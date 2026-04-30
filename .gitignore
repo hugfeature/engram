@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.duckdb
+*.pkl
+.eggs/
+benchmark/data/
+benchmark/results/
