@@ -1,0 +1,236 @@
+"""Engram Unified Server — FastAPI REST + MCP StreamableHTTP."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+from mcp.server import Server as MCPServer
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.types import TextContent
+
+from .db import MemoryDB
+from .graph import MemoryGraph
+from .pruner import start_scheduler
+from .tools import TOOL_SCHEMAS
+from .handlers import (
+    handle_recall, handle_store, handle_update,
+    handle_session_handoff, handle_consolidate, handle_stats,
+    TOOL_HANDLERS, ARG_MAPPING,
+)
+from . import __version__
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(message)s",
+    stream=sys.stderr,
+)
+log = logging.getLogger("engram.http")
+
+# --- Singletons (shared by REST + MCP) ---
+
+_db: MemoryDB | None = None
+_graph: MemoryGraph | None = None
+
+
+def _get_db() -> MemoryDB:
+    global _db
+    if _db is None:
+        _db = MemoryDB()
+    return _db
+
+
+def _get_graph() -> MemoryGraph:
+    global _graph
+    if _graph is None:
+        _graph = MemoryGraph()
+    return _graph
+
+
+# --- MCP Server ---
+
+mcp_server = MCPServer("engram")
+
+
+@mcp_server.list_tools()
+async def list_tools():
+    return TOOL_SCHEMAS
+
+
+@mcp_server.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    db = _get_db()
+    graph = _get_graph()
+
+    handler = TOOL_HANDLERS.get(name)
+    if not handler:
+        return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
+
+    arg_map = ARG_MAPPING.get(name, {})
+    kwargs = {}
+    for mcp_key, handler_key in arg_map.items():
+        if mcp_key in arguments:
+            kwargs[handler_key] = arguments[mcp_key]
+
+    result = handler(db, graph, **kwargs)
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+
+session_mgr = StreamableHTTPSessionManager(app=mcp_server, stateless=True)
+
+
+# --- Lifespan ---
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    start_scheduler(_get_db(), _get_graph())
+    log.info("Engram server started (REST + MCP)")
+    async with session_mgr.run():
+        yield
+    log.info("Engram server shutting down")
+
+
+# --- FastAPI App ---
+
+app = FastAPI(title="Engram", version=__version__, lifespan=lifespan)
+
+# Mount MCP at /mcp
+app.mount("/mcp", session_mgr.handle_request)
+
+
+# --- Request models ---
+
+class RecallRequest(BaseModel):
+    query: str
+    user_id: str = "default"
+    top_k: int = 5
+
+
+class StoreRequest(BaseModel):
+    content: str
+    importance: float
+    category: str = "fact"
+    user_id: str = "default"
+    metadata: dict | None = None
+
+
+class UpdateRequest(BaseModel):
+    memory_id: int
+    new_content: str
+    importance: float | None = None
+
+
+class HandoffRequest(BaseModel):
+    summary: str
+    completed: list[str] | None = None
+    in_progress: list[str] | None = None
+    blocked: list[str] | None = None
+    next_steps: list[str] | None = None
+    user_id: str = "default"
+
+
+class ConsolidateRequest(BaseModel):
+    user_id: str = "default"
+
+
+class StatsRequest(BaseModel):
+    user_id: str = "default"
+
+
+# --- REST Routes ---
+
+@app.post("/v1/recall")
+def recall_endpoint(req: RecallRequest):
+    return handle_recall(_get_db(), _get_graph(),
+                         query=req.query, user_id=req.user_id, top_k=req.top_k)
+
+
+@app.post("/v1/store")
+def store_endpoint(req: StoreRequest):
+    return handle_store(_get_db(), _get_graph(),
+                        content=req.content, importance=req.importance,
+                        category=req.category, user_id=req.user_id,
+                        metadata=req.metadata)
+
+
+@app.post("/v1/update")
+def update_endpoint(req: UpdateRequest):
+    return handle_update(_get_db(), _get_graph(),
+                         memory_id=req.memory_id, new_content=req.new_content,
+                         importance=req.importance)
+
+
+@app.post("/v1/handoff")
+def handoff_endpoint(req: HandoffRequest):
+    return handle_session_handoff(
+        _get_db(), _get_graph(),
+        summary=req.summary, completed=req.completed,
+        in_progress=req.in_progress, blocked=req.blocked,
+        next_steps=req.next_steps, user_id=req.user_id,
+    )
+
+
+@app.post("/v1/consolidate")
+def consolidate_endpoint(req: ConsolidateRequest):
+    return handle_consolidate(_get_db(), _get_graph(), user_id=req.user_id)
+
+
+@app.post("/v1/stats")
+def stats_endpoint(req: StatsRequest):
+    return handle_stats(_get_db(), user_id=req.user_id)
+
+
+@app.get("/v1/health")
+def health():
+    return {
+        "status": "ok",
+        "version": __version__,
+        "transports": ["rest", "mcp-streamable-http"],
+        "tools": ["recall_memory", "store_memory", "update_memory",
+                  "session_handoff", "consolidate_memory", "memory_stats"],
+    }
+
+
+@app.get("/v1/tools")
+def tools_list():
+    return {
+        "tools": [
+            {"name": "recall", "method": "POST", "path": "/v1/recall",
+             "params": {"query": "str (required)", "user_id": "str", "top_k": "int"}},
+            {"name": "store", "method": "POST", "path": "/v1/store",
+             "params": {"content": "str (required)", "importance": "float (required)",
+                        "category": "str", "user_id": "str", "metadata": "object"}},
+            {"name": "update", "method": "POST", "path": "/v1/update",
+             "params": {"memory_id": "int (required)", "new_content": "str (required)",
+                        "importance": "float"}},
+            {"name": "handoff", "method": "POST", "path": "/v1/handoff",
+             "params": {"summary": "str (required)", "completed": "list[str]",
+                        "in_progress": "list[str]", "blocked": "list[str]",
+                        "next_steps": "list[str]", "user_id": "str"}},
+            {"name": "consolidate", "method": "POST", "path": "/v1/consolidate",
+             "params": {"user_id": "str"}},
+            {"name": "stats", "method": "POST", "path": "/v1/stats",
+             "params": {"user_id": "str"}},
+        ]
+    }
+
+
+def main():
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description="Engram unified server (REST + MCP)")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8900)
+    args = parser.parse_args()
+
+    log.info(f"Engram server starting on {args.host}:{args.port}")
+    uvicorn.run(app, host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()
