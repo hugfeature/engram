@@ -34,9 +34,16 @@ def _is_running(pid: int | None = None) -> bool:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except OSError:
         return False
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "command="], text=True, timeout=5
+        )
+        return "engram" in out.lower()
+    except Exception:
+        return True
 
 
 def cmd_start(host: str, port: int) -> None:
@@ -46,14 +53,13 @@ def cmd_start(host: str, port: int) -> None:
         return
 
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-    log_fd = open(LOG_FILE, "a")
-
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "engram.http_server", "--host", host, "--port", str(port)],
-        start_new_session=True,
-        stdout=log_fd,
-        stderr=subprocess.STDOUT,
-    )
+    with open(LOG_FILE, "a") as log_fd:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "engram.http_server", "--host", host, "--port", str(port)],
+            start_new_session=True,
+            stdout=log_fd,
+            stderr=subprocess.STDOUT,
+        )
 
     time.sleep(1)
     if proc.poll() is not None:
@@ -97,6 +103,11 @@ def cmd_status() -> None:
 
 
 def cmd_run(host: str, port: int) -> None:
+    def _handle_sigterm(signum, frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     from engram.http_server import main as serve_main
     sys.argv = ["engram-server", "--host", host, "--port", str(port)]
     serve_main()

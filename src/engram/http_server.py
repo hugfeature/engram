@@ -17,10 +17,12 @@ from mcp.types import TextContent
 from .db import MemoryDB
 from .graph import MemoryGraph
 from .pruner import start_scheduler
+from .embedding import is_degraded
 from .tools import TOOL_SCHEMAS
 from .handlers import (
     handle_recall, handle_store, handle_update,
     handle_session_handoff, handle_consolidate, handle_stats,
+    handle_track_failure, handle_track_progress,
     TOOL_HANDLERS, ARG_MAPPING,
 )
 from . import __version__
@@ -88,10 +90,39 @@ session_mgr = StreamableHTTPSessionManager(app=mcp_server, stateless=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    start_scheduler(_get_db(), _get_graph())
+    scheduler = None
+    try:
+        _get_db()
+    except Exception as e:
+        log.error("DB init failed (degraded mode): %s", e)
+    try:
+        _get_graph()
+    except Exception as e:
+        log.error("Graph init failed (degraded mode): %s", e)
+    try:
+        if _db is not None and _graph is not None:
+            scheduler = start_scheduler(_db, _graph)
+    except Exception as e:
+        log.warning("Scheduler init failed: %s", e)
     log.info("Engram server started (REST + MCP)")
     async with session_mgr.run():
         yield
+    if scheduler:
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception:
+            pass
+        log.info("Scheduler shut down")
+    if _graph is not None:
+        try:
+            _graph.flush()
+        except Exception as e:
+            log.error("Graph flush on shutdown failed: %s", e)
+    if _db is not None:
+        try:
+            _db.close()
+        except Exception as e:
+            log.error("DB close on shutdown failed: %s", e)
     log.info("Engram server shutting down")
 
 
@@ -142,6 +173,26 @@ class StatsRequest(BaseModel):
     user_id: str = "default"
 
 
+class TrackFailureRequest(BaseModel):
+    error: str
+    component: str
+    root_cause: str | None = None
+    severity: str = "major"
+    fix: str | None = None
+    related_test_ids: list[str] | None = None
+    user_id: str = "default"
+
+
+class TrackProgressRequest(BaseModel):
+    feature: str
+    status: str
+    completion: float = 0
+    blockers: list[str] | None = None
+    quality_score: float | None = None
+    notes: str | None = None
+    user_id: str = "default"
+
+
 # --- REST Routes ---
 
 @app.post("/v1/recall")
@@ -185,14 +236,48 @@ def stats_endpoint(req: StatsRequest):
     return handle_stats(_get_db(), user_id=req.user_id)
 
 
+@app.post("/v1/failure")
+def failure_endpoint(req: TrackFailureRequest):
+    return handle_track_failure(
+        _get_db(), _get_graph(),
+        error=req.error, component=req.component,
+        root_cause=req.root_cause, severity=req.severity,
+        fix=req.fix, related_test_ids=req.related_test_ids,
+        user_id=req.user_id,
+    )
+
+
+@app.post("/v1/progress")
+def progress_endpoint(req: TrackProgressRequest):
+    return handle_track_progress(
+        _get_db(), _get_graph(),
+        feature=req.feature, status=req.status,
+        completion=req.completion, blockers=req.blockers,
+        quality_score=req.quality_score, notes=req.notes,
+        user_id=req.user_id,
+    )
+
+
 @app.get("/v1/health")
+@app.get("/health")
 def health():
+    db_ok = False
+    try:
+        if _db is not None:
+            _db.conn.execute("SELECT 1").fetchone()
+            db_ok = True
+    except Exception:
+        pass
+    graph_ok = _graph is not None
+    degraded = is_degraded()
+    status = "ok" if (db_ok and graph_ok and not degraded) else "degraded"
     return {
-        "status": "ok",
+        "status": status,
         "version": __version__,
+        "db": db_ok,
+        "graph": graph_ok,
+        "embedding_degraded": degraded,
         "transports": ["rest", "mcp-streamable-http"],
-        "tools": ["recall_memory", "store_memory", "update_memory",
-                  "session_handoff", "consolidate_memory", "memory_stats"],
     }
 
 
@@ -216,6 +301,14 @@ def tools_list():
              "params": {"user_id": "str"}},
             {"name": "stats", "method": "POST", "path": "/v1/stats",
              "params": {"user_id": "str"}},
+            {"name": "failure", "method": "POST", "path": "/v1/failure",
+             "params": {"error": "str (required)", "component": "str (required)",
+                        "root_cause": "str", "severity": "str", "fix": "str",
+                        "related_test_ids": "list[str]", "user_id": "str"}},
+            {"name": "progress", "method": "POST", "path": "/v1/progress",
+             "params": {"feature": "str (required)", "status": "str (required)",
+                        "completion": "float", "blockers": "list[str]",
+                        "quality_score": "float", "notes": "str", "user_id": "str"}},
         ]
     }
 

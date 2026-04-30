@@ -3,12 +3,24 @@
 import os
 
 
-def _float(key: str, default: float) -> float:
-    return float(os.environ.get(key, default))
+def _float(key: str, default: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    try:
+        return max(lo, min(hi, float(val)))
+    except (ValueError, TypeError):
+        return default
 
 
-def _int(key: str, default: int) -> int:
-    return int(os.environ.get(key, default))
+def _int(key: str, default: int, lo: int = 1, hi: int = 1000) -> int:
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    try:
+        return max(lo, min(hi, int(val)))
+    except (ValueError, TypeError):
+        return default
 
 
 # --- Decay (decay.py) ---
@@ -30,12 +42,12 @@ SIMILARITY_LOW = _float("ENGRAM_SIM_LOW", 0.20)
 REINFORCE_SIM = _float("ENGRAM_REINFORCE_SIM", 0.75)
 W_BM25 = _float("ENGRAM_W_BM25", 0.30)
 W_VECTOR = _float("ENGRAM_W_VECTOR", 0.70)
-GRAPH_MAX_DEPTH = _int("ENGRAM_GRAPH_DEPTH", 3)
+GRAPH_MAX_DEPTH = _int("ENGRAM_GRAPH_DEPTH", 3, lo=1, hi=10)
 
 # --- Graph (graph.py) ---
 EDGE_THRESHOLD = _float("ENGRAM_EDGE_THRESHOLD", 0.40)
 EDGE_WEIGHT = _float("ENGRAM_EDGE_WEIGHT", 0.50)
-MAX_EDGES = _int("ENGRAM_MAX_EDGES", 5)
+MAX_EDGES = _int("ENGRAM_MAX_EDGES", 5, lo=1, hi=50)
 
 # --- Consolidator (consolidator.py) ---
 CONSOLIDATE_THRESHOLD = _float("ENGRAM_CONSOLIDATE_THRESHOLD", 0.70)

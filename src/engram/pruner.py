@@ -47,8 +47,6 @@ def start_scheduler(db: MemoryDB, graph: MemoryGraph, user_id: str = "default"):
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
 
-        run_maintenance(db, graph, user_id)
-
         scheduler = BackgroundScheduler()
         scheduler.add_job(
             run_maintenance,
