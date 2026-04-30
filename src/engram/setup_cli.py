@@ -39,12 +39,13 @@ def main():
     try:
         from engram.graph import MemoryGraph
         graph = MemoryGraph()
-        print(f"      Graph ready at {data_dir}/graph.pkl")
+        print(f"      Graph ready at {data_dir}/graph.json")
     except Exception as e:
         print(f"      ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 
-    exe_path = os.popen("which engram").read().strip()
+    import shutil
+    exe_path = shutil.which("engram") or ""
     if not exe_path:
         exe_path = "engram"
 

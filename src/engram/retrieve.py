@@ -5,6 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from dataclasses import dataclass
 
+import logging
+
+import numpy as np
+
 from .db import MemoryDB, MemoryRow
 from .embedding import embed
 from .decay import compute_strength
@@ -38,10 +42,13 @@ def recall(
 
     internal_k = max(20, top_k)
 
+    log = logging.getLogger("engram.retrieve")
+
     vector_results = db.search_vector(
         query_embedding, user_id, top_k=internal_k, threshold=SIMILARITY_HIGH
     )
     if not vector_results:
+        log.info("No results at threshold=%.2f, falling back to %.2f", SIMILARITY_HIGH, SIMILARITY_LOW)
         vector_results = db.search_vector(
             query_embedding, user_id, top_k=internal_k, threshold=SIMILARITY_LOW
         )
@@ -79,10 +86,13 @@ def recall(
     seed_ids = [m.id for m in vector_results[:5]]
     if seed_ids:
         graph_neighbors = graph.expand(seed_ids, max_depth=GRAPH_MAX_DEPTH, user_id=user_id)
+        neighbor_ids = [mid for mid, _ in graph_neighbors[:top_k] if mid not in scored]
+        neighbor_batch = db.get_by_ids_batch(neighbor_ids) if neighbor_ids else {}
+        neighbor_emb_batch = db.get_embeddings_batch(neighbor_ids) if neighbor_ids else {}
         for mid, cum_weight in graph_neighbors[:top_k]:
             if mid in scored:
                 continue
-            m = db.get_by_id(mid)
+            m = neighbor_batch.get(mid)
             if not m or m.user_id != user_id:
                 continue
             days = (now - m.last_accessed_at.replace(tzinfo=timezone.utc)).total_seconds() / 86400
@@ -90,10 +100,9 @@ def recall(
             bm25_raw = fts_by_id.get(mid, 0.0)
             bm25_norm = bm25_raw / max_bm25
 
-            emb = db.get_embedding(mid)
+            emb = neighbor_emb_batch.get(mid)
             sim = 0.0
             if emb:
-                import numpy as np
                 sim = float(np.dot(np.array(query_embedding), np.array(emb)))
 
             vector_score = sim * strength

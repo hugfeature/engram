@@ -10,18 +10,67 @@ from dataclasses import dataclass
 
 import duckdb
 
-from .embedding import get_dimensions
+from .embedding import get_dimensions, MODEL_NAME
 
 log = logging.getLogger("engram.db")
 
-DB_PATH = os.path.join(os.path.expanduser("~"), ".engram", "memories.duckdb")
+ENGRAM_DIR = os.path.join(os.path.expanduser("~"), ".engram")
+DB_PATH = os.path.join(ENGRAM_DIR, "memories.duckdb")
+
+_DEFAULT_DIM = 768
 
 
 def _dim() -> int:
+    cache = os.path.join(ENGRAM_DIR, ".dim_cache")
     try:
-        return get_dimensions()
+        with open(cache) as f:
+            line = f.read().strip()
+            if ":" in line:
+                model, dim_str = line.rsplit(":", 1)
+                if model == MODEL_NAME:
+                    return int(dim_str)
+            else:
+                return int(line)
     except Exception:
-        return 768
+        pass
+    try:
+        dim = get_dimensions()
+        os.makedirs(ENGRAM_DIR, exist_ok=True)
+        with open(cache, "w") as f:
+            f.write(f"{MODEL_NAME}:{dim}")
+        return dim
+    except Exception:
+        return _DEFAULT_DIM
+
+
+def _recover_wal(db_path: str) -> None:
+    """Remove corrupted WAL file so DuckDB can start fresh from checkpoint."""
+    wal = db_path + ".wal"
+    if not os.path.exists(wal):
+        return
+    log.warning("WAL file exists at startup: %s (%d bytes)", wal, os.path.getsize(wal))
+    bak = wal + ".recovery"
+    try:
+        os.replace(wal, bak)
+        log.warning("WAL moved to %s for recovery", bak)
+    except OSError as e:
+        log.error("Failed to move WAL: %s", e)
+
+
+def _connect_with_retry(db_path: str) -> duckdb.DuckDBPyConnection:
+    """Connect to DuckDB with automatic WAL recovery on failure."""
+    try:
+        return duckdb.connect(db_path)
+    except (duckdb.IOException, duckdb.InternalException) as e:
+        log.warning("DuckDB connect failed: %s — attempting WAL recovery", e)
+        _recover_wal(db_path)
+        try:
+            return duckdb.connect(db_path)
+        except Exception:
+            log.error("DuckDB still fails after WAL recovery, creating fresh DB")
+            if os.path.exists(db_path):
+                os.replace(db_path, db_path + ".corrupt")
+            return duckdb.connect(db_path)
 
 
 def _schema_sql(dim: int) -> str:
@@ -92,7 +141,8 @@ def _row_to_memory(row) -> MemoryRow:
 class MemoryDB:
     def __init__(self, db_path: str = DB_PATH, dim: int | None = None):
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self.conn = duckdb.connect(db_path)
+        self._db_path = db_path
+        self.conn = _connect_with_retry(db_path)
         self._dim = dim or _dim()
         self._init_schema()
 
@@ -122,6 +172,12 @@ class MemoryDB:
     def _float_cast(self) -> str:
         return f"FLOAT[{self._dim}]"
 
+    def _validate_embedding(self, embedding: list[float]) -> None:
+        if len(embedding) != self._dim:
+            raise ValueError(
+                f"Embedding dimension mismatch: expected {self._dim}, got {len(embedding)}"
+            )
+
     def insert(
         self,
         content: str,
@@ -131,6 +187,7 @@ class MemoryDB:
         user_id: str = "default",
         metadata: dict | None = None,
     ) -> int:
+        self._validate_embedding(embedding)
         meta_json = json.dumps(metadata or {}, ensure_ascii=False)
         cast = self._float_cast()
         result = self.conn.execute(
@@ -149,27 +206,23 @@ class MemoryDB:
         content: str,
         embedding: list[float],
         importance: float | None = None,
+        metadata: dict | None = None,
     ):
+        self._validate_embedding(embedding)
         cast = self._float_cast()
+        sets = [f"content = ?", f"embedding = ?::{cast}", "last_accessed_at = now()"]
+        params: list = [content, embedding]
         if importance is not None:
-            self.conn.execute(
-                f"""
-                UPDATE memories
-                SET content = ?, embedding = ?::{cast}, importance = ?,
-                    last_accessed_at = now()
-                WHERE id = ?
-                """,
-                [content, embedding, importance, memory_id],
-            )
-        else:
-            self.conn.execute(
-                f"""
-                UPDATE memories
-                SET content = ?, embedding = ?::{cast}, last_accessed_at = now()
-                WHERE id = ?
-                """,
-                [content, embedding, memory_id],
-            )
+            sets.append("importance = ?")
+            params.append(importance)
+        if metadata is not None:
+            sets.append("metadata = ?::JSON")
+            params.append(json.dumps(metadata, ensure_ascii=False))
+        params.append(memory_id)
+        self.conn.execute(
+            f"UPDATE memories SET {', '.join(sets)} WHERE id = ?",
+            params,
+        )
 
     def bump_recall(self, memory_id: int):
         self.conn.execute(
@@ -215,6 +268,9 @@ class MemoryDB:
         top_k: int = 20,
         threshold: float = 0.20,
     ) -> list[MemoryRow]:
+        self._validate_embedding(query_embedding)
+        threshold = max(0.0, min(1.0, float(threshold)))
+        top_k = max(1, min(1000, int(top_k)))
         cast = self._float_cast()
         rows = self.conn.execute(
             f"""
@@ -266,7 +322,7 @@ class MemoryDB:
                 results.append(m)
             return results
         except Exception as e:
-            log.warning("FTS search failed (query=%r): %s", query, e)
+            log.error("FTS search failed (query=%r): %s", query, e)
             return []
 
     def search_similar_for_dedup(
@@ -304,6 +360,35 @@ class MemoryDB:
             "SELECT COUNT(*) FROM memories WHERE user_id = ?", [user_id]
         ).fetchone()
         return row[0]
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+
+    def get_by_ids_batch(self, memory_ids: list[int]) -> dict[int, MemoryRow]:
+        if not memory_ids:
+            return {}
+        placeholders = ",".join("?" for _ in memory_ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT id, user_id, content, importance, category,
+                   recall_count, created_at, last_accessed_at, metadata
+            FROM memories WHERE id IN ({placeholders})
+            """,
+            memory_ids,
+        ).fetchall()
+        return {r[0]: _row_to_memory(r) for r in rows}
+
+    def get_embeddings_batch(self, memory_ids: list[int]) -> dict[int, list[float]]:
+        if not memory_ids:
+            return {}
+        placeholders = ",".join("?" for _ in memory_ids)
+        rows = self.conn.execute(
+            f"SELECT id, embedding FROM memories WHERE id IN ({placeholders})",
+            memory_ids,
+        ).fetchall()
+        return {r[0]: list(r[1]) for r in rows if r[1]}
 
     def get_metadata_batch(self, memory_ids: list[int]) -> dict[int, dict]:
         if not memory_ids:

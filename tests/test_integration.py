@@ -21,6 +21,7 @@ class TestGraphJsonPersistence:
         vec = np.random.randn(768)
         vec = (vec / np.linalg.norm(vec)).tolist()
         g1.index_memory(1, vec, {2: vec})
+        g1.flush()
 
         g2 = MemoryGraph(path)
         assert 1 in g2._graph

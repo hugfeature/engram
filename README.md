@@ -33,6 +33,7 @@ Agent 做了什么、卡在哪里、下一步该做什么——这些结构化�
 - 反复被回忆起的知识，越用越牢固
 - 矛盾的信息自动覆盖，不会左右互搏
 - **v0.2 新增**：结构化会话交接（session handoff），让下一个会话从断点继续而非从零开始
+- **v0.4 新增**：工程状态中枢 — 结构化失败归因（track_failure）和进度追踪（track_progress），让 Agent 不只记信息，还记工程状态
 
 ---
 
@@ -134,6 +135,79 @@ strength = importance × e^(-λ × days) × (1 + recall_count × 0.2)
 
 ---
 
+## 工程状态中枢（v0.4）
+
+Engram 不只是"存信息"的记忆插件——它是**懂工程流程的状态层**。
+
+
+### 失败归因（track_failure）
+
+当 Agent 遇到 bug、测试失败或部署问题时，用结构化格式记录：
+
+```python
+# MCP 调用
+track_failure(
+    error="CSRF token missing on checkout",
+    component="payment",
+    severity="critical",        # → importance=0.9
+    root_cause="middleware not loaded after refactor",
+    fix="re-add CsrfMiddleware to pipeline",
+    related_test_ids=["test_checkout_01", "test_payment_csrf"]
+)
+```
+
+**设计决策**：
+- `severity` 自动映射 `importance`（critical=0.9, major=0.7, minor=0.5）
+- 固定使用 `failure` 类别（最快衰减 λ=0.35，~11天半衰期）——环境会变，旧的失败记录自然过期
+- `component` 字段支持按模块聚合统计，快速定位高风险区域
+
+### 进度追踪（track_progress）
+
+跨会话追踪功能/任务状态：
+
+```python
+track_progress(
+    feature="login-flow-refactor",
+    status="in_progress",       # → importance=0.8
+    completion=60,
+    blockers=["waiting for API design review"],
+    quality_score=0.85,
+    notes="auth module done, UI pending"
+)
+```
+
+**设计决策**：
+- `status` 自动映射 `importance`（blocked=0.9 最高，done=0.5 最低）
+- 固定使用 `strategy` 类别（最慢衰减 λ=0.10，~38天半衰期）——进度状态要记最久
+- 完成的特性自然衰减消失，不需要手动清理
+
+### 工程指标（memory_stats 增强）
+
+`memory_stats` 现在会自动聚合工程数据：
+
+```json
+{
+  "total": 42,
+  "categories": {"fact": 20, "failure": 8, "strategy": 14},
+  "engineering": {
+    "failures": {
+      "total": 8,
+      "by_component": {"auth": 5, "payment": 3},
+      "by_severity": {"critical": 2, "major": 6}
+    },
+    "features": {
+      "total_tracked": 4,
+      "active": {
+        "login-refactor": {"status": "in_progress", "completion": 60},
+        "payment-fix": {"status": "blocked", "completion": 30}
+      }
+    }
+  }
+}
+```
+
+---
+
 ## 技术架构
 
 ```
@@ -144,7 +218,7 @@ strength = importance × e^(-λ × days) × (1 + recall_count × 0.2)
                    │ stdio (JSON-RPC)
 ┌──────────────────▼───────────────────────────┐
 │              server.py                       │
-│  6 MCP tools  ·  APScheduler (12h 维护)      │
+│  8 MCP tools  ·  APScheduler (12h 维护)      │
 ├──────────────────────────────────────────────┤
 │                                              │
 │  ┌─ 写入路径 ──────┐  ┌─ 读取路径 ──────┐    │
@@ -170,8 +244,8 @@ strength = importance × e^(-λ × days) × (1 + recall_count × 0.2)
 ├── graph.json          # 语义图谱（JSON 序列化）
 └── model_cache/        # 嵌入模型缓存
 ```
-
 ---
+
 
 ## MCP 工具接口
 
@@ -180,9 +254,11 @@ strength = importance × e^(-λ × days) × (1 + recall_count × 0.2)
 | `recall_memory` | `query`, `user_id?`, `top_k?` | 语义检索记忆，每次任务开始时调用。返回结果包含 metadata |
 | `store_memory` | `content`, `importance`, `category?`, `metadata?`, `user_id?` | 存储新记忆（自动去重），返回 memory_id |
 | `update_memory` | `memory_id`, `new_content`, `importance?` | 更新已有记忆 |
-| `session_handoff` | `summary`, `completed?`, `in_progress?`, `blocked?`, `next_steps?`, `user_id?` | **v0.2** 结构化会话交接，记录当前进度供下次会话继续 |
+| `session_handoff` | `summary`, `completed?`, `in_progress?`, `blocked?`, `next_steps?`, `user_id?` | 结构化会话交接，记录当前进度供下次会话继续 |
+| `track_failure` | `error`, `component`, `root_cause?`, `severity?`, `fix?`, `related_test_ids?`, `user_id?` | **v0.4** 结构化失败归因，自动关联组件/严重级/修复方案 |
+| `track_progress` | `feature`, `status`, `completion?`, `blockers?`, `quality_score?`, `notes?`, `user_id?` | **v0.4** 功能进度快照，跨会话追踪特性状态 |
 | `consolidate_memory` | `user_id?` | 手动触发记忆整合 |
-| `memory_stats` | `user_id?` | 记忆统计：总数、类别分布、平均强度、上次维护时间 |
+| `memory_stats` | `user_id?` | 记忆统计 + **v0.4** 工程指标（失败趋势、组件健康度、活跃特性） |
 
 ### 重要性参考
 
@@ -374,26 +450,6 @@ engram-setup
 >
 > 关键参数：`recall top-50 → rerank to top-5`，`importance=1.0` 修正权重比。
 > 本地部署零云端依赖，与使用 GPT-4o-mini 的 Mem0 差距缩小至 35%。
-
-### 运行评测
-
-```bash
-# 纯检索命中率（不需要 LLM）
-python benchmark/locomo_eval.py --mode turn --top-k 5
-
-# 带 LLM 评分 + API embedding
-python benchmark/locomo_eval.py --mode turn --top-k 5 \
-    --llm DeepSeek-V3.2 --base-url https://api.example.com/v1 \
-    --embed-model bge-m3
-
-# 带 reranker（两阶段检索，最佳配置）
-python benchmark/locomo_eval.py --mode turn --top-k 5 \
-    --llm DeepSeek-V3.2 --base-url https://api.example.com/v1 \
-    --embed-model bge-m3 --rerank
-
-# 快速验证（前 10 题）
-python benchmark/locomo_eval.py --mode turn --dry-run
-```
 
 ---
 

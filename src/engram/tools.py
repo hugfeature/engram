@@ -151,4 +151,90 @@ TOOL_SCHEMAS: list[Tool] = [
             },
         },
     ),
+    Tool(
+        name="track_failure",
+        description="Record a structured failure event (bug, test failure, deployment issue). "
+                    "Enforces consistent schema for pattern analysis across sessions.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string",
+                    "description": "The error message or failure description",
+                },
+                "component": {
+                    "type": "string",
+                    "description": "Component/module where the failure occurred (e.g. 'auth', 'payment', 'ci-pipeline')",
+                },
+                "root_cause": {
+                    "type": "string",
+                    "description": "Root cause analysis (why it failed)",
+                },
+                "severity": {
+                    "type": "string",
+                    "enum": ["critical", "major", "minor"],
+                    "description": "Impact severity",
+                    "default": "major",
+                },
+                "fix": {
+                    "type": "string",
+                    "description": "How it was fixed, or proposed fix",
+                },
+                "related_test_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "IDs or names of related test cases",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "User identifier",
+                    "default": "default",
+                },
+            },
+            "required": ["error", "component"],
+        },
+    ),
+    Tool(
+        name="track_progress",
+        description="Record a feature or task progress snapshot. "
+                    "Creates a searchable record for cross-session continuity.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "feature": {
+                    "type": "string",
+                    "description": "Feature or task name (e.g. 'login-flow-refactor', 'engram-v0.4')",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["planning", "in_progress", "blocked", "review", "done"],
+                    "description": "Current status",
+                },
+                "completion": {
+                    "type": "number",
+                    "description": "Completion percentage (0-100)",
+                    "default": 0,
+                },
+                "blockers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Current blockers preventing progress",
+                },
+                "quality_score": {
+                    "type": "number",
+                    "description": "Quality assessment 0.0-1.0 (test pass rate, coverage, etc.)",
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Free-form progress notes",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "User identifier",
+                    "default": "default",
+                },
+            },
+            "required": ["feature", "status"],
+        },
+    ),
 ]

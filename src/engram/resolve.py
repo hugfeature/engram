@@ -5,9 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+import re
+
 import numpy as np
 
 from .config import DEDUP_THRESHOLD, REINFORCE_THRESHOLD
+
+_PUNCT_RE = re.compile(r"[^\w\s']", re.UNICODE)
 
 POSITIVE_WORDS = {
     "love", "like", "prefer", "use", "adopt", "enjoy", "want", "choose",
@@ -34,8 +38,13 @@ class Resolution:
     merged_content: str | None = None
 
 
+def _tokenize(text: str) -> set[str]:
+    cleaned = _PUNCT_RE.sub(" ", text.lower())
+    return set(cleaned.split())
+
+
 def _polarity(text: str) -> int | None:
-    words = set(text.lower().split())
+    words = _tokenize(text)
     has_neg = bool(words & NEGATION_WORDS)
     has_pos = bool(words & POSITIVE_WORDS)
     has_neg_word = bool(words & NEGATIVE_WORDS)
@@ -56,7 +65,7 @@ def _is_contradiction(text_a: str, text_b: str) -> bool:
 
 
 def _merge_content(existing: str, incoming: str) -> str:
-    incoming_words = set(incoming.lower().split()) - set(existing.lower().split())
+    incoming_words = _tokenize(incoming) - _tokenize(existing)
     if len(incoming_words) < 3:
         return existing
     return f"{existing}; {incoming}"

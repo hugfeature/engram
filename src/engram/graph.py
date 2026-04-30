@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
 import threading
+import time
 from collections import deque
+from typing import TYPE_CHECKING
 
 import networkx as nx
 import numpy as np
 
 from .config import EDGE_THRESHOLD, EDGE_WEIGHT, MAX_EDGES
+
+if TYPE_CHECKING:
+    from .db import MemoryDB
 
 log = logging.getLogger("engram.graph")
 
@@ -19,42 +25,81 @@ GRAPH_PATH = os.path.join(os.path.expanduser("~"), ".engram", "graph.json")
 
 
 class MemoryGraph:
+    _FLUSH_INTERVAL = 2.0
+
     def __init__(self, graph_path: str = GRAPH_PATH):
         self._path = graph_path
         self._lock = threading.RLock()
         self._dirty = False
+        self._last_flush_time = 0.0
+        atexit.register(self.flush)
         os.makedirs(os.path.dirname(graph_path), exist_ok=True)
+        self._graph: nx.DiGraph = self._load_graph(graph_path)
+        if self._dirty:
+            self._flush()
+
+    def _load_graph(self, graph_path: str) -> nx.DiGraph:
         if os.path.exists(graph_path):
-            with open(graph_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            self._graph: nx.DiGraph = nx.node_link_graph(data, directed=True)
-        else:
-            pkl_path = graph_path.replace(".json", ".pkl")
-            if os.path.exists(pkl_path):
+            try:
+                with open(graph_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return nx.node_link_graph(data, directed=True)
+            except Exception as e:
+                log.error("Failed to load graph.json: %s — starting empty", e)
+                bak = graph_path + ".corrupt"
+                try:
+                    os.replace(graph_path, bak)
+                except OSError:
+                    pass
+                return nx.DiGraph()
+
+        pkl_path = graph_path.replace(".json", ".pkl")
+        if os.path.exists(pkl_path):
+            try:
                 import pickle
                 with open(pkl_path, "rb") as f:
-                    self._graph = pickle.load(f)
-                self._flush()
-                os.remove(pkl_path)
-            else:
-                self._graph = nx.DiGraph()
+                    g = pickle.load(f)
+                self._dirty = True
+                return g
+            except Exception as e:
+                log.error("Failed to load graph.pkl: %s — starting empty", e)
+                return nx.DiGraph()
+            finally:
+                try:
+                    os.remove(pkl_path)
+                except OSError:
+                    pass
+
+        return nx.DiGraph()
 
     def _mark_dirty(self):
         self._dirty = True
 
     def _flush(self):
-        data = nx.node_link_data(self._graph)
-        with open(self._path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        self._dirty = False
+        try:
+            data = nx.node_link_data(self._graph)
+            tmp_path = self._path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp_path, self._path)
+            self._dirty = False
+        except Exception as e:
+            log.error("Failed to flush graph to %s: %s (will retry)", self._path, e)
 
     def _save(self):
-        if self._dirty:
-            self._flush()
+        if not self._dirty:
+            return
+        now = time.monotonic()
+        if now - self._last_flush_time < self._FLUSH_INTERVAL:
+            return
+        self._flush()
+        self._last_flush_time = now
 
     def flush(self):
         with self._lock:
-            self._save()
+            if self._dirty:
+                self._flush()
+                self._last_flush_time = time.monotonic()
 
     def upsert_node(
         self,
@@ -137,7 +182,7 @@ class MemoryGraph:
         self,
         memory_id: int,
         embedding: list[float],
-        db,
+        db: "MemoryDB",
         user_id: str = "default",
         importance: float = 0.5,
         category: str = "fact",
@@ -158,12 +203,15 @@ class MemoryGraph:
                 embedding, user_id, top_k=top_k, threshold=threshold
             )
 
+            candidate_ids = [m.id for m in candidates if m.id != memory_id]
+            emb_batch = db.get_embeddings_batch(candidate_ids) if candidate_ids else {}
+
             new_vec = np.array(embedding)
             similarities = []
             for m in candidates:
                 if m.id == memory_id:
                     continue
-                emb = db.get_embedding(m.id)
+                emb = emb_batch.get(m.id)
                 if not emb:
                     continue
                 sim = float(np.dot(new_vec, np.array(emb)))
@@ -228,14 +276,17 @@ class MemoryGraph:
         with self._lock:
             if memory_id not in self._graph:
                 return
+            boosted: set[int] = set()
             for neighbor, _ in self.expand([memory_id], max_depth=max_depth):
-                if neighbor in self._graph:
-                    data = self._graph.nodes[neighbor]
-                    edge_w = 1.0
-                    if self._graph.has_edge(memory_id, neighbor):
-                        edge_w = self._graph[memory_id][neighbor].get("weight", 1.0)
-                    boost_val = amount * edge_w
-                    data["strength"] = min(1.0, data.get("strength", 0) + boost_val)
+                if neighbor in boosted or neighbor not in self._graph:
+                    continue
+                boosted.add(neighbor)
+                data = self._graph.nodes[neighbor]
+                edge_w = 1.0
+                if self._graph.has_edge(memory_id, neighbor):
+                    edge_w = self._graph[memory_id][neighbor].get("weight", 1.0)
+                boost_val = amount * edge_w
+                data["strength"] = min(1.0, data.get("strength", 0) + boost_val)
             self._mark_dirty()
             self._save()
 

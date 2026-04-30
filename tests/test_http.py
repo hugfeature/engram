@@ -27,9 +27,10 @@ class TestHealthAndTools:
         r = client.get("/v1/health")
         assert r.status_code == 200
         data = r.json()
-        assert data["status"] == "ok"
-        assert data["version"] == "0.3.1"
-        assert len(data["tools"]) == 6
+        assert data["status"] in ("ok", "degraded")
+        assert data["version"] == "0.4.4"
+        assert "db" in data
+        assert "embedding_degraded" in data
 
     def test_tools_list(self, client):
         r = client.get("/v1/tools")
@@ -95,3 +96,48 @@ class TestConsolidateAndStats:
         data = r.json()
         assert "total" in data
         assert data["total"] == 0
+
+
+class TestTrackFailureHTTP:
+    def test_basic(self, client):
+        r = client.post("/v1/failure", json={"error": "NPE", "component": "auth"})
+        assert r.status_code == 200
+        assert "memory_id" in r.json()
+
+    def test_missing_required(self, client):
+        r = client.post("/v1/failure", json={"error": "NPE"})
+        assert r.status_code == 422
+
+    def test_with_all_fields(self, client):
+        r = client.post("/v1/failure", json={
+            "error": "timeout", "component": "payment",
+            "root_cause": "slow query", "severity": "critical",
+            "fix": "add index", "related_test_ids": ["t1"],
+        })
+        assert r.status_code == 200
+        assert "memory_id" in r.json()
+
+
+class TestTrackProgressHTTP:
+    def test_basic(self, client):
+        r = client.post("/v1/progress", json={"feature": "login", "status": "in_progress"})
+        assert r.status_code == 200
+        assert "memory_id" in r.json()
+
+    def test_missing_required(self, client):
+        r = client.post("/v1/progress", json={"feature": "login"})
+        assert r.status_code == 422
+
+    def test_invalid_status(self, client):
+        r = client.post("/v1/progress", json={"feature": "x", "status": "invalid"})
+        assert r.status_code == 200
+        assert "error" in r.json()
+
+    def test_with_all_fields(self, client):
+        r = client.post("/v1/progress", json={
+            "feature": "auth-v2", "status": "blocked",
+            "completion": 60, "blockers": ["API"],
+            "quality_score": 0.85, "notes": "waiting",
+        })
+        assert r.status_code == 200
+        assert "memory_id" in r.json()

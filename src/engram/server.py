@@ -80,7 +80,15 @@ def main():
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream, server.create_initialization_options())
 
-    asyncio.run(_run())
+    try:
+        asyncio.run(_run())
+    finally:
+        if _scheduler:
+            _scheduler.shutdown(wait=False)
+            log.info("Scheduler shut down")
+        if _graph:
+            _graph.flush()
+            log.info("Graph flushed")
 
 
 if __name__ == "__main__":
