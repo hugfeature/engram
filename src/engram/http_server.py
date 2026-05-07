@@ -23,7 +23,8 @@ from .handlers import (
     handle_track_failure, handle_track_progress,
     handle_session_outcome,
 )
-from .shared import get_db, get_graph, dispatch_tool, _db, _graph
+from . import shared
+from .shared import get_db, get_graph, dispatch_tool
 from . import __version__
 
 logging.basicConfig(
@@ -66,8 +67,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.error("Graph init failed (degraded mode): %s", e)
     try:
-        if _db is not None and _graph is not None:
-            scheduler = start_scheduler(_db, _graph)
+        if shared._db is not None and shared._graph is not None:
+            scheduler = start_scheduler(shared._db, shared._graph)
     except Exception as e:
         log.warning("Scheduler init failed: %s", e)
     log.info("Engram server started (REST + MCP)")
@@ -79,14 +80,14 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
         log.info("Scheduler shut down")
-    if _graph is not None:
+    if shared._graph is not None:
         try:
-            _graph.flush()
+            shared._graph.flush()
         except Exception as e:
             log.error("Graph flush on shutdown failed: %s", e)
-    if _db is not None:
+    if shared._db is not None:
         try:
-            _db.close()
+            shared._db.close()
         except Exception as e:
             log.error("DB close on shutdown failed: %s", e)
     log.info("Engram server shutting down")
@@ -171,6 +172,12 @@ class SessionOutcomeRequest(BaseModel):
 
 
 def _respond(result: dict) -> dict | JSONResponse:
+    """Map handler outputs to HTTP status codes with optional explicit override."""
+    explicit_status = result.get("status_code")
+    if isinstance(explicit_status, int) and 100 <= explicit_status <= 599:
+        payload = {k: v for k, v in result.items() if k != "status_code"}
+        return JSONResponse(content=payload, status_code=explicit_status)
+
     """Map handler errors to HTTP 4xx/5xx, otherwise return 200."""
     if "error" in result:
         err = str(result.get("error", "")).lower()

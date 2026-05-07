@@ -207,7 +207,7 @@ def handle_consolidate(db: MemoryDB, graph: MemoryGraph,
         results = run_consolidate(db, graph, user_id)
     except Exception as e:
         log.error("Consolidation failed: %s", e)
-        return {"result": f"Consolidation failed: {e}", "details": []}
+        return {"error": f"consolidation failed: {e}", "details": [], "status_code": 500}
     if not results:
         msg = "No similar memories found to consolidate"
     else:

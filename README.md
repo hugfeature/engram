@@ -2,56 +2,55 @@
 
 **Every task leaves a trace.**
 
-Engram 是一个面向 AI Agent 的**会话接力与记忆系统**，让任务可以跨会话、跨 Agent 持续推进，而不是每次从零开始。
+Engram 是一个面向 AI Agent 的**会话接力系统**：让任务可以跨会话、跨 Agent 持续推进，而不是每次从零开始。
 
-它本地运行，提供记忆检索、会话交接、工程状态管理和自动整理能力。
+它本地运行，提供上下文召回、会话交接、工程状态管理和自动整理能力。
 
----
+## 🎯 产品目标
 
-## 🚨 The Real Problem
-
-AI Agent 已经很强，但在真实工程中有三个致命问题：
-
-- **跨会话直接"失忆"**，任务中断
-- **重复犯同样的错误**（API 误用 / 逻辑偏差）
-- **上下文越堆越大**，最后直接崩掉
-
-这不是模型问题，而是：
-
-> **Context & State Management 问题**
+> **Agent 可替换，任务不中断。**  
+> **按需召回上下文，不靠无限堆 token。**  
+> **数据始终保留在本机。**
 
 ---
 
-## ✅ What Engram Solves
+## ✅ 你会得到什么
 
-Engram 不只是"记忆存储"。它解决的是：
-
-### 1. 会话接力（Session Handoff）
-
-让任务可以在不同 Agent / 不同时间点继续执行
-
-### 2. 上下文压缩（Context Compression）
-
-从长对话中提取"可执行状态"，避免 token 爆炸
-
-### 3. 工程状态管理（Engineering State）
-
-记录错误、进度、决策，而不是只存对话
+1. **会话接力**：任务中途换 Agent，仍能继续推进。  
+2. **上下文压缩**：按需召回关键状态，不再每次喂整段历史。  
+3. **本地可控**：数据留在本机，不依赖云端记忆服务。  
+4. **工程可追踪**：失败原因、进度、决策可结构化沉淀。
 
 ---
 
-## 🧠 Core Idea
+## ⚡ 5 分钟上手
 
-> Don't store conversations.
-> Store **what matters for the next step.**
+```bash
+# 安装
+pip install mcp-engram
+
+# 初始化（下载模型、创建数据库）
+engram-setup
+```
+
+在 MCP 客户端中配置 `engram` 服务后即可使用。
 
 ---
 
-## 🔥 Core Capabilities
+## 🔁 推荐工作流（跨 Agent 接力）
 
-### 🧩 Persistent Memory
+1. **任务开始**：`recall_memory(query=任务关键词)`  
+2. **执行中**：遇到问题用 `track_failure`，进度变化用 `track_progress`  
+3. **结束前**：调用 `session_handoff` 写明完成项、阻塞项、下一步  
+4. **下个 Agent**：先 recall + 读 handoff，直接接着做
 
-- 存储事实、偏好、决策
+---
+
+## 🔥 核心能力
+
+### 🧩 持久上下文层（记忆引擎）
+
+- 存储事实、偏好、决策（作为可检索上下文）
 - 支持语义检索 + BM25 关键词检索 + 图谱关联扩展
 - 混合评分：`0.3 × BM25 + 0.7 × (语义相似度 × 衰减强度) + 图谱加成`
 
@@ -73,13 +72,13 @@ Engram 不只是"记忆存储"。它解决的是：
 
 ### 🛠 Engineering State
 
-不仅记"发生了什么"，还记：
+不仅记“发生了什么”，还记：
 
 - `track_failure`：错误原因 + 根因 + 组件 + 严重级 + 修复方式
 - `track_progress`：模块进度 / 阻塞 / 质量评分
 - `update_memory`：状态更新
 
-👉 本质是把"测试经验"和"开发上下文"结构化
+👉 本质是把“测试经验”和“开发上下文”结构化
 
 ### 🧹 Auto Maintenance
 
@@ -91,7 +90,7 @@ Engram 不只是"记忆存储"。它解决的是：
 - **整合**（Consolidation）— 相似度 ≥ 0.70 的记忆簇自动合并
 - **剪枝**（Pruning）— 强度 < 0.05 且无链式保护的记忆自动删除
 
-避免 memory 无限膨胀，零运维。
+避免上下文无限膨胀，零运维。
 
 ---
 
