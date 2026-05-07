@@ -11,7 +11,7 @@ from engram.handlers import (
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
-    db = MemoryDB(str(tmp_path / "eng.duckdb"))
+    db = MemoryDB(str(tmp_path / "eng.duckdb"), dim=768)
     graph = MemoryGraph(str(tmp_path / "eng.json"))
     monkeypatch.setattr("engram.handlers.embed", lambda t: [0.1] * 768)
     monkeypatch.setattr("engram.retrieve.embed", lambda t: [0.1] * 768)

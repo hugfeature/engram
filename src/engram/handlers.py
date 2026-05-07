@@ -12,9 +12,11 @@ from .resolve import resolve, Action
 from .retrieve import recall
 from .consolidator import run_consolidate
 from .decay import compute_strength
-from .pruner import last_maintenance_time
+from .pruner import maintenance
 
 log = logging.getLogger("engram.handlers")
+
+MAX_CONTENT_LENGTH = 100_000  # 100KB
 
 
 def _validate_user_id(user_id: str) -> str:
@@ -66,6 +68,8 @@ def handle_store(db: MemoryDB, graph: MemoryGraph, content: str,
                  user_id: str = "default", metadata: dict | None = None) -> dict:
     if not content or not content.strip():
         return {"error": "content must be non-empty"}
+    if len(content) > MAX_CONTENT_LENGTH:
+        return {"error": f"content too large (max {MAX_CONTENT_LENGTH // 1000}KB)"}
     try:
         importance = min(max(float(importance), 0.0), 1.0)
     except (TypeError, ValueError):
@@ -122,6 +126,8 @@ def handle_store(db: MemoryDB, graph: MemoryGraph, content: str,
 def handle_update(db: MemoryDB, graph: MemoryGraph,
                   memory_id: int, new_content: str,
                   importance: float | None = None) -> dict:
+    if not new_content or not new_content.strip():
+        return {"error": "new_content must be non-empty"}
     try:
         memory_id = int(memory_id)
     except (TypeError, ValueError):
@@ -204,31 +210,33 @@ def handle_consolidate(db: MemoryDB, graph: MemoryGraph,
 
 
 def handle_stats(db: MemoryDB, user_id: str = "default") -> dict:
-    memories = db.get_all(user_id)
-    now = datetime.now(timezone.utc)
+    user_id = _validate_user_id(user_id)
 
-    categories: dict[str, int] = {}
+    # SQL aggregation — no full row loading
+    agg = db.get_stats_aggregate(user_id)
+    total = agg["total"]
+    categories = agg["categories"]
+
+    # Strength calculation — only load lightweight columns
+    strength_rows = db.get_strength_data(user_id)
+    now = datetime.now(timezone.utc)
     strengths: list[float] = []
-    for m in memories:
-        categories[m.category] = categories.get(m.category, 0) + 1
-        days = (now - m.last_accessed_at.replace(tzinfo=timezone.utc)).total_seconds() / 86400
-        strengths.append(compute_strength(m.category, m.importance, days, m.recall_count))
+    for cat, imp, last_accessed, recall_count in strength_rows:
+        days = (now - last_accessed.replace(tzinfo=timezone.utc)).total_seconds() / 86400
+        strengths.append(compute_strength(cat, imp, days, recall_count))
 
     result = {
-        "total": len(memories),
+        "total": total,
         "categories": categories,
         "avg_strength": round(sum(strengths) / len(strengths), 4) if strengths else 0,
-        "last_maintenance": last_maintenance_time.isoformat() if last_maintenance_time else None,
+        "last_maintenance": maintenance.last_time.isoformat() if maintenance.last_time else None,
+        "fts_available": db.fts_available,
     }
 
-    failures = []
-    progress_items = []
-    for m in memories:
-        meta = m.metadata or {}
-        if meta.get("type") == "failure":
-            failures.append(meta)
-        elif meta.get("type") == "progress":
-            progress_items.append(meta)
+    # Engineering stats — only load metadata column
+    all_meta = db.get_metadata_for_stats(user_id)
+    failures = [m for m in all_meta if m.get("type") == "failure"]
+    progress_items = [m for m in all_meta if m.get("type") == "progress"]
 
     eng_stats: dict = {}
     if failures:

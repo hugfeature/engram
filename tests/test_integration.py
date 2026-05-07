@@ -13,14 +13,19 @@ from engram.graph import MemoryGraph
 
 class TestGraphJsonPersistence:
     def test_save_and_reload(self, tmp_path):
+        db_path = str(tmp_path / "g.duckdb")
         path = str(tmp_path / "g.json")
+        db = MemoryDB(db_path, dim=768)
         g1 = MemoryGraph(path)
         g1.upsert_node(1, strength=0.9)
         g1.upsert_node(2, strength=0.7)
 
         vec = np.random.randn(768)
         vec = (vec / np.linalg.norm(vec)).tolist()
-        g1.index_memory(1, vec, {2: vec})
+        db.insert("memory 1", vec, 0.9, "fact", "default")
+        db.insert("memory 2", vec, 0.7, "fact", "default")
+        g1.index_memory_incremental(1, vec, db, "default", 0.9, "fact")
+        g1.index_memory_incremental(2, vec, db, "default", 0.7, "fact")
         g1.flush()
 
         g2 = MemoryGraph(path)
@@ -59,7 +64,7 @@ class TestGraphJsonPersistence:
 class TestSearchSimilarForDedup:
     @pytest.fixture
     def db(self, tmp_path):
-        return MemoryDB(str(tmp_path / "test.duckdb"))
+        return MemoryDB(str(tmp_path / "test.duckdb"), dim=768)
 
     def test_returns_similar(self, db):
         vec = np.ones(768)
@@ -88,8 +93,8 @@ class TestInputValidation:
 
     @pytest.fixture
     def setup(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("engram.server._db", MemoryDB(str(tmp_path / "t.duckdb")))
-        monkeypatch.setattr("engram.server._graph", MemoryGraph(str(tmp_path / "t.json")))
+        monkeypatch.setattr("engram.shared._db", MemoryDB(str(tmp_path / "t.duckdb"), dim=768))
+        monkeypatch.setattr("engram.shared._graph", MemoryGraph(str(tmp_path / "t.json")))
 
     @pytest.mark.asyncio
     async def test_recall_empty_query(self, setup):
@@ -133,10 +138,10 @@ class TestInputValidation:
 class TestServerUpdateMemory:
     @pytest.fixture
     def setup(self, tmp_path, monkeypatch):
-        db = MemoryDB(str(tmp_path / "t.duckdb"))
+        db = MemoryDB(str(tmp_path / "t.duckdb"), dim=768)
         graph = MemoryGraph(str(tmp_path / "t.json"))
-        monkeypatch.setattr("engram.server._db", db)
-        monkeypatch.setattr("engram.server._graph", graph)
+        monkeypatch.setattr("engram.shared._db", db)
+        monkeypatch.setattr("engram.shared._graph", graph)
         monkeypatch.setattr("engram.handlers.embed", lambda t: [0.1] * 768)
         return db
 

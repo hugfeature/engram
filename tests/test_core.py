@@ -85,7 +85,7 @@ class TestDB:
         from engram.db import MemoryDB
 
         db_path = str(tmp_path / "test.duckdb")
-        return MemoryDB(db_path)
+        return MemoryDB(db_path, dim=768)
 
     def test_insert_and_get(self, db):
         emb = [0.1] * 768
@@ -147,12 +147,16 @@ class TestDB:
 
 class TestGraph:
     @pytest.fixture
-    def graph(self, tmp_path):
+    def db_graph(self, tmp_path):
+        from engram.db import MemoryDB
         from engram.graph import MemoryGraph
 
-        return MemoryGraph(str(tmp_path / "test_graph.pkl"))
+        db = MemoryDB(str(tmp_path / "test.duckdb"), dim=768)
+        graph = MemoryGraph(str(tmp_path / "test_graph.json"))
+        return db, graph
 
-    def test_upsert_and_expand(self, graph):
+    def test_upsert_and_expand(self, db_graph):
+        db, graph = db_graph
         import numpy as np
 
         graph.upsert_node(1, strength=1.0)
@@ -162,21 +166,31 @@ class TestGraph:
         vec1 = (vec1 / np.linalg.norm(vec1)).tolist()
         vec2 = vec1[:]  # identical = high similarity
 
-        graph.index_memory(1, vec1, {2: vec2})
+        db.insert("memory 1", vec1, 0.8, "fact", "default")
+        db.insert("memory 2", vec2, 0.5, "fact", "default")
+        graph.index_memory_incremental(1, vec1, db, "default", 0.8, "fact")
+        graph.index_memory_incremental(2, vec2, db, "default", 0.5, "fact")
         neighbors = graph.expand([1], max_depth=1)
         assert any(mid == 2 for mid, _ in neighbors)
 
-    def test_chain_safe_prune(self, graph):
-        graph.upsert_node(1, strength=0.01)
-        graph.upsert_node(2, strength=0.01)
-        assert graph.chain_safe_to_prune(1, 0.05) is True
-
-        graph.upsert_node(3, strength=0.8)
+    def test_chain_safe_prune(self, db_graph):
+        db, graph = db_graph
         import numpy as np
         vec = np.random.randn(768)
         vec = (vec / np.linalg.norm(vec)).tolist()
-        graph.index_memory(1, vec, {3: vec})
-        assert graph.chain_safe_to_prune(1, 0.05) is False
+
+        # Isolated weak node → safe to prune
+        weak_id = db.insert("weak memory", vec, 0.05, "fact", "default")
+        graph.upsert_node(weak_id, strength=0.01)
+        assert graph.chain_safe_to_prune(weak_id, 0.05) is True
+
+        # Add a strong anchor connected to the weak node
+        anchor_id = db.insert("strong anchor", vec, 0.8, "fact", "default")
+        graph.upsert_node(anchor_id, strength=0.8)
+        graph.index_memory_incremental(anchor_id, vec, db, "default", 0.8, "fact")
+
+        # weak_id is now connected to anchor_id → not safe to prune
+        assert graph.chain_safe_to_prune(weak_id, 0.05) is False
 
 
 class TestConsolidator:
@@ -185,8 +199,8 @@ class TestConsolidator:
         from engram.db import MemoryDB
         from engram.graph import MemoryGraph
 
-        db = MemoryDB(str(tmp_path / "test.duckdb"))
-        graph = MemoryGraph(str(tmp_path / "test_graph.pkl"))
+        db = MemoryDB(str(tmp_path / "test.duckdb"), dim=768)
+        graph = MemoryGraph(str(tmp_path / "test_graph.json"))
         return db, graph
 
     def test_no_consolidation_when_dissimilar(self, setup):
