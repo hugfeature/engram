@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 import networkx as nx
 import numpy as np
 
-from .config import EDGE_THRESHOLD, EDGE_WEIGHT, MAX_EDGES
+from .config import EDGE_THRESHOLD, EDGE_WEIGHT, MAX_EDGES, GRAPH_MAX_DEPTH, PRUNE_THRESHOLD
 
 if TYPE_CHECKING:
     from .db import MemoryDB
@@ -220,9 +220,8 @@ class MemoryGraph:
                 category=category,
             )
 
-            from .config import EDGE_THRESHOLD as threshold
             candidates = db.search_vector(
-                embedding, user_id, top_k=top_k, threshold=threshold
+                embedding, user_id, top_k=top_k, threshold=EDGE_THRESHOLD
             )
 
             candidate_ids = [m.id for m in candidates if m.id != memory_id]
@@ -237,7 +236,7 @@ class MemoryGraph:
                 if not emb:
                     continue
                 sim = float(np.dot(new_vec, np.array(emb)))
-                if sim >= threshold:
+                if sim >= EDGE_THRESHOLD:
                     similarities.append((m.id, sim))
 
             similarities.sort(key=lambda x: x[1], reverse=True)
@@ -259,7 +258,7 @@ class MemoryGraph:
     def expand(
         self,
         seed_ids: list[int],
-        max_depth: int = 2,
+        max_depth: int = GRAPH_MAX_DEPTH,
         user_id: str | None = None,
     ) -> list[tuple[int, float]]:
         with self._lock:
@@ -312,7 +311,7 @@ class MemoryGraph:
             self._mark_dirty()
             self._save()
 
-    def chain_safe_to_prune(self, memory_id: int, threshold: float = 0.05) -> bool:
+    def chain_safe_to_prune(self, memory_id: int, threshold: float = PRUNE_THRESHOLD) -> bool:
         with self._lock:
             if memory_id not in self._graph:
                 return True

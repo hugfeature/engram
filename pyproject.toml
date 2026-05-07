@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-engram"
-version = "0.6.0"
+dynamic = ["version"]
 description = "Session handoff & persistent memory for AI Agents — Ebbinghaus decay, hybrid retrieval (BM25+vector+graph), engineering state tracking, auto-consolidation. Local-first, zero cloud dependency."
 readme = "README.md"
 license = "MIT"
@@ -46,6 +46,9 @@ packages = ["src/engram"]
 
 [tool.hatch.build.targets.wheel.sources]
 "src" = ""
+
+[tool.hatch.version]
+path = "src/engram/__init__.py"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]

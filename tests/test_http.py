@@ -37,8 +37,8 @@ class TestHealthAndTools:
         r = client.get("/v1/tools")
         assert r.status_code == 200
         names = [t["name"] for t in r.json()["tools"]]
-        assert "recall" in names
-        assert "store" in names
+        assert "recall_memory" in names
+        assert "store_memory" in names
 
 
 class TestStore:

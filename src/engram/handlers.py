@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from .db import MemoryDB
 from .graph import MemoryGraph
 from .embedding import embed
+from .config import DEDUP_SEARCH_THRESHOLD
 from .resolve import resolve, Action
 from .retrieve import recall
 from .consolidator import run_consolidate
@@ -17,6 +18,11 @@ from .pruner import maintenance
 log = logging.getLogger("engram.handlers")
 
 MAX_CONTENT_LENGTH = 100_000  # 100KB
+
+
+def _error(msg: str) -> dict:
+    """Standardized error response — all handlers use this."""
+    return {"ok": False, "error": msg}
 
 
 def _validate_user_id(user_id: str) -> str:
@@ -38,7 +44,7 @@ def handle_recall(db: MemoryDB, graph: MemoryGraph, query: str,
                   user_id: str = "default", top_k: int = 5,
                   session_id: str | None = None) -> dict:
     if not query or not query.strip():
-        return {"error": "query must be non-empty"}
+        return _error("query must be non-empty")
     user_id = _validate_user_id(user_id)
     top_k = min(max(int(top_k), 1), 100)
 
@@ -72,9 +78,9 @@ def handle_store(db: MemoryDB, graph: MemoryGraph, content: str,
                  importance: float, category: str = "fact",
                  user_id: str = "default", metadata: dict | None = None) -> dict:
     if not content or not content.strip():
-        return {"error": "content must be non-empty"}
+        return _error("content must be non-empty")
     if len(content) > MAX_CONTENT_LENGTH:
-        return {"error": f"content too large (max {MAX_CONTENT_LENGTH // 1000}KB)"}
+        return _error(f"content too large (max {MAX_CONTENT_LENGTH // 1000}KB)")
     try:
         importance = min(max(float(importance), 0.0), 1.0)
     except (TypeError, ValueError):
@@ -87,14 +93,14 @@ def handle_store(db: MemoryDB, graph: MemoryGraph, content: str,
         import json as _json
         try:
             if len(_json.dumps(metadata, ensure_ascii=False)) > 10_000:
-                return {"error": "metadata too large (max 10KB)"}
+                return _error("metadata too large (max 10KB)")
         except (TypeError, ValueError):
-            return {"error": "metadata must be JSON-serializable"}
+            return _error("metadata must be JSON-serializable")
 
     new_embedding = _safe_embed(content)
     if new_embedding is None:
-        return {"error": "Embedding generation failed", "error_code": "internal"}
-    existing = db.search_similar_for_dedup(new_embedding, user_id, top_k=10, threshold=0.60)
+        return _error("Embedding generation failed")
+    existing = db.search_similar_for_dedup(new_embedding, user_id, top_k=10, threshold=DEDUP_SEARCH_THRESHOLD)
     resolution = resolve(content, new_embedding, existing)
 
     result_id = None
@@ -115,7 +121,7 @@ def handle_store(db: MemoryDB, graph: MemoryGraph, content: str,
         merged = resolution.merged_content or content
         merged_emb = _safe_embed(merged)
         if merged_emb is None:
-            return {"error": "Embedding generation failed"}
+            return _error("Embedding generation failed")
         db.update(resolution.existing_id, merged, merged_emb, importance)
         msg = f"Merged into existing memory (id={resolution.existing_id})"
         result_id = resolution.existing_id
@@ -132,23 +138,20 @@ def handle_update(db: MemoryDB, graph: MemoryGraph,
                   memory_id: int, new_content: str,
                   importance: float | None = None) -> dict:
     if not new_content or not new_content.strip():
-        return {"error": "new_content must be non-empty", "error_code": "invalid_argument"}
+        return _error("new_content must be non-empty")
     if len(new_content) > MAX_CONTENT_LENGTH:
-        return {"error": f"new_content too large (max {MAX_CONTENT_LENGTH // 1000}KB)", "error_code": "unprocessable"}
-        return {"error": "new_content must be non-empty"}
-    if len(new_content) > MAX_CONTENT_LENGTH:
-        return {"error": f"new_content too large (max {MAX_CONTENT_LENGTH // 1000}KB)"}
+        return _error(f"new_content too large (max {MAX_CONTENT_LENGTH // 1000}KB)")
     try:
         memory_id = int(memory_id)
     except (TypeError, ValueError):
-        return {"error": "memory_id must be an integer", "error_code": "invalid_argument"}
+        return _error("memory_id must be an integer")
     existing = db.get_by_id(memory_id)
     if not existing:
-        return {"error": f"Memory {memory_id} not found", "error_code": "not_found"}
+        return _error(f"Memory {memory_id} not found")
 
     new_embedding = _safe_embed(new_content)
     if new_embedding is None:
-        return {"error": "Embedding generation failed", "error_code": "internal"}
+        return _error("Embedding generation failed")
     db.update(memory_id, new_content, new_embedding, importance)
 
     graph.index_memory_incremental(
@@ -165,7 +168,7 @@ def handle_session_handoff(db: MemoryDB, graph: MemoryGraph, summary: str,
                            next_steps: list[str] | None = None,
                            user_id: str = "default") -> dict:
     if not summary or not summary.strip():
-        return {"error": "summary must be non-empty"}
+        return _error("summary must be non-empty")
     user_id = _validate_user_id(user_id)
 
     completed = completed or []
@@ -197,7 +200,7 @@ def handle_session_handoff(db: MemoryDB, graph: MemoryGraph, summary: str,
 
     handoff_embedding = _safe_embed(content)
     if handoff_embedding is None:
-        return {"error": "Embedding generation failed"}
+        return _error("Embedding generation failed")
     mid = db.insert(content, handoff_embedding, 0.9, "strategy", user_id, metadata=meta)
     graph.index_memory_incremental(mid, handoff_embedding, db, user_id, 0.9, "strategy")
 
@@ -290,9 +293,9 @@ def handle_track_failure(db: MemoryDB, graph: MemoryGraph, error: str,
                          related_test_ids: list[str] | None = None,
                          user_id: str = "default") -> dict:
     if not error or not error.strip():
-        return {"error": "error must be non-empty"}
+        return _error("error must be non-empty")
     if not component or not component.strip():
-        return {"error": "component must be non-empty"}
+        return _error("component must be non-empty")
     if severity not in ("critical", "major", "minor"):
         severity = "major"
     user_id = _validate_user_id(user_id)
@@ -321,7 +324,7 @@ def handle_track_failure(db: MemoryDB, graph: MemoryGraph, error: str,
     importance = {"critical": 0.9, "major": 0.7, "minor": 0.5}[severity]
     emb = _safe_embed(content)
     if emb is None:
-        return {"error": "Embedding generation failed"}
+        return _error("Embedding generation failed")
     mid = db.insert(content, emb, importance, "failure", user_id, metadata=meta)
     graph.index_memory_incremental(mid, emb, db, user_id, importance, "failure")
 
@@ -335,10 +338,10 @@ def handle_track_progress(db: MemoryDB, graph: MemoryGraph, feature: str,
                           notes: str | None = None,
                           user_id: str = "default") -> dict:
     if not feature or not feature.strip():
-        return {"error": "feature must be non-empty"}
+        return _error("feature must be non-empty")
     valid_statuses = ("planning", "in_progress", "blocked", "review", "done")
     if status not in valid_statuses:
-        return {"error": f"status must be one of {valid_statuses}"}
+        return _error(f"status must be one of {valid_statuses}")
     try:
         completion = min(max(float(completion), 0), 100)
     except (TypeError, ValueError):
@@ -373,7 +376,7 @@ def handle_track_progress(db: MemoryDB, graph: MemoryGraph, feature: str,
     importance = importance_map[status]
     emb = _safe_embed(content)
     if emb is None:
-        return {"error": "Embedding generation failed"}
+        return _error("Embedding generation failed")
     mid = db.insert(content, emb, importance, "strategy", user_id, metadata=meta)
     graph.index_memory_incremental(mid, emb, db, user_id, importance, "strategy")
 
@@ -384,9 +387,9 @@ def handle_session_outcome(db: MemoryDB, graph: MemoryGraph, session_id: str,
                            outcome: str, notes: str | None = None,
                            user_id: str = "default") -> dict:
     if not session_id or not session_id.strip():
-        return {"error": "session_id must be non-empty"}
+        return _error("session_id must be non-empty")
     if outcome not in ("success", "failure"):
-        return {"error": "outcome must be 'success' or 'failure'"}
+        return _error("outcome must be 'success' or 'failure'")
     user_id = _validate_user_id(user_id)
 
     memory_ids = db.get_session_memories(session_id, user_id)
