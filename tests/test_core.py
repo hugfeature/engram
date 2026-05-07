@@ -144,6 +144,59 @@ class TestDB:
         db.insert("two", emb)
         assert db.count() == 2
 
+    def test_session_log_insert_and_query(self, db):
+        emb = [0.1] * 768
+        id1 = db.insert("m1", emb)
+        id2 = db.insert("m2", emb)
+        db.log_session_recall("sess_a", [id1, id2], "default")
+        ids = db.get_session_memories("sess_a", "default")
+        assert id1 in ids
+        assert id2 in ids
+
+    def test_session_log_empty_session(self, db):
+        ids = db.get_session_memories("nonexistent", "default")
+        assert ids == []
+
+    def test_session_log_distinct(self, db):
+        emb = [0.1] * 768
+        mid = db.insert("m1", emb)
+        db.log_session_recall("sess_dup", [mid], "default")
+        db.log_session_recall("sess_dup", [mid], "default")
+        ids = db.get_session_memories("sess_dup", "default")
+        assert ids.count(mid) == 1
+
+    def test_adjust_importance_batch_boost(self, db):
+        emb = [0.1] * 768
+        mid = db.insert("m1", emb, 0.5, "fact", "default")
+        db.adjust_importance_batch([mid], +0.05)
+        m = db.get_by_id(mid)
+        assert abs(m.importance - 0.55) < 1e-6
+
+    def test_adjust_importance_batch_reduce(self, db):
+        emb = [0.1] * 768
+        mid = db.insert("m1", emb, 0.5, "fact", "default")
+        db.adjust_importance_batch([mid], -0.02)
+        m = db.get_by_id(mid)
+        assert abs(m.importance - 0.48) < 1e-6
+
+    def test_adjust_importance_batch_clamp_upper(self, db):
+        emb = [0.1] * 768
+        mid = db.insert("m1", emb, 0.98, "fact", "default")
+        db.adjust_importance_batch([mid], +0.05)
+        m = db.get_by_id(mid)
+        assert m.importance <= 1.0
+
+    def test_adjust_importance_batch_clamp_lower(self, db):
+        emb = [0.1] * 768
+        mid = db.insert("m1", emb, 0.01, "fact", "default")
+        db.adjust_importance_batch([mid], -0.05)
+        m = db.get_by_id(mid)
+        assert m.importance >= 0.0
+
+    def test_adjust_importance_batch_empty(self, db):
+        result = db.adjust_importance_batch([], 0.1)
+        assert result == 0
+
 
 class TestGraph:
     @pytest.fixture
