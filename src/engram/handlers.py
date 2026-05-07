@@ -133,6 +133,8 @@ def handle_update(db: MemoryDB, graph: MemoryGraph,
                   importance: float | None = None) -> dict:
     if not new_content or not new_content.strip():
         return {"error": "new_content must be non-empty"}
+    if len(new_content) > MAX_CONTENT_LENGTH:
+        return {"error": f"new_content too large (max {MAX_CONTENT_LENGTH // 1000}KB)"}
     try:
         memory_id = int(memory_id)
     except (TypeError, ValueError):
