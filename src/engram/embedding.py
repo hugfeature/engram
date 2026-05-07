@@ -20,6 +20,13 @@ _model_lock = threading.Lock()
 _dimensions: int | None = None
 _degraded = False
 
+# Embedding result cache — avoids re-encoding identical text (e.g. during consolidation)
+_EMBED_CACHE_MAX = 512
+_EMBED_CACHE_MAX_KEY_LEN = 1000  # Truncate cache keys longer than this
+_embed_cache: dict[str, list[float]] = {}
+_embed_cache_order: list[str] = []
+_cache_lock = threading.Lock()
+
 
 def is_degraded() -> bool:
     return _degraded
@@ -28,19 +35,21 @@ def is_degraded() -> bool:
 def try_recover() -> bool:
     """Attempt to exit degraded mode if model loads successfully."""
     global _degraded, _model
-    if not _degraded:
-        return True
-    try:
-        from sentence_transformers import SentenceTransformer
-        cache_dir = os.path.join(os.path.expanduser("~"), ".engram", "model_cache")
-        m = SentenceTransformer(MODEL_NAME, cache_folder=cache_dir, local_files_only=True)
-        m.encode("warmup", normalize_embeddings=True)
-        _model = m
-        _degraded = False
-        log.info("Recovered from degraded mode — model loaded successfully")
-        return True
-    except Exception:
-        return False
+    with _model_lock:
+        if not _degraded:
+            return True
+        try:
+            from sentence_transformers import SentenceTransformer
+            cache_dir = os.path.join(os.path.expanduser("~"), ".engram", "model_cache")
+            m = SentenceTransformer(MODEL_NAME, cache_folder=cache_dir, local_files_only=True)
+            m.encode("warmup", normalize_embeddings=True)
+            _model = m
+            _degraded = False
+            log.info("Recovered from degraded mode — model loaded successfully")
+            return True
+        except Exception as e:
+            log.warning("Recovery attempt failed: %s", e)
+            return False
 
 
 def _load_model_in_thread(result: dict, cache_dir: str):
@@ -81,6 +90,8 @@ def _get_model() -> SentenceTransformer | None:
                         MODEL_LOAD_TIMEOUT,
                     )
                     _degraded = True
+                    # Don't return immediately — the daemon thread may still finish.
+                    # If it completes later, try_recover() can restore normal mode.
                     return None
 
                 if "error" in result:
@@ -114,13 +125,24 @@ def get_dimensions() -> int:
 
 
 def embed(text: str) -> list[float]:
+    cache_key = text[:_EMBED_CACHE_MAX_KEY_LEN]
+    with _cache_lock:
+        if cache_key in _embed_cache:
+            return _embed_cache[cache_key]
     model = _get_model()
     if model is None:
         log.warning("Embedding in degraded mode — returning zero vector")
         return [0.0] * get_dimensions()
     try:
         vec = model.encode(text, normalize_embeddings=True)
-        return vec.tolist()
+        result = vec.tolist()
+        with _cache_lock:
+            _embed_cache[cache_key] = result
+            _embed_cache_order.append(cache_key)
+            while len(_embed_cache) > _EMBED_CACHE_MAX:
+                oldest = _embed_cache_order.pop(0)
+                _embed_cache.pop(oldest, None)
+        return result
     except Exception as e:
         log.error("Embedding encode failed for text (%d chars): %s", len(text), e)
         return [0.0] * get_dimensions()

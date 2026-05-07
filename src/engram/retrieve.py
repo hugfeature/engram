@@ -18,6 +18,8 @@ from .config import (
     W_BM25, W_VECTOR, GRAPH_MAX_DEPTH,
 )
 
+log = logging.getLogger("engram.retrieve")
+
 
 @dataclass
 class RecallResult:
@@ -41,8 +43,6 @@ def recall(
     query_embedding = embed(query)
 
     internal_k = max(20, top_k)
-
-    log = logging.getLogger("engram.retrieve")
 
     vector_results = db.search_vector(
         query_embedding, user_id, top_k=internal_k, threshold=SIMILARITY_HIGH
@@ -87,20 +87,21 @@ def recall(
     if seed_ids:
         graph_neighbors = graph.expand(seed_ids, max_depth=GRAPH_MAX_DEPTH, user_id=user_id)
         neighbor_ids = [mid for mid, _ in graph_neighbors[:top_k] if mid not in scored]
-        neighbor_batch = db.get_by_ids_batch(neighbor_ids) if neighbor_ids else {}
-        neighbor_emb_batch = db.get_embeddings_batch(neighbor_ids) if neighbor_ids else {}
+        neighbor_batch = db.get_neighbors_batch(neighbor_ids) if neighbor_ids else {}
         for mid, cum_weight in graph_neighbors[:top_k]:
             if mid in scored:
                 continue
-            m = neighbor_batch.get(mid)
-            if not m or m.user_id != user_id:
+            entry = neighbor_batch.get(mid)
+            if not entry:
+                continue
+            m, emb = entry
+            if m.user_id != user_id:
                 continue
             days = (now - m.last_accessed_at.replace(tzinfo=timezone.utc)).total_seconds() / 86400
             strength = compute_strength(m.category, m.importance, days, m.recall_count)
             bm25_raw = fts_by_id.get(mid, 0.0)
             bm25_norm = bm25_raw / max_bm25
 
-            emb = neighbor_emb_batch.get(mid)
             sim = 0.0
             if emb:
                 sim = float(np.dot(np.array(query_embedding), np.array(emb)))

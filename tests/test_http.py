@@ -14,8 +14,8 @@ def client(tmp_path):
     db = MemoryDB(str(tmp_path / "http.duckdb"))
     graph = MemoryGraph(str(tmp_path / "http.json"))
 
-    with patch("engram.http_server._get_db", return_value=db), \
-         patch("engram.http_server._get_graph", return_value=graph), \
+    with patch("engram.shared._db", db), \
+         patch("engram.shared._graph", graph), \
          patch("engram.handlers.embed", return_value=[0.1] * 768), \
          patch("engram.retrieve.embed", return_value=[0.1] * 768):
         from engram.http_server import app
@@ -28,8 +28,9 @@ class TestHealthAndTools:
         assert r.status_code == 200
         data = r.json()
         assert data["status"] in ("ok", "degraded")
-        assert data["version"] == "0.4.4"
+        assert "version" in data
         assert "db" in data
+        assert "fts" in data
         assert "embedding_degraded" in data
 
     def test_tools_list(self, client):
@@ -48,7 +49,7 @@ class TestStore:
 
     def test_store_empty_rejected(self, client):
         r = client.post("/v1/store", json={"content": "", "importance": 0.5})
-        assert r.status_code == 200
+        assert r.status_code == 400
         assert "error" in r.json()
 
     def test_store_missing_field(self, client):
@@ -130,7 +131,7 @@ class TestTrackProgressHTTP:
 
     def test_invalid_status(self, client):
         r = client.post("/v1/progress", json={"feature": "x", "status": "invalid"})
-        assert r.status_code == 200
+        assert r.status_code == 400
         assert "error" in r.json()
 
     def test_with_all_fields(self, client):

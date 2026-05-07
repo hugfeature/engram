@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from mcp.server import Server as MCPServer
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import TextContent
 
-from .db import MemoryDB
-from .graph import MemoryGraph
 from .pruner import start_scheduler
 from .embedding import is_degraded
 from .tools import TOOL_SCHEMAS
@@ -23,8 +21,8 @@ from .handlers import (
     handle_recall, handle_store, handle_update,
     handle_session_handoff, handle_consolidate, handle_stats,
     handle_track_failure, handle_track_progress,
-    TOOL_HANDLERS, ARG_MAPPING,
 )
+from .shared import get_db, get_graph, dispatch_tool, _db, _graph
 from . import __version__
 
 logging.basicConfig(
@@ -33,25 +31,6 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 log = logging.getLogger("engram.http")
-
-# --- Singletons (shared by REST + MCP) ---
-
-_db: MemoryDB | None = None
-_graph: MemoryGraph | None = None
-
-
-def _get_db() -> MemoryDB:
-    global _db
-    if _db is None:
-        _db = MemoryDB()
-    return _db
-
-
-def _get_graph() -> MemoryGraph:
-    global _graph
-    if _graph is None:
-        _graph = MemoryGraph()
-    return _graph
 
 
 # --- MCP Server ---
@@ -66,21 +45,7 @@ async def list_tools():
 
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    db = _get_db()
-    graph = _get_graph()
-
-    handler = TOOL_HANDLERS.get(name)
-    if not handler:
-        return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
-
-    arg_map = ARG_MAPPING.get(name, {})
-    kwargs = {}
-    for mcp_key, handler_key in arg_map.items():
-        if mcp_key in arguments:
-            kwargs[handler_key] = arguments[mcp_key]
-
-    result = handler(db, graph, **kwargs)
-    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+    return dispatch_tool(name, arguments)
 
 
 session_mgr = StreamableHTTPSessionManager(app=mcp_server, stateless=True)
@@ -92,11 +57,11 @@ session_mgr = StreamableHTTPSessionManager(app=mcp_server, stateless=True)
 async def lifespan(app: FastAPI):
     scheduler = None
     try:
-        _get_db()
+        get_db()
     except Exception as e:
         log.error("DB init failed (degraded mode): %s", e)
     try:
-        _get_graph()
+        get_graph()
     except Exception as e:
         log.error("Graph init failed (degraded mode): %s", e)
     try:
@@ -195,77 +160,87 @@ class TrackProgressRequest(BaseModel):
 
 # --- REST Routes ---
 
+
+def _respond(result: dict) -> dict | JSONResponse:
+    """Return 400 JSON if handler returned an error dict, otherwise 200."""
+    if "error" in result and len(result) <= 2:
+        return JSONResponse(content=result, status_code=400)
+    return result
+
+
 @app.post("/v1/recall")
 def recall_endpoint(req: RecallRequest):
-    return handle_recall(_get_db(), _get_graph(),
-                         query=req.query, user_id=req.user_id, top_k=req.top_k)
+    return _respond(handle_recall(get_db(), get_graph(),
+                         query=req.query, user_id=req.user_id, top_k=req.top_k))
 
 
 @app.post("/v1/store")
 def store_endpoint(req: StoreRequest):
-    return handle_store(_get_db(), _get_graph(),
+    return _respond(handle_store(get_db(), get_graph(),
                         content=req.content, importance=req.importance,
                         category=req.category, user_id=req.user_id,
-                        metadata=req.metadata)
+                        metadata=req.metadata))
 
 
 @app.post("/v1/update")
 def update_endpoint(req: UpdateRequest):
-    return handle_update(_get_db(), _get_graph(),
+    return _respond(handle_update(get_db(), get_graph(),
                          memory_id=req.memory_id, new_content=req.new_content,
-                         importance=req.importance)
+                         importance=req.importance))
 
 
 @app.post("/v1/handoff")
 def handoff_endpoint(req: HandoffRequest):
-    return handle_session_handoff(
-        _get_db(), _get_graph(),
+    return _respond(handle_session_handoff(
+        get_db(), get_graph(),
         summary=req.summary, completed=req.completed,
         in_progress=req.in_progress, blocked=req.blocked,
         next_steps=req.next_steps, user_id=req.user_id,
-    )
+    ))
 
 
 @app.post("/v1/consolidate")
 def consolidate_endpoint(req: ConsolidateRequest):
-    return handle_consolidate(_get_db(), _get_graph(), user_id=req.user_id)
+    return _respond(handle_consolidate(get_db(), get_graph(), user_id=req.user_id))
 
 
 @app.post("/v1/stats")
 def stats_endpoint(req: StatsRequest):
-    return handle_stats(_get_db(), user_id=req.user_id)
+    return _respond(handle_stats(get_db(), user_id=req.user_id))
 
 
 @app.post("/v1/failure")
 def failure_endpoint(req: TrackFailureRequest):
-    return handle_track_failure(
-        _get_db(), _get_graph(),
+    return _respond(handle_track_failure(
+        get_db(), get_graph(),
         error=req.error, component=req.component,
         root_cause=req.root_cause, severity=req.severity,
         fix=req.fix, related_test_ids=req.related_test_ids,
         user_id=req.user_id,
-    )
+    ))
 
 
 @app.post("/v1/progress")
 def progress_endpoint(req: TrackProgressRequest):
-    return handle_track_progress(
-        _get_db(), _get_graph(),
+    return _respond(handle_track_progress(
+        get_db(), get_graph(),
         feature=req.feature, status=req.status,
         completion=req.completion, blockers=req.blockers,
         quality_score=req.quality_score, notes=req.notes,
         user_id=req.user_id,
-    )
+    ))
 
 
 @app.get("/v1/health")
 @app.get("/health")
 def health():
+    fts_ok = False
     db_ok = False
     try:
         if _db is not None:
             _db.conn.execute("SELECT 1").fetchone()
             db_ok = True
+            fts_ok = _db.fts_available
     except Exception:
         pass
     graph_ok = _graph is not None
@@ -276,6 +251,7 @@ def health():
         "version": __version__,
         "db": db_ok,
         "graph": graph_ok,
+        "fts": fts_ok,
         "embedding_degraded": degraded,
         "transports": ["rest", "mcp-streamable-http"],
     }
