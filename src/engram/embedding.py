@@ -127,8 +127,12 @@ def get_dimensions() -> int:
 def embed(text: str) -> list[float]:
     cache_key = text[:_EMBED_CACHE_MAX_KEY_LEN]
     with _cache_lock:
-        if cache_key in _embed_cache:
-            return _embed_cache[cache_key]
+        cached = _embed_cache.get(cache_key)
+        if cached is not None:
+            if cache_key in _embed_cache_order:
+                _embed_cache_order.remove(cache_key)
+            _embed_cache_order.append(cache_key)
+            return cached
     model = _get_model()
     if model is None:
         log.warning("Embedding in degraded mode — returning zero vector")
@@ -138,8 +142,10 @@ def embed(text: str) -> list[float]:
         result = vec.tolist()
         with _cache_lock:
             _embed_cache[cache_key] = result
+            if cache_key in _embed_cache_order:
+                _embed_cache_order.remove(cache_key)
             _embed_cache_order.append(cache_key)
-            while len(_embed_cache) > _EMBED_CACHE_MAX:
+            while len(_embed_cache) > _EMBED_CACHE_MAX and _embed_cache_order:
                 oldest = _embed_cache_order.pop(0)
                 _embed_cache.pop(oldest, None)
         return result

@@ -171,9 +171,16 @@ class SessionOutcomeRequest(BaseModel):
 
 
 def _respond(result: dict) -> dict | JSONResponse:
-    """Return 400 JSON if handler returned an error dict, otherwise 200."""
-    if "error" in result and len(result) <= 2:
-        return JSONResponse(content=result, status_code=400)
+    """Map handler errors to HTTP 4xx/5xx, otherwise return 200."""
+    if "error" in result:
+        err = str(result.get("error", "")).lower()
+        if "not found" in err:
+            code = 404
+        else:
+            code = 400
+        return JSONResponse(content=result, status_code=code)
+    if "result" in result and "failed" in str(result.get("result", "")).lower():
+        return JSONResponse(content=result, status_code=500)
     return result
 
 
