@@ -8,6 +8,7 @@ import logging
 import os
 import threading
 import time
+import warnings
 from collections import deque
 from typing import TYPE_CHECKING
 
@@ -32,6 +33,7 @@ class MemoryGraph:
         self._lock = threading.RLock()
         self._dirty = False
         self._last_flush_time = 0.0
+        self._pkl_pending_delete: str | None = None
         atexit.register(self.flush)
         os.makedirs(os.path.dirname(graph_path), exist_ok=True)
         self._graph: nx.DiGraph = self._load_graph(graph_path)
@@ -60,15 +62,12 @@ class MemoryGraph:
                 with open(pkl_path, "rb") as f:
                     g = pickle.load(f)
                 self._dirty = True
+                # Mark pkl for deletion — will be removed after successful json flush
+                self._pkl_pending_delete = pkl_path
                 return g
             except Exception as e:
                 log.error("Failed to load graph.pkl: %s — starting empty", e)
                 return nx.DiGraph()
-            finally:
-                try:
-                    os.remove(pkl_path)
-                except OSError:
-                    pass
 
         return nx.DiGraph()
 
@@ -76,14 +75,26 @@ class MemoryGraph:
         self._dirty = True
 
     def _flush(self):
+        tmp_path = self._path + ".tmp"
         try:
             data = nx.node_link_data(self._graph)
-            tmp_path = self._path + ".tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
             os.replace(tmp_path, self._path)
             self._dirty = False
+            # Delete old pickle file only after successful json write
+            if self._pkl_pending_delete:
+                try:
+                    os.remove(self._pkl_pending_delete)
+                except OSError:
+                    pass
+                self._pkl_pending_delete = None
         except Exception as e:
+            # Clean up temp file on failure
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
             log.error("Failed to flush graph to %s: %s (will retry)", self._path, e)
 
     def _save(self):
@@ -136,6 +147,17 @@ class MemoryGraph:
         importance: float = 0.5,
         category: str = "fact",
     ):
+        """Build graph edges by comparing against all embeddings (O(n)).
+
+        .. deprecated::
+            Use ``index_memory_incremental`` instead, which uses DB vector search
+            and avoids loading all embeddings into memory.
+        """
+        warnings.warn(
+            "index_memory is deprecated — use index_memory_incremental instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         with self._lock:
             self._graph.add_node(
                 memory_id,

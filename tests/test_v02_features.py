@@ -12,7 +12,7 @@ from engram.graph import MemoryGraph
 class TestMetadataColumn:
     @pytest.fixture
     def db(self, tmp_path):
-        return MemoryDB(str(tmp_path / "test.duckdb"))
+        return MemoryDB(str(tmp_path / "test.duckdb"), dim=768)
 
     def test_default_metadata_is_empty_dict(self, db):
         vec = [0.1] * 768
@@ -81,10 +81,10 @@ class TestParseMetadata:
 class TestSessionHandoff:
     @pytest.fixture
     def setup(self, tmp_path, monkeypatch):
-        db = MemoryDB(str(tmp_path / "t.duckdb"))
+        db = MemoryDB(str(tmp_path / "t.duckdb"), dim=768)
         graph = MemoryGraph(str(tmp_path / "t.json"))
-        monkeypatch.setattr("engram.server._db", db)
-        monkeypatch.setattr("engram.server._graph", graph)
+        monkeypatch.setattr("engram.shared._db", db)
+        monkeypatch.setattr("engram.shared._graph", graph)
         monkeypatch.setattr("engram.handlers.embed", lambda t: [0.1] * 768)
         return db
 
@@ -159,10 +159,10 @@ class TestSessionHandoff:
 class TestStoreWithMetadata:
     @pytest.fixture
     def setup(self, tmp_path, monkeypatch):
-        db = MemoryDB(str(tmp_path / "t.duckdb"))
+        db = MemoryDB(str(tmp_path / "t.duckdb"), dim=768)
         graph = MemoryGraph(str(tmp_path / "t.json"))
-        monkeypatch.setattr("engram.server._db", db)
-        monkeypatch.setattr("engram.server._graph", graph)
+        monkeypatch.setattr("engram.shared._db", db)
+        monkeypatch.setattr("engram.shared._graph", graph)
         monkeypatch.setattr("engram.handlers.embed", lambda t: [0.1] * 768)
         return db
 
@@ -206,10 +206,10 @@ class TestStoreWithMetadata:
 class TestRecallWithMetadata:
     @pytest.fixture
     def setup(self, tmp_path, monkeypatch):
-        db = MemoryDB(str(tmp_path / "t.duckdb"))
+        db = MemoryDB(str(tmp_path / "t.duckdb"), dim=768)
         graph = MemoryGraph(str(tmp_path / "t.json"))
-        monkeypatch.setattr("engram.server._db", db)
-        monkeypatch.setattr("engram.server._graph", graph)
+        monkeypatch.setattr("engram.shared._db", db)
+        monkeypatch.setattr("engram.shared._graph", graph)
         monkeypatch.setattr("engram.handlers.embed", lambda t: [0.1] * 768)
         monkeypatch.setattr("engram.retrieve.embed", lambda t: [0.1] * 768)
         return db
@@ -248,10 +248,10 @@ class TestRecallWithMetadata:
 class TestBackwardCompat:
     @pytest.fixture
     def setup(self, tmp_path, monkeypatch):
-        db = MemoryDB(str(tmp_path / "t.duckdb"))
+        db = MemoryDB(str(tmp_path / "t.duckdb"), dim=768)
         graph = MemoryGraph(str(tmp_path / "t.json"))
-        monkeypatch.setattr("engram.server._db", db)
-        monkeypatch.setattr("engram.server._graph", graph)
+        monkeypatch.setattr("engram.shared._db", db)
+        monkeypatch.setattr("engram.shared._graph", graph)
         monkeypatch.setattr("engram.handlers.embed", lambda t: [0.1] * 768)
         return db
 

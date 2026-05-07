@@ -28,7 +28,7 @@ class TestDaemonHelpers:
     def test_is_running_current_pid(self, monkeypatch):
         from engram.daemon import _is_running
         monkeypatch.setattr("subprocess.check_output",
-                            lambda *a, **kw: "python engram server")
+                            lambda *a, **kw: "python -m engram.http_server --port 8900")
         assert _is_running(os.getpid()) is True
 
     def test_is_running_invalid_pid(self, monkeypatch):
@@ -241,3 +241,25 @@ class TestGraphFlush:
         g2 = MemoryGraph(path)
         assert 1 in g2._graph
         assert 2 in g2._graph
+
+
+# --- v0.4.6: content length validation ---
+
+class TestContentLength:
+    def test_store_rejects_oversized_content(self, tmp_path, monkeypatch):
+        db = MemoryDB(str(tmp_path / "len.duckdb"))
+        graph = MemoryGraph(str(tmp_path / "len.json"))
+        monkeypatch.setattr("engram.handlers.embed", lambda t: [0.1] * 768)
+        from engram.handlers import handle_store
+        big = "x" * 200_000
+        result = handle_store(db, graph, content=big, importance=0.5)
+        assert "error" in result
+        assert "too large" in result["error"]
+
+    def test_store_accepts_normal_content(self, tmp_path, monkeypatch):
+        db = MemoryDB(str(tmp_path / "len2.duckdb"))
+        graph = MemoryGraph(str(tmp_path / "len2.json"))
+        monkeypatch.setattr("engram.handlers.embed", lambda t: [0.1] * 768)
+        from engram.handlers import handle_store
+        result = handle_store(db, graph, content="normal content", importance=0.5)
+        assert "memory_id" in result

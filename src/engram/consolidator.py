@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 import numpy as np
 
@@ -13,14 +14,25 @@ from .config import CONSOLIDATE_THRESHOLD
 
 log = logging.getLogger("engram.consolidator")
 
+_CJK_PATTERN = re.compile(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]')
+
+
+def _has_cjk(text: str) -> bool:
+    return bool(_CJK_PATTERN.search(text))
+
 
 def _merge_pair(content_a: str, content_b: str) -> str:
-    words_a = set(content_a.lower().split())
-    words_b = set(content_b.lower().split())
-    unique_b = words_b - words_a
-
-    if len(unique_b) < 3:
-        return max(content_a, content_b, key=len)
+    # CJK text: whitespace splitting is meaningless, use character-level diff
+    if _has_cjk(content_a) or _has_cjk(content_b):
+        chars_b = set(content_b) - set(content_a)
+        if len(chars_b) < 2:
+            return max(content_a, content_b, key=len)
+    else:
+        words_a = set(content_a.lower().split())
+        words_b = set(content_b.lower().split())
+        unique_b = words_b - words_a
+        if len(unique_b) < 3:
+            return max(content_a, content_b, key=len)
 
     if len(content_a) >= len(content_b):
         base, extra = content_a, content_b
@@ -134,10 +146,8 @@ def run_consolidate(
             continue
         db.update(keep_id, merged_content, merged_emb, best_importance)
 
-        all_emb = {mid: emb for mid, emb in embeddings.items() if mid not in remove_ids}
-        all_emb[keep_id] = merged_emb
-        graph.index_memory(
-            keep_id, merged_emb, all_emb,
+        graph.index_memory_incremental(
+            keep_id, merged_emb, db,
             user_id, best_importance, meta_map[keep_id]["category"],
         )
 

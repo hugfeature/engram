@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-engram"
-version = "0.4.4"
-description = "Every thought leaves a trace — persistent memory service for AI Agents (MCP + HTTP/REST) with Ebbinghaus decay, vector search, and graph expansion"
+version = "0.5.2"
+description = "Session handoff & persistent memory for AI Agents — Ebbinghaus decay, hybrid retrieval (BM25+vector+graph), engineering state tracking, auto-consolidation. Local-first, zero cloud dependency."
 readme = "README.md"
 license = "MIT"
 authors = [

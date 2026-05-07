@@ -37,11 +37,14 @@ def _is_running(pid: int | None = None) -> bool:
     except OSError:
         return False
     try:
-        import subprocess
         out = subprocess.check_output(
             ["ps", "-p", str(pid), "-o", "command="], text=True, timeout=5
         )
-        return "engram" in out.lower()
+        # Match engram-specific invocations, not arbitrary processes containing "engram"
+        return any(
+            marker in out
+            for marker in ("engram.http_server", "engram.server", "-m engram")
+        )
     except Exception:
         return True
 
