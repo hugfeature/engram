@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
@@ -22,7 +23,7 @@ _degraded = False
 
 # Embedding result cache — avoids re-encoding identical text (e.g. during consolidation)
 _EMBED_CACHE_MAX = 512
-_EMBED_CACHE_MAX_KEY_LEN = 1000  # Truncate cache keys longer than this
+_EMBED_CACHE_MAX_KEY_LEN = 1000  # Limit debug key preview length
 _embed_cache: dict[str, list[float]] = {}
 _embed_cache_order: list[str] = []
 _cache_lock = threading.Lock()
@@ -124,8 +125,15 @@ def get_dimensions() -> int:
     return _dimensions
 
 
+def _cache_key(text: str) -> str:
+    """Stable cache key to avoid collisions on truncated long text."""
+    digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+    preview = text[:_EMBED_CACHE_MAX_KEY_LEN]
+    return f"{digest}:{preview}"
+
+
 def embed(text: str) -> list[float]:
-    cache_key = text[:_EMBED_CACHE_MAX_KEY_LEN]
+    cache_key = _cache_key(text)
     with _cache_lock:
         cached = _embed_cache.get(cache_key)
         if cached is not None:
