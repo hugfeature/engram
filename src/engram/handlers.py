@@ -93,7 +93,7 @@ def handle_store(db: MemoryDB, graph: MemoryGraph, content: str,
 
     new_embedding = _safe_embed(content)
     if new_embedding is None:
-        return {"error": "Embedding generation failed"}
+        return {"error": "Embedding generation failed", "error_code": "internal"}
     existing = db.search_similar_for_dedup(new_embedding, user_id, top_k=10, threshold=0.60)
     resolution = resolve(content, new_embedding, existing)
 
@@ -132,20 +132,23 @@ def handle_update(db: MemoryDB, graph: MemoryGraph,
                   memory_id: int, new_content: str,
                   importance: float | None = None) -> dict:
     if not new_content or not new_content.strip():
+        return {"error": "new_content must be non-empty", "error_code": "invalid_argument"}
+    if len(new_content) > MAX_CONTENT_LENGTH:
+        return {"error": f"new_content too large (max {MAX_CONTENT_LENGTH // 1000}KB)", "error_code": "unprocessable"}
         return {"error": "new_content must be non-empty"}
     if len(new_content) > MAX_CONTENT_LENGTH:
         return {"error": f"new_content too large (max {MAX_CONTENT_LENGTH // 1000}KB)"}
     try:
         memory_id = int(memory_id)
     except (TypeError, ValueError):
-        return {"error": "memory_id must be an integer"}
+        return {"error": "memory_id must be an integer", "error_code": "invalid_argument"}
     existing = db.get_by_id(memory_id)
     if not existing:
-        return {"error": f"Memory {memory_id} not found"}
+        return {"error": f"Memory {memory_id} not found", "error_code": "not_found"}
 
     new_embedding = _safe_embed(new_content)
     if new_embedding is None:
-        return {"error": "Embedding generation failed"}
+        return {"error": "Embedding generation failed", "error_code": "internal"}
     db.update(memory_id, new_content, new_embedding, importance)
 
     graph.index_memory_incremental(
@@ -207,6 +210,7 @@ def handle_consolidate(db: MemoryDB, graph: MemoryGraph,
         results = run_consolidate(db, graph, user_id)
     except Exception as e:
         log.error("Consolidation failed: %s", e)
+        return {"error": f"consolidation failed: {e}", "error_code": "internal", "details": [], "status_code": 500}
         return {"error": f"consolidation failed: {e}", "details": [], "status_code": 500}
     if not results:
         msg = "No similar memories found to consolidate"
