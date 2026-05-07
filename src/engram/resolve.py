@@ -13,6 +13,8 @@ from .config import DEDUP_THRESHOLD, REINFORCE_THRESHOLD
 
 _PUNCT_RE = re.compile(r"[^\w\s']", re.UNICODE)
 
+# Polarity detection — English-only word lists.
+# CJK and other languages will return None polarity (treated as neutral).
 POSITIVE_WORDS = {
     "love", "like", "prefer", "use", "adopt", "enjoy", "want", "choose",
     "recommend", "support", "favor", "embrace",

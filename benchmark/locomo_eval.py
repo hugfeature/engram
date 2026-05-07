@@ -169,13 +169,18 @@ class FlexDimDB(MemoryDB):
                 category VARCHAR NOT NULL DEFAULT 'fact',
                 recall_count INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP NOT NULL DEFAULT now(),
-                last_accessed_at TIMESTAMP NOT NULL DEFAULT now()
+                last_accessed_at TIMESTAMP NOT NULL DEFAULT now(),
+                metadata JSON DEFAULT '{{}}'::JSON
             )
         """)
         try:
-            self.conn.execute("INSTALL fts; LOAD fts;")
-        except Exception:
-            pass
+            self.conn.execute("INSTALL fts")
+            self.conn.execute("LOAD fts")
+            self.conn.execute(
+                "PRAGMA create_fts_index('memories', 'id', 'content', overwrite=0)"
+            )
+        except Exception as e:
+            print(f"  Warning: FTS init failed: {e}")
 
     def insert(self, content, embedding, importance=0.5, category="fact", user_id="default"):
         result = self.conn.execute(
@@ -426,7 +431,7 @@ def run_benchmark(
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db = make_db(tmpdir)
-            graph = MemoryGraph(graph_path=os.path.join(tmpdir, "graph.pkl"))
+            graph = MemoryGraph(graph_path=os.path.join(tmpdir, "graph.json"))
 
             # Ingest
             turn_id_map: dict[str, int] = {}
