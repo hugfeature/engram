@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-engram"
-version = "0.5.2"
+version = "0.6.0"
 description = "Session handoff & persistent memory for AI Agents — Ebbinghaus decay, hybrid retrieval (BM25+vector+graph), engineering state tracking, auto-consolidation. Local-first, zero cloud dependency."
 readme = "README.md"
 license = "MIT"

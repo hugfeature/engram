@@ -35,13 +35,18 @@ def _safe_embed(content: str) -> list[float] | None:
 
 
 def handle_recall(db: MemoryDB, graph: MemoryGraph, query: str,
-                  user_id: str = "default", top_k: int = 5) -> dict:
+                  user_id: str = "default", top_k: int = 5,
+                  session_id: str | None = None) -> dict:
     if not query or not query.strip():
         return {"error": "query must be non-empty"}
     user_id = _validate_user_id(user_id)
     top_k = min(max(int(top_k), 1), 100)
 
     results = recall(query, db, graph, user_id, top_k)
+
+    if session_id and results:
+        db.log_session_recall(session_id, [r.id for r in results], user_id)
+
     meta_batch = db.get_metadata_batch([r.id for r in results]) if results else {}
 
     memories_out = []
@@ -369,6 +374,52 @@ def handle_track_progress(db: MemoryDB, graph: MemoryGraph, feature: str,
     return {"result": f"Progress tracked (id={mid})", "memory_id": mid}
 
 
+def handle_session_outcome(db: MemoryDB, graph: MemoryGraph, session_id: str,
+                           outcome: str, notes: str | None = None,
+                           user_id: str = "default") -> dict:
+    if not session_id or not session_id.strip():
+        return {"error": "session_id must be non-empty"}
+    if outcome not in ("success", "failure"):
+        return {"error": "outcome must be 'success' or 'failure'"}
+    user_id = _validate_user_id(user_id)
+
+    memory_ids = db.get_session_memories(session_id, user_id)
+    if not memory_ids:
+        return {
+            "result": "No memories recalled in this session",
+            "session_id": session_id,
+            "outcome": outcome,
+            "memories_adjusted": 0,
+        }
+
+    # Importance feedback
+    if outcome == "success":
+        adjusted = db.adjust_importance_batch(memory_ids, +0.05)
+    else:
+        adjusted = db.adjust_importance_batch(memory_ids, -0.02)
+
+        # Store failure lesson as a new memory
+        lesson = notes or f"Session {session_id} failed (no notes provided)"
+        lesson_content = f"Session failure lesson ({session_id}): {lesson}"
+        lesson_embedding = _safe_embed(lesson_content)
+        if lesson_embedding is not None:
+            meta = {
+                "type": "session_failure",
+                "session_id": session_id,
+                "original_notes": notes,
+            }
+            mid = db.insert(lesson_content, lesson_embedding, 0.7, "failure",
+                            user_id, metadata=meta)
+            graph.index_memory_incremental(mid, lesson_embedding, db, user_id, 0.7, "failure")
+
+    return {
+        "result": f"Session outcome recorded ({outcome})",
+        "session_id": session_id,
+        "outcome": outcome,
+        "memories_adjusted": adjusted,
+    }
+
+
 TOOL_HANDLERS = {
     "recall_memory": lambda db, graph, **kw: handle_recall(db, graph, **kw),
     "store_memory": lambda db, graph, **kw: handle_store(db, graph, **kw),
@@ -378,10 +429,11 @@ TOOL_HANDLERS = {
     "memory_stats": lambda db, graph, **kw: handle_stats(db, **kw),
     "track_failure": lambda db, graph, **kw: handle_track_failure(db, graph, **kw),
     "track_progress": lambda db, graph, **kw: handle_track_progress(db, graph, **kw),
+    "session_outcome": lambda db, graph, **kw: handle_session_outcome(db, graph, **kw),
 }
 
 ARG_MAPPING = {
-    "recall_memory": {"query": "query", "user_id": "user_id", "top_k": "top_k"},
+    "recall_memory": {"query": "query", "user_id": "user_id", "top_k": "top_k", "session_id": "session_id"},
     "store_memory": {"content": "content", "importance": "importance", "category": "category",
                      "user_id": "user_id", "metadata": "metadata"},
     "update_memory": {"memory_id": "memory_id", "new_content": "new_content", "importance": "importance"},
@@ -395,4 +447,6 @@ ARG_MAPPING = {
     "track_progress": {"feature": "feature", "status": "status", "completion": "completion",
                        "blockers": "blockers", "quality_score": "quality_score", "notes": "notes",
                        "user_id": "user_id"},
+    "session_outcome": {"session_id": "session_id", "outcome": "outcome",
+                        "notes": "notes", "user_id": "user_id"},
 }

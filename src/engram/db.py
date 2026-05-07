@@ -94,6 +94,18 @@ INSTALL fts;
 LOAD fts;
 """
 
+SESSION_LOG_SQL = """
+CREATE SEQUENCE IF NOT EXISTS session_log_id_seq START 1;
+
+CREATE TABLE IF NOT EXISTS session_memory_log (
+    id INTEGER PRIMARY KEY DEFAULT nextval('session_log_id_seq'),
+    session_id VARCHAR NOT NULL,
+    memory_id INTEGER NOT NULL,
+    user_id VARCHAR NOT NULL DEFAULT 'default',
+    recalled_at TIMESTAMP NOT NULL DEFAULT now()
+);
+"""
+
 
 @dataclass
 class MemoryRow:
@@ -181,6 +193,7 @@ class MemoryDB:
         except Exception as e:
             log.warning("FTS extension load failed: %s", e)
         self._rebuild_fts_index()
+        self.conn.execute(SESSION_LOG_SQL)
 
     def _rebuild_fts_index(self):
         """Rebuild the FTS index from scratch to include all current data."""
@@ -266,6 +279,44 @@ class MemoryDB:
             """,
             [memory_id],
         )
+
+    def log_session_recall(self, session_id: str, memory_ids: list[int], user_id: str = "default"):
+        if not memory_ids:
+            return
+        rows = [[session_id, mid, user_id] for mid in memory_ids]
+        self.conn.executemany(
+            "INSERT INTO session_memory_log (session_id, memory_id, user_id) VALUES (?, ?, ?)",
+            rows,
+        )
+
+    def get_session_memories(self, session_id: str, user_id: str = "default") -> list[int]:
+        rows = self._fetchall_dicts(
+            """
+            SELECT DISTINCT memory_id FROM session_memory_log
+            WHERE session_id = ? AND user_id = ?
+            ORDER BY memory_id
+            """,
+            [session_id, user_id],
+        )
+        return [r["memory_id"] for r in rows]
+
+    def adjust_importance_batch(self, memory_ids: list[int], delta: float) -> int:
+        if not memory_ids:
+            return 0
+        placeholders = ",".join("?" for _ in memory_ids)
+        result = self.conn.execute(
+            f"""
+            UPDATE memories
+            SET importance = CASE
+                WHEN importance + ? > 1.0 THEN 1.0
+                WHEN importance + ? < 0.0 THEN 0.0
+                ELSE importance + ?
+            END
+            WHERE id IN ({placeholders})
+            """,
+            [delta, delta, delta] + memory_ids,
+        )
+        return result.fetchone()[0]
 
     def delete(self, memory_id: int):
         self.conn.execute("DELETE FROM memories WHERE id = ?", [memory_id])

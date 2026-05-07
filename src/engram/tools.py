@@ -25,6 +25,10 @@ TOOL_SCHEMAS: list[Tool] = [
                     "description": "Number of results to return",
                     "default": 5,
                 },
+                "session_id": {
+                    "type": "string",
+                    "description": "Optional session identifier for tracking which memories were used",
+                },
             },
             "required": ["query"],
         },
@@ -235,6 +239,34 @@ TOOL_SCHEMAS: list[Tool] = [
                 },
             },
             "required": ["feature", "status"],
+        },
+    ),
+    Tool(
+        name="session_outcome",
+        description="Mark a session as successful or failed. Adjusts importance of memories recalled in the session based on outcome.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "The session identifier (must match session_id used in recall_memory)",
+                },
+                "outcome": {
+                    "type": "string",
+                    "enum": ["success", "failure"],
+                    "description": "Whether the session succeeded or failed",
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional notes about the outcome (used as failure lesson when outcome is failure)",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "User identifier",
+                    "default": "default",
+                },
+            },
+            "required": ["session_id", "outcome"],
         },
     ),
 ]

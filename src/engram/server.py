@@ -1,4 +1,4 @@
-"""Engram MCP Server — stdio mode, 8 MCP tools."""
+"""Engram MCP Server — stdio mode, 9 MCP tools."""
 
 from __future__ import annotations
 

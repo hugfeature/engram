@@ -21,6 +21,7 @@ from .handlers import (
     handle_recall, handle_store, handle_update,
     handle_session_handoff, handle_consolidate, handle_stats,
     handle_track_failure, handle_track_progress,
+    handle_session_outcome,
 )
 from .shared import get_db, get_graph, dispatch_tool, _db, _graph
 from . import __version__
@@ -105,6 +106,7 @@ class RecallRequest(BaseModel):
     query: str
     user_id: str = "default"
     top_k: int = 5
+    session_id: str | None = None
 
 
 class StoreRequest(BaseModel):
@@ -158,6 +160,13 @@ class TrackProgressRequest(BaseModel):
     user_id: str = "default"
 
 
+class SessionOutcomeRequest(BaseModel):
+    session_id: str
+    outcome: str
+    notes: str | None = None
+    user_id: str = "default"
+
+
 # --- REST Routes ---
 
 
@@ -171,7 +180,8 @@ def _respond(result: dict) -> dict | JSONResponse:
 @app.post("/v1/recall")
 def recall_endpoint(req: RecallRequest):
     return _respond(handle_recall(get_db(), get_graph(),
-                         query=req.query, user_id=req.user_id, top_k=req.top_k))
+                         query=req.query, user_id=req.user_id,
+                         top_k=req.top_k, session_id=req.session_id))
 
 
 @app.post("/v1/store")
@@ -231,6 +241,15 @@ def progress_endpoint(req: TrackProgressRequest):
     ))
 
 
+@app.post("/v1/session-outcome")
+def session_outcome_endpoint(req: SessionOutcomeRequest):
+    return _respond(handle_session_outcome(
+        get_db(), get_graph(),
+        session_id=req.session_id, outcome=req.outcome,
+        notes=req.notes, user_id=req.user_id,
+    ))
+
+
 @app.get("/v1/health")
 @app.get("/health")
 def health():
@@ -285,6 +304,9 @@ def tools_list():
              "params": {"feature": "str (required)", "status": "str (required)",
                         "completion": "float", "blockers": "list[str]",
                         "quality_score": "float", "notes": "str", "user_id": "str"}},
+            {"name": "session_outcome", "method": "POST", "path": "/v1/session-outcome",
+             "params": {"session_id": "str (required)", "outcome": "str (required)",
+                        "notes": "str", "user_id": "str"}},
         ]
     }
 

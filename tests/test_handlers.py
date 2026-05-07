@@ -7,6 +7,7 @@ from engram.graph import MemoryGraph
 from engram.handlers import (
     handle_recall, handle_store, handle_update,
     handle_session_handoff, handle_consolidate, handle_stats,
+    handle_session_outcome,
 )
 
 
@@ -109,3 +110,65 @@ class TestHandleStats:
         result = handle_stats(db)
         assert result["total"] == 1
         assert "fact" in result["categories"]
+
+
+class TestHandleSessionOutcome:
+    def test_outcome_success(self, env):
+        db, graph = env
+        mid = db.insert("test memory", [0.1] * 768, 0.5, "fact", "default")
+        db.log_session_recall("sess_1", [mid], "default")
+        result = handle_session_outcome(db, graph, session_id="sess_1", outcome="success")
+        assert "recorded" in result["result"]
+        assert result["outcome"] == "success"
+        assert result["memories_adjusted"] > 0
+        # Importance should have increased
+        m = db.get_by_id(mid)
+        assert m.importance > 0.5
+
+    def test_outcome_failure(self, env):
+        db, graph = env
+        mid = db.insert("test memory", [0.1] * 768, 0.5, "fact", "default")
+        db.log_session_recall("sess_2", [mid], "default")
+        result = handle_session_outcome(db, graph, session_id="sess_2",
+                                        outcome="failure", notes="missing context")
+        assert "recorded" in result["result"]
+        assert result["outcome"] == "failure"
+        # Importance should have decreased
+        m = db.get_by_id(mid)
+        assert m.importance < 0.5
+        # Failure lesson should be stored
+        all_memories = db.get_all("default")
+        lesson = [m for m in all_memories if "missing context" in m.content]
+        assert len(lesson) >= 1
+
+    def test_outcome_empty_session_id_rejected(self, env):
+        db, graph = env
+        result = handle_session_outcome(db, graph, session_id="", outcome="success")
+        assert "error" in result
+
+    def test_outcome_invalid_outcome(self, env):
+        db, graph = env
+        result = handle_session_outcome(db, graph, session_id="s1", outcome="bogus")
+        assert "error" in result
+
+    def test_outcome_no_memories_found(self, env):
+        db, graph = env
+        result = handle_session_outcome(db, graph, session_id="empty_sess", outcome="success")
+        assert result["memories_adjusted"] == 0
+
+
+class TestHandleRecallSessionLog:
+    def test_recall_with_session_id_logs(self, env):
+        db, graph = env
+        handle_store(db, graph, content="session test memory", importance=0.5)
+        result = handle_recall(db, graph, query="session test", session_id="sess_log")
+        if result["memoriesFound"] > 0:
+            ids = db.get_session_memories("sess_log", "default")
+            assert len(ids) > 0
+
+    def test_recall_without_session_id_no_log(self, env):
+        db, graph = env
+        handle_store(db, graph, content="no session test", importance=0.5)
+        handle_recall(db, graph, query="no session test")
+        ids = db.get_session_memories("nonexistent", "default")
+        assert ids == []
