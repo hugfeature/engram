@@ -171,9 +171,19 @@ class SessionOutcomeRequest(BaseModel):
 
 
 def _respond(result: dict) -> dict | JSONResponse:
-    """Return 400 JSON if handler returned an error dict, otherwise 200."""
-    if "error" in result and len(result) <= 2:
-        return JSONResponse(content=result, status_code=400)
+    """Map handler outputs to HTTP status codes with optional explicit override."""
+    explicit_status = result.get("status_code")
+    if isinstance(explicit_status, int) and 100 <= explicit_status <= 599:
+        payload = {k: v for k, v in result.items() if k != "status_code"}
+        return JSONResponse(content=payload, status_code=explicit_status)
+
+    if "error" in result:
+        err = str(result.get("error", "")).lower()
+        if "not found" in err:
+            code = 404
+        else:
+            code = 400
+        return JSONResponse(content=result, status_code=code)
     return result
 
 
