@@ -135,6 +135,9 @@ def handle_update(db: MemoryDB, graph: MemoryGraph,
         return {"error": "new_content must be non-empty", "error_code": "invalid_argument"}
     if len(new_content) > MAX_CONTENT_LENGTH:
         return {"error": f"new_content too large (max {MAX_CONTENT_LENGTH // 1000}KB)", "error_code": "unprocessable"}
+        return {"error": "new_content must be non-empty"}
+    if len(new_content) > MAX_CONTENT_LENGTH:
+        return {"error": f"new_content too large (max {MAX_CONTENT_LENGTH // 1000}KB)"}
     try:
         memory_id = int(memory_id)
     except (TypeError, ValueError):
@@ -208,6 +211,7 @@ def handle_consolidate(db: MemoryDB, graph: MemoryGraph,
     except Exception as e:
         log.error("Consolidation failed: %s", e)
         return {"error": f"consolidation failed: {e}", "error_code": "internal", "details": [], "status_code": 500}
+        return {"error": f"consolidation failed: {e}", "details": [], "status_code": 500}
     if not results:
         msg = "No similar memories found to consolidate"
     else:

@@ -191,6 +191,16 @@ def _respond(result: dict) -> dict | JSONResponse:
             err = str(result.get("error", "")).lower()
             code = 404 if "not found" in err else 400
         return JSONResponse(content=result, status_code=code)
+    """Map handler errors to HTTP 4xx/5xx, otherwise return 200."""
+    if "error" in result:
+        err = str(result.get("error", "")).lower()
+        if "not found" in err:
+            code = 404
+        else:
+            code = 400
+        return JSONResponse(content=result, status_code=code)
+    if "result" in result and "failed" in str(result.get("result", "")).lower():
+        return JSONResponse(content=result, status_code=500)
     return result
 
 
