@@ -1,7 +1,5 @@
 """Engram Unified Server — FastAPI REST + MCP StreamableHTTP."""
 
-from __future__ import annotations
-
 import argparse
 import logging
 import sys
@@ -9,7 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, create_model
 from mcp.server import Server as MCPServer
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import TextContent
@@ -17,14 +15,11 @@ from mcp.types import TextContent
 from .pruner import start_scheduler
 from .embedding import is_degraded
 from .tools import TOOL_SCHEMAS
-from .handlers import (
-    handle_recall, handle_store, handle_update,
-    handle_session_handoff, handle_consolidate, handle_stats,
-    handle_track_failure, handle_track_progress,
-    handle_session_outcome,
-)
 from . import shared
-from .shared import get_db, get_graph, dispatch_tool
+from .shared import (
+    get_db, get_graph, dispatch_tool, dispatch_rest,
+    TOOL_REST_MAP,
+)
 from . import __version__
 
 logging.basicConfig(
@@ -101,181 +96,98 @@ app = FastAPI(title="Engram", version=__version__, lifespan=lifespan)
 app.mount("/mcp", session_mgr.handle_request)
 
 
-# --- Request models ---
+# --- Auto-generate REST routes from tool schemas ---
 
-class RecallRequest(BaseModel):
-    query: str
-    user_id: str = "default"
-    top_k: int = 5
-    session_id: str | None = None
+_JSON_TYPE_MAP = {
+    "string": str,
+    "integer": int,
+    "number": float,
+    "boolean": bool,
+}
 
-
-class StoreRequest(BaseModel):
-    content: str
-    importance: float
-    category: str = "fact"
-    user_id: str = "default"
-    metadata: dict | None = None
-
-
-class UpdateRequest(BaseModel):
-    memory_id: int
-    new_content: str
-    importance: float | None = None
+_ARRAY_ITEM_MAP = {
+    "string": str,
+    "integer": int,
+    "number": float,
+}
 
 
-class HandoffRequest(BaseModel):
-    summary: str
-    completed: list[str] | None = None
-    in_progress: list[str] | None = None
-    blocked: list[str] | None = None
-    next_steps: list[str] | None = None
-    user_id: str = "default"
+def _build_request_model(tool_name: str, schema: dict) -> type[BaseModel]:
+    """Build a Pydantic model from a tool's inputSchema for REST validation + OpenAPI docs."""
+    fields = {}
+    props = schema.get("properties", {})
+    required = set(schema.get("required", []))
 
+    for name, prop in props.items():
+        json_type = prop.get("type", "string")
+        if json_type == "array":
+            items_type = prop.get("items", {}).get("type", "string")
+            item_py = _ARRAY_ITEM_MAP.get(items_type, str)
+            py_type = list[item_py]
+        elif json_type == "object":
+            py_type = dict
+        else:
+            py_type = _JSON_TYPE_MAP.get(json_type, str)
 
-class ConsolidateRequest(BaseModel):
-    user_id: str = "default"
+        desc = prop.get("description", "")
+        if name in required:
+            fields[name] = (py_type, Field(description=desc))
+        else:
+            default = prop.get("default")
+            if default is not None:
+                fields[name] = (py_type, Field(default=default, description=desc))
+            else:
+                fields[name] = (py_type | None, Field(default=None, description=desc))
 
-
-class StatsRequest(BaseModel):
-    user_id: str = "default"
-
-
-class TrackFailureRequest(BaseModel):
-    error: str
-    component: str
-    root_cause: str | None = None
-    severity: str = "major"
-    fix: str | None = None
-    related_test_ids: list[str] | None = None
-    user_id: str = "default"
-
-
-class TrackProgressRequest(BaseModel):
-    feature: str
-    status: str
-    completion: float = 0
-    blockers: list[str] | None = None
-    quality_score: float | None = None
-    notes: str | None = None
-    user_id: str = "default"
-
-
-class SessionOutcomeRequest(BaseModel):
-    session_id: str
-    outcome: str
-    notes: str | None = None
-    user_id: str = "default"
-
-
-# --- REST Routes ---
+    model_name = "".join(w.capitalize() for w in tool_name.split("_")) + "Request"
+    return create_model(model_name, **fields)
 
 
 def _respond(result: dict) -> dict | JSONResponse:
-    """Map handler outputs to HTTP status codes with optional explicit override."""
-    explicit_status = result.get("status_code")
-    if isinstance(explicit_status, int) and 100 <= explicit_status <= 599:
-        payload = {k: v for k, v in result.items() if k != "status_code"}
-        return JSONResponse(content=payload, status_code=explicit_status)
-
-    if "error" in result:
-        code_by_error = {
-            "invalid_argument": 400,
-            "not_found": 404,
-            "conflict": 409,
-            "unprocessable": 422,
-            "internal": 500,
-        }
-        code = code_by_error.get(str(result.get("error_code", "")).lower())
-        if code is None:
-            err = str(result.get("error", "")).lower()
-            code = 404 if "not found" in err else 400
-        return JSONResponse(content=result, status_code=code)
-    """Map handler errors to HTTP 4xx/5xx, otherwise return 200."""
-    if "error" in result:
-        err = str(result.get("error", "")).lower()
-        if "not found" in err:
-            code = 404
-        else:
-            code = 400
-        return JSONResponse(content=result, status_code=code)
-    if "result" in result and "failed" in str(result.get("result", "")).lower():
-        return JSONResponse(content=result, status_code=500)
+    """Return 400 JSON if handler returned an error (ok=False), otherwise 200."""
+    if result.get("ok") is False:
+        return JSONResponse(content=result, status_code=400)
     return result
 
 
-@app.post("/v1/recall")
-def recall_endpoint(req: RecallRequest):
-    return _respond(handle_recall(get_db(), get_graph(),
-                         query=req.query, user_id=req.user_id,
-                         top_k=req.top_k, session_id=req.session_id))
+# Register REST routes from TOOL_REST_MAP + TOOL_SCHEMAS
+for _tool in TOOL_SCHEMAS:
+    _path = TOOL_REST_MAP.get(_tool.name)
+    if _path is None:
+        continue
+    _model = _build_request_model(_tool.name, _tool.inputSchema)
+
+    def _make_route(name: str, mdl: type[BaseModel]):
+        def route(req: mdl):
+            body = req.model_dump(exclude_unset=True)
+            return _respond(dispatch_rest(name, body))
+        route.__name__ = f"{name}_endpoint"
+        return route
+
+    app.post(_path, name=_tool.name)(_make_route(_tool.name, _model))
 
 
-@app.post("/v1/store")
-def store_endpoint(req: StoreRequest):
-    return _respond(handle_store(get_db(), get_graph(),
-                        content=req.content, importance=req.importance,
-                        category=req.category, user_id=req.user_id,
-                        metadata=req.metadata))
+# --- Auto-generated tools catalog ---
+
+@app.get("/v1/tools")
+def tools_list():
+    tools = []
+    for tool in TOOL_SCHEMAS:
+        path = TOOL_REST_MAP.get(tool.name)
+        if path is None:
+            continue
+        params = {}
+        for pname, pdef in tool.inputSchema.get("properties", {}).items():
+            ptype = pdef.get("type", "string")
+            if pname in tool.inputSchema.get("required", []):
+                params[pname] = f"{ptype} (required)"
+            else:
+                params[pname] = ptype
+        tools.append({"name": tool.name, "method": "POST", "path": path, "params": params})
+    return {"tools": tools}
 
 
-@app.post("/v1/update")
-def update_endpoint(req: UpdateRequest):
-    return _respond(handle_update(get_db(), get_graph(),
-                         memory_id=req.memory_id, new_content=req.new_content,
-                         importance=req.importance))
-
-
-@app.post("/v1/handoff")
-def handoff_endpoint(req: HandoffRequest):
-    return _respond(handle_session_handoff(
-        get_db(), get_graph(),
-        summary=req.summary, completed=req.completed,
-        in_progress=req.in_progress, blocked=req.blocked,
-        next_steps=req.next_steps, user_id=req.user_id,
-    ))
-
-
-@app.post("/v1/consolidate")
-def consolidate_endpoint(req: ConsolidateRequest):
-    return _respond(handle_consolidate(get_db(), get_graph(), user_id=req.user_id))
-
-
-@app.post("/v1/stats")
-def stats_endpoint(req: StatsRequest):
-    return _respond(handle_stats(get_db(), user_id=req.user_id))
-
-
-@app.post("/v1/failure")
-def failure_endpoint(req: TrackFailureRequest):
-    return _respond(handle_track_failure(
-        get_db(), get_graph(),
-        error=req.error, component=req.component,
-        root_cause=req.root_cause, severity=req.severity,
-        fix=req.fix, related_test_ids=req.related_test_ids,
-        user_id=req.user_id,
-    ))
-
-
-@app.post("/v1/progress")
-def progress_endpoint(req: TrackProgressRequest):
-    return _respond(handle_track_progress(
-        get_db(), get_graph(),
-        feature=req.feature, status=req.status,
-        completion=req.completion, blockers=req.blockers,
-        quality_score=req.quality_score, notes=req.notes,
-        user_id=req.user_id,
-    ))
-
-
-@app.post("/v1/session-outcome")
-def session_outcome_endpoint(req: SessionOutcomeRequest):
-    return _respond(handle_session_outcome(
-        get_db(), get_graph(),
-        session_id=req.session_id, outcome=req.outcome,
-        notes=req.notes, user_id=req.user_id,
-    ))
-
+# --- Health ---
 
 @app.get("/v1/health")
 @app.get("/health")
@@ -283,13 +195,13 @@ def health():
     fts_ok = False
     db_ok = False
     try:
-        if _db is not None:
-            _db.conn.execute("SELECT 1").fetchone()
+        if shared._db is not None:
+            shared._db.conn.execute("SELECT 1").fetchone()
             db_ok = True
-            fts_ok = _db.fts_available
+            fts_ok = shared._db.fts_available
     except Exception:
         pass
-    graph_ok = _graph is not None
+    graph_ok = shared._graph is not None
     degraded = is_degraded()
     status = "ok" if (db_ok and graph_ok and not degraded) else "degraded"
     return {
@@ -300,41 +212,6 @@ def health():
         "fts": fts_ok,
         "embedding_degraded": degraded,
         "transports": ["rest", "mcp-streamable-http"],
-    }
-
-
-@app.get("/v1/tools")
-def tools_list():
-    return {
-        "tools": [
-            {"name": "recall", "method": "POST", "path": "/v1/recall",
-             "params": {"query": "str (required)", "user_id": "str", "top_k": "int"}},
-            {"name": "store", "method": "POST", "path": "/v1/store",
-             "params": {"content": "str (required)", "importance": "float (required)",
-                        "category": "str", "user_id": "str", "metadata": "object"}},
-            {"name": "update", "method": "POST", "path": "/v1/update",
-             "params": {"memory_id": "int (required)", "new_content": "str (required)",
-                        "importance": "float"}},
-            {"name": "handoff", "method": "POST", "path": "/v1/handoff",
-             "params": {"summary": "str (required)", "completed": "list[str]",
-                        "in_progress": "list[str]", "blocked": "list[str]",
-                        "next_steps": "list[str]", "user_id": "str"}},
-            {"name": "consolidate", "method": "POST", "path": "/v1/consolidate",
-             "params": {"user_id": "str"}},
-            {"name": "stats", "method": "POST", "path": "/v1/stats",
-             "params": {"user_id": "str"}},
-            {"name": "failure", "method": "POST", "path": "/v1/failure",
-             "params": {"error": "str (required)", "component": "str (required)",
-                        "root_cause": "str", "severity": "str", "fix": "str",
-                        "related_test_ids": "list[str]", "user_id": "str"}},
-            {"name": "progress", "method": "POST", "path": "/v1/progress",
-             "params": {"feature": "str (required)", "status": "str (required)",
-                        "completion": "float", "blockers": "list[str]",
-                        "quality_score": "float", "notes": "str", "user_id": "str"}},
-            {"name": "session_outcome", "method": "POST", "path": "/v1/session-outcome",
-             "params": {"session_id": "str (required)", "outcome": "str (required)",
-                        "notes": "str", "user_id": "str"}},
-        ]
     }
 
 

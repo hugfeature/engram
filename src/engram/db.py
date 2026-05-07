@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 import duckdb
 
 from .embedding import get_dimensions, MODEL_NAME
+from .config import DEDUP_SEARCH_THRESHOLD, SIMILARITY_LOW
 
 log = logging.getLogger("engram.db")
 
@@ -351,7 +352,7 @@ class MemoryDB:
         query_embedding: list[float],
         user_id: str = "default",
         top_k: int = 20,
-        threshold: float = 0.20,
+        threshold: float = SIMILARITY_LOW,
     ) -> list[MemoryRow]:
         self._validate_embedding(query_embedding)
         threshold = max(0.0, min(1.0, float(threshold)))
@@ -423,7 +424,7 @@ class MemoryDB:
         query_embedding: list[float],
         user_id: str = "default",
         top_k: int = 10,
-        threshold: float = 0.60,
+        threshold: float = DEDUP_SEARCH_THRESHOLD,
     ) -> list[tuple[int, str, list[float]]]:
         cast = self._float_cast()
         rows = self._fetchall_dicts(
