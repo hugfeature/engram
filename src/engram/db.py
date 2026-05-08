@@ -875,7 +875,7 @@ class MemoryDB:
             """SELECT session_id, started_at, last_active_at
             FROM session_lifecycle
             WHERE user_id = ? AND ended_at IS NULL
-              AND last_active_at < now() - INTERVAL ? MINUTE
+              AND last_active_at < now() - INTERVAL '1 MINUTE' * ?
             ORDER BY last_active_at DESC LIMIT 5""",
             [user_id, stale_minutes],
         )
@@ -931,6 +931,6 @@ class MemoryDB:
             """UPDATE session_lifecycle
             SET ended_at = last_active_at, end_type = 'interrupted'
             WHERE user_id = ? AND ended_at IS NULL
-              AND last_active_at < now() - INTERVAL ? MINUTE""",
+              AND last_active_at < now() - INTERVAL '1 MINUTE' * ?""",
             [user_id, stale_minutes],
         )
