@@ -1,6 +1,12 @@
 # Engram
 
-**AI Agent Continuity Engine** — 让 Agent 的任务跨会话、跨实例持续推进，而不是每次从零开始。
+**AI Agent Continuity ** — 让 Agent 的任务跨会话、跨实例持续推进，而不是每次从零开始。
+
+## 🎯 产品目标
+
+> **Agent 可替换，任务不中断。**  
+> **按需召回上下文，不靠无限堆 token。**  
+> **数据始终保留在本机。**
 
 [![PyPI](https://img.shields.io/pypi/v/mcp-engram)](https://pypi.org/project/mcp-engram/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -23,14 +29,14 @@ AI Agent 的每次会话都是一座孤岛：
 
 Engram 是一个本地运行的 **MCP Server**，为 Agent 提供六项 continuity 能力：
 
-| 能力 | 做什么 | 为什么需要 |
-|------|--------|-----------|
-| **Task Context** | Task 是一等实体，handoff/failure/progress 挂在 task 下 | 跨会话的任务全景视图 |
-| **Session Handoff** | 结构化记录完成项、阻塞项、下一步 + 自动验证执行情况 | Agent 可替换，任务不中断 |
-| **Smart Recall** | 语义 + 关键词 + 图谱混合检索 + type 过滤 + handoff 置顶 | 按需召回，不堆 token |
-| **Error-aware Memory** | 按 component 附带历史 failure 上下文 + 记忆质量评分 | 经验可追溯，错误不重犯 |
-| **Engineering State** | 结构化的失败归因、进度快照、session outcome 反馈闭环 | 量化执行质量 |
-| **Auto Maintenance** | 去重、矛盾消解、Ebbinghaus 衰减、整合、剪枝 | 上下文不膨胀，零运维 |
+| 能力                   | 做什么                                                  | 为什么需要               |
+| ---------------------- | ------------------------------------------------------- | ------------------------ |
+| **Task Context**       | Task 是一等实体，handoff/failure/progress 挂在 task 下  | 跨会话的任务全景视图     |
+| **Session Handoff**    | 结构化记录完成项、阻塞项、下一步 + 自动验证执行情况     | Agent 可替换，任务不中断 |
+| **Smart Recall**       | 语义 + 关键词 + 图谱混合检索 + type 过滤 + handoff 置顶 | 按需召回，不堆 token     |
+| **Error-aware Memory** | 按 component 附带历史 failure 上下文 + 记忆质量评分     | 经验可追溯，错误不重犯   |
+| **Engineering State**  | 结构化的失败归因、进度快照、session outcome 反馈闭环    | 量化执行质量             |
+| **Auto Maintenance**   | 去重、矛盾消解、Ebbinghaus 衰减、整合、剪枝             | 上下文不膨胀，零运维     |
 
 **数据始终在本机，零云端依赖。**
 
@@ -105,44 +111,44 @@ Engram 提供 **12 个 MCP 工具**：
 
 ### 核心
 
-| 工具 | 用途 |
-|------|------|
-| `recall_memory` | 混合检索记忆，支持 `memory_type` 过滤、handoff 自动置顶、附带 failure 上下文和质量评分 |
-| `store_memory` | 存储新记忆，自动去重 / 合并 / 矛盾消解 |
-| `update_memory` | 按 ID 更新已有记忆 |
-| `session_handoff` | 结构化会话交接 + next_steps 执行验证（支持 `task_id` 关联） |
+| 工具              | 用途                                                                                   |
+| ----------------- | -------------------------------------------------------------------------------------- |
+| `recall_memory`   | 混合检索记忆，支持 `memory_type` 过滤、handoff 自动置顶、附带 failure 上下文和质量评分 |
+| `store_memory`    | 存储新记忆，自动去重 / 合并 / 矛盾消解                                                 |
+| `update_memory`   | 按 ID 更新已有记忆                                                                     |
+| `session_handoff` | 结构化会话交接 + next_steps 执行验证（支持 `task_id` 关联）                            |
 
 ### 任务管理
 
-| 工具 | 用途 |
-|------|------|
-| `create_task` | 创建跟踪任务（name / goal），返回 task_id |
-| `update_task` | 更新任务状态 / 目标 / metadata |
-| `get_task` | 获取任务详情 + 关联的全部 handoff / failure / progress 记忆 |
+| 工具          | 用途                                                        |
+| ------------- | ----------------------------------------------------------- |
+| `create_task` | 创建跟踪任务（name / goal），返回 task_id                   |
+| `update_task` | 更新任务状态 / 目标 / metadata                              |
+| `get_task`    | 获取任务详情 + 关联的全部 handoff / failure / progress 记忆 |
 
 ### 工程状态
 
-| 工具 | 用途 |
-|------|------|
-| `track_failure` | 结构化失败记录（支持 `task_id` 关联，按 component 可追溯） |
-| `track_progress` | 功能进度快照（支持 `task_id` 关联） |
-| `session_outcome` | 标记会话成功/失败，多次失败记忆额外降权 |
+| 工具              | 用途                                                       |
+| ----------------- | ---------------------------------------------------------- |
+| `track_failure`   | 结构化失败记录（支持 `task_id` 关联，按 component 可追溯） |
+| `track_progress`  | 功能进度快照（支持 `task_id` 关联）                        |
+| `session_outcome` | 标记会话成功/失败，多次失败记忆额外降权                    |
 
 ### 维护
 
-| 工具 | 用途 |
-|------|------|
+| 工具                 | 用途                                 |
+| -------------------- | ------------------------------------ |
 | `consolidate_memory` | 手动触发记忆整合（相似记忆聚类合并） |
-| `memory_stats` | 记忆统计 + 工程指标概览 |
+| `memory_stats`       | 记忆统计 + 工程指标概览              |
 
 ### 重要性参考
 
-| 值 | 场景 |
-|----|------|
+| 值          | 场景               |
+| ----------- | ------------------ |
 | **0.9–1.0** | 核心身份、永久事实 |
-| **0.7–0.8** | 架构决策、强偏好 |
-| **0.5** | 普通项目事实 |
-| **0.2–0.3** | 临时会话上下文 |
+| **0.7–0.8** | 架构决策、强偏好   |
+| **0.5**     | 普通项目事实       |
+| **0.2–0.3** | 临时会话上下文     |
 
 ---
 
@@ -157,12 +163,12 @@ effective_λ = base_λ × (1 - importance × 0.8)
 strength = importance × e^(-λ × days) × (1 + recall_count × 0.2)
 ```
 
-| 类别 | λ | 半衰期 | 适用 |
-|------|---|--------|------|
-| `strategy` | 0.10 | ~38 天 | 被验证有效的方法论 |
-| `fact` | 0.16 | ~24 天 | 用户偏好、技术选型 |
-| `assumption` | 0.20 | ~19 天 | 推断的上下文 |
-| `failure` | 0.35 | ~11 天 | 踩过的坑、临时 workaround |
+| 类别         | λ    | 半衰期 | 适用                      |
+| ------------ | ---- | ------ | ------------------------- |
+| `strategy`   | 0.10 | ~38 天 | 被验证有效的方法论        |
+| `fact`       | 0.16 | ~24 天 | 用户偏好、技术选型        |
+| `assumption` | 0.20 | ~19 天 | 推断的上下文              |
+| `failure`    | 0.35 | ~11 天 | 踩过的坑、临时 workaround |
 
 > 策略记最久，失败记最短——环境会变，昨天的坑明天可能已经填上了。
 
@@ -190,11 +196,11 @@ score = 0.3 × BM25 + 0.7 × (语义相似度 × 衰减强度) + 图谱加成
 
 每次 `recall_memory` 返回的结果自动附带三个维度的增强信息：
 
-| 增强 | 说明 |
-|------|------|
-| **Handoff Validation** | 检测 handoff 的 `next_steps` 是否被后续 session 执行，返回每步的执行状态 |
-| **Related Failures** | 非 failure 类记忆如果涉及特定 component，自动附带该 component 的历史 failure 上下文 |
-| **Quality Score** | 动态计算 `importance × recall频率 × session outcome` 综合质量分 |
+| 增强                   | 说明                                                                                |
+| ---------------------- | ----------------------------------------------------------------------------------- |
+| **Handoff Validation** | 检测 handoff 的 `next_steps` 是否被后续 session 执行，返回每步的执行状态            |
+| **Related Failures**   | 非 failure 类记忆如果涉及特定 component，自动附带该 component 的历史 failure 上下文 |
+| **Quality Score**      | 动态计算 `importance × recall频率 × session outcome` 综合质量分                     |
 
 ```
 quality_score = clamp(importance × (1 + recall_bonus) × outcome_factor, 0, 1)
@@ -251,25 +257,25 @@ quality_score = clamp(importance × (1 + recall_bonus) × outcome_factor, 0, 1)
 
 **数据目录** `~/.engram/`：
 
-| 文件 | 说明 |
-|------|------|
+| 文件              | 说明                                                               |
+| ----------------- | ------------------------------------------------------------------ |
 | `memories.duckdb` | 向量数据库 — memories + tasks + session_outcomes（单文件，零运维） |
-| `graph.json` | 语义图谱（支持 batch_mode、多用户隔离） |
-| `model_cache/` | 嵌入模型缓存 |
+| `graph.json`      | 语义图谱（支持 batch_mode、多用户隔离）                            |
+| `model_cache/`    | 嵌入模型缓存                                                       |
 
 ---
 
 ## 与其他 Memory 系统的区别
 
-| 维度 | 普通 Memory | Engram |
-|------|-------------|--------|
-| **核心抽象** | 记忆条目 | **Task + 记忆**，以任务为中心组织 |
-| **核心动作** | 存文本 → 检索文本 | 存状态 → **驱动下一步执行** |
-| **跨会话** | 仅检索历史 | **结构化交接** + next_steps 执行验证 |
-| **工程上下文** | 无 | **失败归因 + 进度追踪 + session outcome** |
-| **召回质量** | 原样返回 | **quality_score + error-aware + handoff 置顶** |
-| **数据增长** | 无限膨胀 | **自动去重 / 衰减 / 剪枝** |
-| **部署** | 云端 API | **本地优先**，零依赖 |
+| 维度           | 普通 Memory       | Engram                                         |
+| -------------- | ----------------- | ---------------------------------------------- |
+| **核心抽象**   | 记忆条目          | **Task + 记忆**，以任务为中心组织              |
+| **核心动作**   | 存文本 → 检索文本 | 存状态 → **驱动下一步执行**                    |
+| **跨会话**     | 仅检索历史        | **结构化交接** + next_steps 执行验证           |
+| **工程上下文** | 无                | **失败归因 + 进度追踪 + session outcome**      |
+| **召回质量**   | 原样返回          | **quality_score + error-aware + handoff 置顶** |
+| **数据增长**   | 无限膨胀          | **自动去重 / 衰减 / 剪枝**                     |
+| **部署**       | 云端 API          | **本地优先**，零依赖                           |
 
 ---
 
@@ -277,12 +283,12 @@ quality_score = clamp(importance × (1 + recall_bonus) × outcome_factor, 0, 1)
 
 基于 [LoCoMo](https://github.com/snap-research/locomo)（Snap Research 长期对话记忆基准）评测：
 
-| System | Overall F1 | LLM | 部署方式 |
-|--------|-----------|-----|---------|
-| MemMachine | 0.8487 | GPT-4o-mini | 云端 |
-| Memobase | 0.7578 | GPT-4o-mini | 云端 |
-| Zep | 0.7514 | GPT-4o-mini | 云端 |
-| Mem0 | 0.6688 | GPT-4o-mini | 云端 |
+| System     | Overall F1 | LLM           | 部署方式 |
+| ---------- | ---------- | ------------- | -------- |
+| MemMachine | 0.8487     | GPT-4o-mini   | 云端     |
+| Memobase   | 0.7578     | GPT-4o-mini   | 云端     |
+| Zep        | 0.7514     | GPT-4o-mini   | 云端     |
+| Mem0       | 0.6688     | GPT-4o-mini   | 云端     |
 | **Engram** | **0.4383** | DeepSeek-V3.2 | **本地** |
 
 > 本地部署零云端依赖，四轮优化累计 **F1 +50.3%**，**Hit@5 +26.2pp**。
@@ -290,12 +296,12 @@ quality_score = clamp(importance × (1 + recall_bonus) × outcome_factor, 0, 1)
 <details>
 <summary>详细分类得分</summary>
 
-| Category | Count | F1 | Hit@5 |
-|----------|------:|-----:|------:|
-| Single-Hop | 114 | 0.5121 | 76.3% |
-| Temporal | 63 | 0.4501 | 95.2% |
-| Multi-Hop | 43 | 0.3181 | 60.5% |
-| Open-Domain | 13 | 0.1324 | 61.5% |
+| Category    |   Count |         F1 |     Hit@5 |
+| ----------- | ------: | ---------: | --------: |
+| Single-Hop  |     114 |     0.5121 |     76.3% |
+| Temporal    |      63 |     0.4501 |     95.2% |
+| Multi-Hop   |      43 |     0.3181 |     60.5% |
+| Open-Domain |      13 |     0.1324 |     61.5% |
 | **Overall** | **233** | **0.4383** | **77.7%** |
 
 </details>
@@ -307,23 +313,23 @@ quality_score = clamp(importance × (1 + recall_bonus) × outcome_factor, 0, 1)
 <details>
 <summary>完整配置项</summary>
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `HF_ENDPOINT` | `https://hf-mirror.com` | HuggingFace 镜像 |
-| `ENGRAM_MODEL` | `all-mpnet-base-v2` | 嵌入模型 |
-| `ENGRAM_MODEL_TIMEOUT` | `30` | 模型加载超时（秒） |
-| `ENGRAM_PRUNE_THRESHOLD` | `0.05` | 剪枝强度阈值 |
-| `ENGRAM_DEDUP_THRESHOLD` | `0.65` | 去重相似度下限 |
-| `ENGRAM_REINFORCE_THRESHOLD` | `0.85` | 强化相似度阈值 |
-| `ENGRAM_SIM_HIGH` | `0.50` | 检索高阈值 |
-| `ENGRAM_SIM_LOW` | `0.20` | 检索低阈值 |
-| `ENGRAM_REINFORCE_SIM` | `0.75` | 检索时强化阈值 |
-| `ENGRAM_W_BM25` | `0.30` | BM25 权重 |
-| `ENGRAM_W_VECTOR` | `0.70` | 向量权重 |
-| `ENGRAM_GRAPH_DEPTH` | `3` | 图谱 BFS 深度 |
-| `ENGRAM_EDGE_THRESHOLD` | `0.40` | 图谱建边阈值 |
-| `ENGRAM_MAX_EDGES` | `5` | 每条记忆最大边数 |
-| `ENGRAM_CONSOLIDATE_THRESHOLD` | `0.70` | 整合聚类阈值 |
+| 变量                           | 默认值                  | 说明               |
+| ------------------------------ | ----------------------- | ------------------ |
+| `HF_ENDPOINT`                  | `https://hf-mirror.com` | HuggingFace 镜像   |
+| `ENGRAM_MODEL`                 | `all-mpnet-base-v2`     | 嵌入模型           |
+| `ENGRAM_MODEL_TIMEOUT`         | `30`                    | 模型加载超时（秒） |
+| `ENGRAM_PRUNE_THRESHOLD`       | `0.05`                  | 剪枝强度阈值       |
+| `ENGRAM_DEDUP_THRESHOLD`       | `0.65`                  | 去重相似度下限     |
+| `ENGRAM_REINFORCE_THRESHOLD`   | `0.85`                  | 强化相似度阈值     |
+| `ENGRAM_SIM_HIGH`              | `0.50`                  | 检索高阈值         |
+| `ENGRAM_SIM_LOW`               | `0.20`                  | 检索低阈值         |
+| `ENGRAM_REINFORCE_SIM`         | `0.75`                  | 检索时强化阈值     |
+| `ENGRAM_W_BM25`                | `0.30`                  | BM25 权重          |
+| `ENGRAM_W_VECTOR`              | `0.70`                  | 向量权重           |
+| `ENGRAM_GRAPH_DEPTH`           | `3`                     | 图谱 BFS 深度      |
+| `ENGRAM_EDGE_THRESHOLD`        | `0.40`                  | 图谱建边阈值       |
+| `ENGRAM_MAX_EDGES`             | `5`                     | 每条记忆最大边数   |
+| `ENGRAM_CONSOLIDATE_THRESHOLD` | `0.70`                  | 整合聚类阈值       |
 
 </details>
 

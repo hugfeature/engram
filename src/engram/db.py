@@ -120,6 +120,17 @@ CREATE TABLE IF NOT EXISTS session_outcome_log (
 """
 
 
+SESSION_LIFECYCLE_SQL = """
+CREATE TABLE IF NOT EXISTS session_lifecycle (
+    session_id VARCHAR PRIMARY KEY,
+    user_id VARCHAR NOT NULL DEFAULT 'default',
+    started_at TIMESTAMP NOT NULL DEFAULT now(),
+    last_active_at TIMESTAMP NOT NULL DEFAULT now(),
+    ended_at TIMESTAMP,
+    end_type VARCHAR
+);
+"""
+
 TASK_SQL = """
 CREATE SEQUENCE IF NOT EXISTS task_id_seq START 1;
 
@@ -234,6 +245,7 @@ class MemoryDB:
         self._rebuild_fts_index()
         self.conn.execute(SESSION_LOG_SQL)
         self.conn.execute(SESSION_OUTCOME_SQL)
+        self.conn.execute(SESSION_LIFECYCLE_SQL)
         self.conn.execute(TASK_SQL)
         self._init_vss()
 
@@ -831,3 +843,94 @@ class MemoryDB:
             [user_id, component, limit],
         )
         return [_row_to_memory(r) for r in rows]
+
+    # --- Session Lifecycle ---
+
+    def upsert_session(self, session_id: str, user_id: str = "default"):
+        """Register a new session or refresh its heartbeat."""
+        self.conn.execute(
+            """INSERT INTO session_lifecycle (session_id, user_id)
+            VALUES (?, ?)
+            ON CONFLICT (session_id) DO UPDATE SET last_active_at = now()""",
+            [session_id, user_id],
+        )
+
+    def end_session(self, session_id: str, end_type: str = "handoff"):
+        """Mark a session as ended (handoff / outcome)."""
+        self.conn.execute(
+            """UPDATE session_lifecycle
+            SET ended_at = now(), last_active_at = now(), end_type = ?
+            WHERE session_id = ?""",
+            [end_type, session_id],
+        )
+
+    def get_interrupted_sessions(self, user_id: str = "default",
+                                 stale_minutes: int = 30) -> list[dict]:
+        """Find sessions that started but never ended.
+
+        A session is interrupted if ended_at IS NULL and last_active_at
+        is older than stale_minutes ago.
+        """
+        return self._fetchall_dicts(
+            """SELECT session_id, started_at, last_active_at
+            FROM session_lifecycle
+            WHERE user_id = ? AND ended_at IS NULL
+              AND last_active_at < now() - INTERVAL ? MINUTE
+            ORDER BY last_active_at DESC LIMIT 5""",
+            [user_id, stale_minutes],
+        )
+
+    def get_session_activity_summary(self, session_id: str,
+                                     user_id: str = "default") -> dict:
+        """Reconstruct what happened in a session from existing data."""
+        recalled_ids = self.get_session_memories(session_id, user_id)
+
+        session_row = self._fetchone_dict(
+            "SELECT started_at, last_active_at FROM session_lifecycle WHERE session_id = ?",
+            [session_id],
+        )
+        recent_writes: list[dict] = []
+        active_tasks: list[dict] = []
+
+        if session_row:
+            started = session_row["started_at"]
+            last_active = session_row["last_active_at"]
+            recent_writes = self._fetchall_dicts(
+                """SELECT id, content, category,
+                       json_extract_string(metadata, '$.type') AS mem_type
+                FROM memories
+                WHERE user_id = ? AND created_at BETWEEN ? AND ?
+                ORDER BY created_at DESC LIMIT 10""",
+                [user_id, started, last_active],
+            )
+            active_tasks = self._fetchall_dicts(
+                """SELECT id, name, status, goal FROM tasks
+                WHERE user_id = ? AND status NOT IN ('done', 'cancelled')
+                ORDER BY updated_at DESC LIMIT 5""",
+                [user_id],
+            )
+
+        return {
+            "session_id": session_id,
+            "recalled_memory_ids": recalled_ids,
+            "memories_written": [
+                {"id": w["id"], "snippet": w["content"][:100],
+                 "type": w.get("mem_type", "")}
+                for w in recent_writes
+            ],
+            "active_tasks": [
+                {"id": t["id"], "name": t["name"], "status": t["status"]}
+                for t in active_tasks
+            ],
+        }
+
+    def cleanup_stale_sessions(self, user_id: str = "default",
+                               stale_minutes: int = 30):
+        """Mark old interrupted sessions as ended to avoid accumulation."""
+        self.conn.execute(
+            """UPDATE session_lifecycle
+            SET ended_at = last_active_at, end_type = 'interrupted'
+            WHERE user_id = ? AND ended_at IS NULL
+              AND last_active_at < now() - INTERVAL ? MINUTE""",
+            [user_id, stale_minutes],
+        )
