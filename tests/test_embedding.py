@@ -2,7 +2,7 @@
 
 import pytest
 
-from engram.embedding import embed, is_degraded, _embed_cache, _embed_cache_order
+from engram.embedding import embed, is_degraded, _embed_cache
 
 
 class TestDegradedMode:
@@ -62,7 +62,6 @@ class TestEmbedCache:
         monkeypatch.setattr("engram.embedding._model", FakeModel())
         # Clear cache
         _embed_cache.clear()
-        _embed_cache_order.clear()
 
         r1 = embed("test cache")
         r2 = embed("test cache")
@@ -84,7 +83,6 @@ class TestEmbedCache:
 
         monkeypatch.setattr("engram.embedding._model", FakeModel())
         _embed_cache.clear()
-        _embed_cache_order.clear()
 
         r1 = embed("text one")
         r2 = embed("text two")
@@ -106,7 +104,6 @@ class TestEmbedCache:
 
         monkeypatch.setattr("engram.embedding._model", FakeModel())
         _embed_cache.clear()
-        _embed_cache_order.clear()
 
         # Fill cache beyond capacity
         for i in range(_EMBED_CACHE_MAX + 10):

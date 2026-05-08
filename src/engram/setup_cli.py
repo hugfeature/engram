@@ -31,6 +31,7 @@ def main():
         db = MemoryDB()
         count = db.count()
         print(f"      Database ready at {data_dir}/memories.duckdb ({count} memories)")
+        db.close()
     except Exception as e:
         print(f"      ERROR: {e}", file=sys.stderr)
         sys.exit(1)

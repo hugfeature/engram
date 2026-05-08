@@ -42,18 +42,19 @@ def run_prune(db: MemoryDB, graph: MemoryGraph, user_id: str = "default"):
         return
 
     pruned = 0
-    for row in rows:
-        mid, category, importance, last_accessed, recall_count = row[:5]
-        days = (now - last_accessed.replace(tzinfo=timezone.utc)).total_seconds() / 86400
-        strength = compute_strength(category, importance, days, recall_count)
-        graph.update_node_strength(mid, strength)
+    with graph.batch_mode():
+        for row in rows:
+            mid, category, importance, last_accessed, recall_count = row[:5]
+            days = (now - last_accessed.replace(tzinfo=timezone.utc)).total_seconds() / 86400
+            strength = compute_strength(category, importance, days, recall_count)
+            graph.update_node_strength(mid, strength)
 
-        if strength < PRUNE_THRESHOLD:
-            if graph.chain_safe_to_prune(mid, PRUNE_THRESHOLD):
-                db.delete(mid)
-                graph.remove_node(mid)
-                pruned += 1
-                log.info("Pruned memory %d (strength=%.4f)", mid, strength)
+            if strength < PRUNE_THRESHOLD:
+                if graph.chain_safe_to_prune(mid, PRUNE_THRESHOLD, user_id=user_id):
+                    db.delete(mid)
+                    graph.remove_node(mid)
+                    pruned += 1
+                    log.info("Pruned memory %d (strength=%.4f)", mid, strength)
 
     if pruned:
         log.info("Pruning complete for user '%s': %d memories removed", user_id, pruned)

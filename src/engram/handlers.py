@@ -12,7 +12,7 @@ from .config import DEDUP_SEARCH_THRESHOLD
 from .resolve import resolve, Action
 from .retrieve import recall
 from .consolidator import run_consolidate
-from .decay import compute_strength
+from .decay import compute_strength, compute_quality_score
 from .pruner import maintenance
 
 log = logging.getLogger("engram.handlers")
@@ -40,28 +40,159 @@ def _safe_embed(content: str) -> list[float] | None:
         return None
 
 
+_VALID_MEMORY_TYPES = {"all", "handoff", "failure", "progress"}
+
+_HANDOFF_STEP_FOLLOW_THROUGH_THRESHOLD = 0.82
+
+
+def _validate_handoff_next_steps(db: MemoryDB, handoff_meta: dict,
+                                  user_id: str) -> list[dict] | None:
+    """Check if handoff next_steps were followed through in later memories.
+
+    Returns a list of step validation results, or None if no next_steps.
+    """
+    next_steps = handoff_meta.get("next_steps")
+    if not next_steps:
+        return None
+
+    handoff_ts = handoff_meta.get("timestamp")
+    validations = []
+    for step in next_steps:
+        step_embedding = _safe_embed(step)
+        if step_embedding is None:
+            validations.append({"step": step, "status": "unknown", "reason": "embed_failed"})
+            continue
+
+        similar = db.search_vector(step_embedding, user_id, top_k=3)
+        followed = False
+        evidence_content = None
+        for row in similar:
+            if row.similarity < _HANDOFF_STEP_FOLLOW_THROUGH_THRESHOLD:
+                continue
+            row_meta = db.get_metadata_batch([row.id]).get(row.id, {})
+            row_type = row_meta.get("type", "")
+            # Only count progress / handoff / general memories as follow-through
+            if row_type in ("progress", "handoff", ""):
+                row_ts = row_meta.get("timestamp")
+                if handoff_ts and row_ts and row_ts > handoff_ts:
+                    followed = True
+                    evidence_content = row.content[:120]
+                    break
+                elif not handoff_ts:
+                    followed = True
+                    evidence_content = row.content[:120]
+                    break
+
+        if followed:
+            validations.append({"step": step, "status": "done", "evidence": evidence_content})
+        else:
+            validations.append({"step": step, "status": "pending"})
+
+    return validations
+
 def handle_recall(db: MemoryDB, graph: MemoryGraph, query: str,
                   user_id: str = "default", top_k: int = 5,
-                  session_id: str | None = None) -> dict:
+                  session_id: str | None = None,
+                  memory_type: str = "all") -> dict:
     if not query or not query.strip():
         return _error("query must be non-empty")
     user_id = _validate_user_id(user_id)
     top_k = min(max(int(top_k), 1), 100)
+    if memory_type not in _VALID_MEMORY_TYPES:
+        memory_type = "all"
 
-    results = recall(query, db, graph, user_id, top_k)
+    # Fetch more results when filtering, to compensate for post-filter reduction
+    fetch_k = top_k * 3 if memory_type != "all" else top_k
+    results = recall(query, db, graph, user_id, fetch_k)
 
     if session_id and results:
         db.log_session_recall(session_id, [r.id for r in results], user_id)
 
     meta_batch = db.get_metadata_batch([r.id for r in results]) if results else {}
 
+    # Filter by memory_type if specified
+    if memory_type != "all":
+        filtered = []
+        for r in results:
+            meta = meta_batch.get(r.id, {})
+            if meta.get("type") == memory_type:
+                filtered.append(r)
+        results = filtered[:top_k]
+    else:
+        # Auto-pin: find the latest handoff and move it to top
+        handoff_idx = None
+        for i, r in enumerate(results):
+            meta = meta_batch.get(r.id, {})
+            if meta.get("type") == "handoff":
+                handoff_idx = i
+                break  # meta_batch order matches results (sorted by score desc)
+
+        if handoff_idx is not None and handoff_idx > 0:
+            handoff = results.pop(handoff_idx)
+            results.insert(0, handoff)
+
+    # --- Recall enhancements (all wrapped in try/except to never break core recall) ---
+
+    failure_context: dict[str, list[dict]] = {}
+    outcome_counts: dict[int, dict[str, int]] = {}
+    memory_rows: dict = {}
+    result_ids = [r.id for r in results]
+
+    try:
+        # Collect components referenced in results for batch failure lookup
+        component_set: set[str] = set()
+        for r in results:
+            meta = meta_batch.get(r.id, {})
+            component = meta.get("component") or meta.get("feature")
+            if component and meta.get("type") != "failure":
+                component_set.add(component)
+
+        # Pre-fetch failure context for all referenced components
+        for component in component_set:
+            failures = db.get_failures_by_component(component, user_id, limit=3)
+            if failures:
+                failure_context[component] = [
+                    {
+                        "memory_id": f.id,
+                        "error": (f.metadata or {}).get("error", ""),
+                        "severity": (f.metadata or {}).get("severity", ""),
+                        "fix": (f.metadata or {}).get("fix", ""),
+                        "timestamp": (f.metadata or {}).get("timestamp", ""),
+                    }
+                    for f in failures
+                ]
+    except Exception as exc:
+        log.warning("Recall enhancement (failure context) failed: %s", exc)
+
+    try:
+        # Batch-fetch outcome counts and memory rows for quality scoring
+        outcome_counts = db.get_memory_outcome_counts(result_ids, user_id) if result_ids else {}
+        memory_rows = db.get_by_ids_batch(result_ids) if result_ids else {}
+    except Exception as exc:
+        log.warning("Recall enhancement (quality scoring data) failed: %s", exc)
+
     memories_out = []
     for r in results:
+        # Compute dynamic quality score (safe — falls back to importance)
+        try:
+            counts = outcome_counts.get(r.id, {"success": 0, "failure": 0})
+            mem_row = memory_rows.get(r.id)
+            recall_count = mem_row.recall_count if mem_row else 0
+            quality = compute_quality_score(
+                importance=r.importance,
+                recall_count=recall_count,
+                success_count=counts["success"],
+                failure_count=counts["failure"],
+            )
+        except Exception:
+            quality = r.importance
+
         entry = {
             "id": r.id,
             "content": r.content,
             "category": r.category,
             "importance": r.importance,
+            "quality_score": round(quality, 4),
             "strength": round(r.strength, 4),
             "similarity": round(r.similarity, 4),
             "score": round(r.score, 4),
@@ -69,6 +200,19 @@ def handle_recall(db: MemoryDB, graph: MemoryGraph, query: str,
         meta = meta_batch.get(r.id, {})
         if meta:
             entry["metadata"] = meta
+            # Handoff validation (safe — never breaks recall)
+            if meta.get("type") == "handoff":
+                try:
+                    step_validations = _validate_handoff_next_steps(db, meta, user_id)
+                    if step_validations:
+                        entry["handoff_validation"] = step_validations
+                except Exception as exc:
+                    log.warning("Handoff validation failed for memory %d: %s", r.id, exc)
+            # Attach related failure context for non-failure memories
+            if meta.get("type") != "failure":
+                component = meta.get("component") or meta.get("feature")
+                if component and component in failure_context:
+                    entry["related_failures"] = failure_context[component]
         memories_out.append(entry)
 
     return {"memoriesFound": len(results), "memories": memories_out}
@@ -154,9 +298,10 @@ def handle_update(db: MemoryDB, graph: MemoryGraph,
         return _error("Embedding generation failed")
     db.update(memory_id, new_content, new_embedding, importance)
 
+    effective_importance = importance if importance is not None else existing.importance
     graph.index_memory_incremental(
         memory_id, new_embedding, db,
-        existing.user_id, importance or existing.importance, existing.category,
+        existing.user_id, effective_importance, existing.category,
     )
     return {"result": f"Updated memory (id={memory_id})"}
 
@@ -166,7 +311,8 @@ def handle_session_handoff(db: MemoryDB, graph: MemoryGraph, summary: str,
                            in_progress: list[str] | None = None,
                            blocked: list[str] | None = None,
                            next_steps: list[str] | None = None,
-                           user_id: str = "default") -> dict:
+                           user_id: str = "default",
+                           task_id: int | None = None) -> dict:
     if not summary or not summary.strip():
         return _error("summary must be non-empty")
     user_id = _validate_user_id(user_id)
@@ -197,6 +343,8 @@ def handle_session_handoff(db: MemoryDB, graph: MemoryGraph, summary: str,
         "next_steps": next_steps,
         "timestamp": now_iso,
     }
+    if task_id is not None:
+        meta["task_id"] = task_id
 
     handoff_embedding = _safe_embed(content)
     if handoff_embedding is None:
@@ -204,7 +352,10 @@ def handle_session_handoff(db: MemoryDB, graph: MemoryGraph, summary: str,
     mid = db.insert(content, handoff_embedding, 0.9, "strategy", user_id, metadata=meta)
     graph.index_memory_incremental(mid, handoff_embedding, db, user_id, 0.9, "strategy")
 
-    return {"result": f"Session handoff recorded (id={mid})", "memory_id": mid}
+    result = {"result": f"Session handoff recorded (id={mid})", "memory_id": mid}
+    if task_id is not None:
+        result["task_id"] = task_id
+    return result
 
 
 def handle_consolidate(db: MemoryDB, graph: MemoryGraph,
@@ -213,8 +364,7 @@ def handle_consolidate(db: MemoryDB, graph: MemoryGraph,
         results = run_consolidate(db, graph, user_id)
     except Exception as e:
         log.error("Consolidation failed: %s", e)
-        return {"error": f"consolidation failed: {e}", "error_code": "internal", "details": [], "status_code": 500}
-        return {"error": f"consolidation failed: {e}", "details": [], "status_code": 500}
+        return _error(f"consolidation failed: {e}")
     if not results:
         msg = "No similar memories found to consolidate"
     else:
@@ -247,8 +397,8 @@ def handle_stats(db: MemoryDB, user_id: str = "default") -> dict:
         "fts_available": db.fts_available,
     }
 
-    # Engineering stats — only load metadata column
-    all_meta = db.get_metadata_for_stats(user_id)
+    # Engineering stats — pre-filter structured metadata via SQL
+    all_meta = db.get_metadata_for_stats(user_id, types=("failure", "progress"))
     failures = [m for m in all_meta if m.get("type") == "failure"]
     progress_items = [m for m in all_meta if m.get("type") == "progress"]
 
@@ -291,7 +441,8 @@ def handle_track_failure(db: MemoryDB, graph: MemoryGraph, error: str,
                          component: str, root_cause: str | None = None,
                          severity: str = "major", fix: str | None = None,
                          related_test_ids: list[str] | None = None,
-                         user_id: str = "default") -> dict:
+                         user_id: str = "default",
+                         task_id: int | None = None) -> dict:
     if not error or not error.strip():
         return _error("error must be non-empty")
     if not component or not component.strip():
@@ -320,6 +471,8 @@ def handle_track_failure(db: MemoryDB, graph: MemoryGraph, error: str,
         "related_test_ids": related_test_ids or [],
         "timestamp": now_iso,
     }
+    if task_id is not None:
+        meta["task_id"] = task_id
 
     importance = {"critical": 0.9, "major": 0.7, "minor": 0.5}[severity]
     emb = _safe_embed(content)
@@ -328,7 +481,10 @@ def handle_track_failure(db: MemoryDB, graph: MemoryGraph, error: str,
     mid = db.insert(content, emb, importance, "failure", user_id, metadata=meta)
     graph.index_memory_incremental(mid, emb, db, user_id, importance, "failure")
 
-    return {"result": f"Failure tracked (id={mid})", "memory_id": mid}
+    result = {"result": f"Failure tracked (id={mid})", "memory_id": mid}
+    if task_id is not None:
+        result["task_id"] = task_id
+    return result
 
 
 def handle_track_progress(db: MemoryDB, graph: MemoryGraph, feature: str,
@@ -336,7 +492,8 @@ def handle_track_progress(db: MemoryDB, graph: MemoryGraph, feature: str,
                           blockers: list[str] | None = None,
                           quality_score: float | None = None,
                           notes: str | None = None,
-                          user_id: str = "default") -> dict:
+                          user_id: str = "default",
+                          task_id: int | None = None) -> dict:
     if not feature or not feature.strip():
         return _error("feature must be non-empty")
     valid_statuses = ("planning", "in_progress", "blocked", "review", "done")
@@ -368,6 +525,8 @@ def handle_track_progress(db: MemoryDB, graph: MemoryGraph, feature: str,
         "notes": notes,
         "timestamp": now_iso,
     }
+    if task_id is not None:
+        meta["task_id"] = task_id
 
     importance_map = {
         "planning": 0.6, "in_progress": 0.8,
@@ -380,7 +539,10 @@ def handle_track_progress(db: MemoryDB, graph: MemoryGraph, feature: str,
     mid = db.insert(content, emb, importance, "strategy", user_id, metadata=meta)
     graph.index_memory_incremental(mid, emb, db, user_id, importance, "strategy")
 
-    return {"result": f"Progress tracked (id={mid})", "memory_id": mid}
+    result = {"result": f"Progress tracked (id={mid})", "memory_id": mid}
+    if task_id is not None:
+        result["task_id"] = task_id
+    return result
 
 
 def handle_session_outcome(db: MemoryDB, graph: MemoryGraph, session_id: str,
@@ -401,11 +563,25 @@ def handle_session_outcome(db: MemoryDB, graph: MemoryGraph, session_id: str,
             "memories_adjusted": 0,
         }
 
-    # Importance feedback
+    # Record outcome for historical tracking
+    db.log_session_outcome(session_id, outcome, user_id)
+
+    extra_demoted = 0
     if outcome == "success":
-        adjusted = db.adjust_importance_batch(memory_ids, +0.05)
+        adjusted = db.adjust_importance_batch(memory_ids, +0.10)
     else:
-        adjusted = db.adjust_importance_batch(memory_ids, -0.02)
+        adjusted = db.adjust_importance_batch(memory_ids, -0.05)
+
+        # Extra demotion for memories involved in multiple failed sessions
+        failure_counts = db.get_memory_failure_count(memory_ids, user_id)
+        repeat_offenders = [mid for mid, count in failure_counts.items() if count >= 2]
+        if repeat_offenders:
+            extra_penalty = -0.05  # Additional penalty per repeated failure
+            extra_demoted = db.adjust_importance_batch(repeat_offenders, extra_penalty)
+            log.info(
+                "Extra demotion applied to %d memories with %s repeated failures",
+                extra_demoted, {mid: failure_counts[mid] for mid in repeat_offenders},
+            )
 
         # Store failure lesson as a new memory
         lesson = notes or f"Session {session_id} failed (no notes provided)"
@@ -421,41 +597,170 @@ def handle_session_outcome(db: MemoryDB, graph: MemoryGraph, session_id: str,
                             user_id, metadata=meta)
             graph.index_memory_incremental(mid, lesson_embedding, db, user_id, 0.7, "failure")
 
-    return {
+    result = {
         "result": f"Session outcome recorded ({outcome})",
         "session_id": session_id,
         "outcome": outcome,
         "memories_adjusted": adjusted,
     }
+    if extra_demoted:
+        result["extra_demoted"] = extra_demoted
+    return result
 
+
+def handle_create_task(db: MemoryDB, graph: MemoryGraph, name: str,
+                       goal: str = "", status: str = "planning",
+                       user_id: str = "default",
+                       metadata: dict | None = None) -> dict:
+    if not name or not name.strip():
+        return _error("name must be non-empty")
+    valid_statuses = ("planning", "in_progress", "blocked", "review", "done", "cancelled")
+    if status not in valid_statuses:
+        return _error(f"status must be one of {valid_statuses}")
+    user_id = _validate_user_id(user_id)
+    task_id = db.create_task(name=name.strip(), goal=goal, status=status,
+                             user_id=user_id, metadata=metadata)
+    return {"result": f"Task created (id={task_id})", "task_id": task_id}
+
+
+def handle_update_task(db: MemoryDB, graph: MemoryGraph, task_id: int,
+                       status: str | None = None, goal: str | None = None,
+                       user_id: str = "default",
+                       metadata: dict | None = None) -> dict:
+    try:
+        task_id = int(task_id)
+    except (TypeError, ValueError):
+        return _error("task_id must be an integer")
+    if status is not None:
+        valid_statuses = ("planning", "in_progress", "blocked", "review", "done", "cancelled")
+        if status not in valid_statuses:
+            return _error(f"status must be one of {valid_statuses}")
+    user_id = _validate_user_id(user_id)
+    existing = db.get_task(task_id)
+    if not existing:
+        return _error(f"Task {task_id} not found")
+    if existing.user_id != user_id:
+        return _error(f"Task {task_id} not found for user '{user_id}'")
+    updated = db.update_task(task_id, status=status, goal=goal, metadata=metadata)
+    if not updated:
+        return _error(f"Failed to update task {task_id}")
+    return {"result": f"Task updated (id={task_id})", "task_id": task_id}
+
+
+def handle_get_task(db: MemoryDB, graph: MemoryGraph, task_id: int,
+                    user_id: str = "default") -> dict:
+    try:
+        task_id = int(task_id)
+    except (TypeError, ValueError):
+        return _error("task_id must be an integer")
+    user_id = _validate_user_id(user_id)
+    task = db.get_task(task_id)
+    if not task:
+        return _error(f"Task {task_id} not found")
+    if task.user_id != user_id:
+        return _error(f"Task {task_id} not found for user '{user_id}'")
+
+    memories = db.get_task_memories(task_id, user_id)
+    handoffs = []
+    failures = []
+    progress_snapshots = []
+    other_memories = []
+    for m in memories:
+        meta = m.metadata or {}
+        memory_type = meta.get("type", "")
+        entry = {
+            "memory_id": m.id,
+            "content": m.content,
+            "importance": m.importance,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "metadata": meta,
+        }
+        if memory_type == "handoff":
+            handoffs.append(entry)
+        elif memory_type == "failure":
+            failures.append(entry)
+        elif memory_type == "progress":
+            progress_snapshots.append(entry)
+        else:
+            other_memories.append(entry)
+
+    return {
+        "task": {
+            "id": task.id,
+            "name": task.name,
+            "goal": task.goal,
+            "status": task.status,
+            "created_at": task.created_at.isoformat() if task.created_at else None,
+            "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+            "metadata": task.metadata,
+        },
+        "handoffs": handoffs,
+        "failures": failures,
+        "progress": progress_snapshots,
+        "other_memories": other_memories,
+        "total_memories": len(memories),
+    }
+
+
+def handle_list_tasks(db: MemoryDB, graph: MemoryGraph,
+                      user_id: str = "default",
+                      status: str | None = None) -> dict:
+    user_id = _validate_user_id(user_id)
+    tasks = db.list_tasks(user_id, status=status)
+    return {
+        "tasks": [
+            {
+                "id": t.id,
+                "name": t.name,
+                "goal": t.goal,
+                "status": t.status,
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+                "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+                "metadata": t.metadata,
+            }
+            for t in tasks
+        ],
+        "total": len(tasks),
+    }
 
 TOOL_HANDLERS = {
-    "recall_memory": lambda db, graph, **kw: handle_recall(db, graph, **kw),
-    "store_memory": lambda db, graph, **kw: handle_store(db, graph, **kw),
-    "update_memory": lambda db, graph, **kw: handle_update(db, graph, **kw),
-    "session_handoff": lambda db, graph, **kw: handle_session_handoff(db, graph, **kw),
-    "consolidate_memory": lambda db, graph, **kw: handle_consolidate(db, graph, **kw),
-    "memory_stats": lambda db, graph, **kw: handle_stats(db, **kw),
-    "track_failure": lambda db, graph, **kw: handle_track_failure(db, graph, **kw),
-    "track_progress": lambda db, graph, **kw: handle_track_progress(db, graph, **kw),
-    "session_outcome": lambda db, graph, **kw: handle_session_outcome(db, graph, **kw),
+    "recall_memory": handle_recall,
+    "store_memory": handle_store,
+    "update_memory": handle_update,
+    "session_handoff": handle_session_handoff,
+    "consolidate_memory": handle_consolidate,
+    "memory_stats": lambda db, graph, **kw: handle_stats(db, user_id=kw.get("user_id", "default")),
+    "track_failure": handle_track_failure,
+    "track_progress": handle_track_progress,
+    "session_outcome": handle_session_outcome,
+    "create_task": handle_create_task,
+    "update_task": handle_update_task,
+    "get_task": handle_get_task,
+    "list_tasks": handle_list_tasks,
 }
 
 ARG_MAPPING = {
-    "recall_memory": {"query": "query", "user_id": "user_id", "top_k": "top_k", "session_id": "session_id"},
+    "recall_memory": {"query": "query", "user_id": "user_id", "top_k": "top_k", "session_id": "session_id", "memory_type": "memory_type"},
     "store_memory": {"content": "content", "importance": "importance", "category": "category",
                      "user_id": "user_id", "metadata": "metadata"},
     "update_memory": {"memory_id": "memory_id", "new_content": "new_content", "importance": "importance"},
     "session_handoff": {"summary": "summary", "completed": "completed", "in_progress": "in_progress",
-                        "blocked": "blocked", "next_steps": "next_steps", "user_id": "user_id"},
+                        "blocked": "blocked", "next_steps": "next_steps", "user_id": "user_id",
+                        "task_id": "task_id"},
     "consolidate_memory": {"user_id": "user_id"},
     "memory_stats": {"user_id": "user_id"},
     "track_failure": {"error": "error", "component": "component", "root_cause": "root_cause",
                       "severity": "severity", "fix": "fix", "related_test_ids": "related_test_ids",
-                      "user_id": "user_id"},
+                      "user_id": "user_id", "task_id": "task_id"},
     "track_progress": {"feature": "feature", "status": "status", "completion": "completion",
                        "blockers": "blockers", "quality_score": "quality_score", "notes": "notes",
-                       "user_id": "user_id"},
+                       "user_id": "user_id", "task_id": "task_id"},
     "session_outcome": {"session_id": "session_id", "outcome": "outcome",
                         "notes": "notes", "user_id": "user_id"},
+    "create_task": {"name": "name", "goal": "goal", "status": "status",
+                    "user_id": "user_id", "metadata": "metadata"},
+    "update_task": {"task_id": "task_id", "status": "status", "goal": "goal",
+                    "user_id": "user_id", "metadata": "metadata"},
+    "get_task": {"task_id": "task_id", "user_id": "user_id"},
+    "list_tasks": {"user_id": "user_id", "status": "status"},
 }

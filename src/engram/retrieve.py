@@ -31,6 +31,8 @@ class RecallResult:
     similarity: float
     bm25: float
     score: float
+    recall_count: int = 0
+    metadata: dict | None = None
 
 
 def recall(
@@ -44,14 +46,10 @@ def recall(
 
     internal_k = max(20, top_k)
 
+    # Single-pass vector search at the lower threshold — avoids redundant DB round-trip
     vector_results = db.search_vector(
-        query_embedding, user_id, top_k=internal_k, threshold=SIMILARITY_HIGH
+        query_embedding, user_id, top_k=internal_k, threshold=SIMILARITY_LOW
     )
-    if not vector_results:
-        log.info("No results at threshold=%.2f, falling back to %.2f", SIMILARITY_HIGH, SIMILARITY_LOW)
-        vector_results = db.search_vector(
-            query_embedding, user_id, top_k=internal_k, threshold=SIMILARITY_LOW
-        )
 
     fts_results = db.search_fts(query, user_id, top_k=internal_k)
     fts_by_id = {m.id: m.bm25_score for m in fts_results}
@@ -70,7 +68,13 @@ def recall(
         bm25_norm = bm25_raw / max_bm25
 
         vector_score = m.similarity * strength
-        hybrid = W_BM25 * bm25_norm + W_VECTOR * vector_score
+
+        # Dynamic weighting: boost BM25 when exact-match signal is strong
+        if bm25_norm >= 0.5:
+            w_bm25, w_vec = 0.45, 0.55
+        else:
+            w_bm25, w_vec = W_BM25, W_VECTOR
+        hybrid = w_bm25 * bm25_norm + w_vec * vector_score
 
         scored[m.id] = RecallResult(
             id=m.id,

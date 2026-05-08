@@ -142,3 +142,51 @@ class TestTrackProgressHTTP:
         })
         assert r.status_code == 200
         assert "memory_id" in r.json()
+
+
+class TestTaskHTTP:
+    def test_create_task(self, client):
+        r = client.post("/v1/tasks", json={"name": "http task", "goal": "test"})
+        assert r.status_code == 200
+        assert "task_id" in r.json()
+
+    def test_create_task_empty_name_rejected(self, client):
+        r = client.post("/v1/tasks", json={"name": ""})
+        assert r.status_code == 400
+        assert "error" in r.json()
+
+    def test_update_task(self, client):
+        r = client.post("/v1/tasks", json={"name": "to update"})
+        tid = r.json()["task_id"]
+        r2 = client.post("/v1/tasks/update", json={"task_id": tid, "status": "in_progress"})
+        assert r2.status_code == 200
+        assert "Task updated" in r2.json()["result"]
+
+    def test_update_task_nonexistent(self, client):
+        r = client.post("/v1/tasks/update", json={"task_id": 9999})
+        assert "error" in r.json()
+
+    def test_get_task(self, client):
+        r = client.post("/v1/tasks", json={"name": "get me"})
+        tid = r.json()["task_id"]
+        r2 = client.post("/v1/tasks/get", json={"task_id": tid})
+        assert r2.status_code == 200
+        assert r2.json()["task"]["name"] == "get me"
+
+    def test_get_task_nonexistent(self, client):
+        r = client.post("/v1/tasks/get", json={"task_id": 9999})
+        assert "error" in r.json()
+
+    def test_list_tasks(self, client):
+        client.post("/v1/tasks", json={"name": "t1"})
+        client.post("/v1/tasks", json={"name": "t2", "status": "in_progress"})
+        r = client.post("/v1/tasks/list", json={})
+        assert r.status_code == 200
+        assert r.json()["total"] == 2
+
+    def test_list_tasks_filter_status(self, client):
+        client.post("/v1/tasks", json={"name": "planning"})
+        client.post("/v1/tasks", json={"name": "active", "status": "in_progress"})
+        r = client.post("/v1/tasks/list", json={"status": "in_progress"})
+        assert r.json()["total"] == 1
+        assert r.json()["tasks"][0]["name"] == "active"
