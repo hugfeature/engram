@@ -1,12 +1,10 @@
 # Engram
 
-**AI Agent Continuity ** — 让 Agent 的任务跨会话、跨实例持续推进，而不是每次从零开始。
+**AI Agent Continuity**
 
-## 🎯 产品目标
-
-> **Agent 可替换，任务不中断。**  
-> **按需召回上下文，不靠无限堆 token。**  
-> **数据始终保留在本机。**
+> Agent 可替换，任务不中断。
+> 按需召回上下文，不靠无限堆 token。
+> 数据始终保留在本机。
 
 [![PyPI](https://img.shields.io/pypi/v/mcp-engram)](https://pypi.org/project/mcp-engram/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -14,7 +12,7 @@
 
 ---
 
-## 问题
+## 为什么需要 AI Agent Continuity
 
 AI Agent 的每次会话都是一座孤岛：
 
@@ -23,64 +21,60 @@ AI Agent 的每次会话都是一座孤岛：
 - **昨天踩过的坑？** 不知道，再踩一遍。
 - **一个任务跨了三次会话？** 没人知道整体进度。
 
-根本原因：**Agent 没有可持续的执行上下文，也没有以"任务"为中心的记忆组织。**
+根本原因：**Agent 没有持久化的任务状态层。**
 
-## 解法
+Engram 是一个本地运行的 [MCP](https://modelcontextprotocol.io/) Server，为 AI Agent 提供持久化的任务状态与会话连续性能力。
 
-Engram 是一个本地运行的 **MCP Server**，为 Agent 提供六项 continuity 能力：
+它解决的不是"记住聊天记录"，而是：
 
-| 能力                   | 做什么                                                  | 为什么需要               |
-| ---------------------- | ------------------------------------------------------- | ------------------------ |
-| **Task Context**       | Task 是一等实体，handoff/failure/progress 挂在 task 下  | 跨会话的任务全景视图     |
-| **Session Handoff**    | 结构化记录完成项、阻塞项、下一步 + 自动验证执行情况     | Agent 可替换，任务不中断 |
-| **Smart Recall**       | 语义 + 关键词 + 图谱混合检索 + type 过滤 + handoff 置顶 | 按需召回，不堆 token     |
-| **Error-aware Memory** | 按 component 附带历史 failure 上下文 + 记忆质量评分     | 经验可追溯，错误不重犯   |
-| **Engineering State**  | 结构化的失败归因、进度快照、session outcome 反馈闭环    | 量化执行质量             |
-| **Auto Maintenance**   | 去重、矛盾消解、Ebbinghaus 衰减、整合、剪枝             | 上下文不膨胀，零运维     |
-
-**数据始终在本机，零云端依赖。**
+- **在会话中断后恢复任务**
+- **在 Agent 切换后继续执行**
+- **在长任务中避免上下文失控**
+- **在多轮协作中保留工程状态**
 
 ---
 
-## 快速开始
+## Continuity Flow
 
-```bash
-pip install mcp-engram
-engram-setup          # 下载嵌入模型、初始化数据库
+**AI Agent Continuity 的核心体验：断点恢复。**
+
+```
+Agent A（Claude Code）                     Agent B（Cursor）
+  │                                          │
+  ├─ 创建任务，开始执行                        │
+  ├─ 记录进度 + 失败经验                       │
+  ├─ ━━━━━━━━━━━━━━━━━━━                     │
+  │   ⚡ Session Interrupted                  │
+  │   ━━━━━━━━━━━━━━━━━━━                     │
+  ├─ session_handoff(交接摘要)                 │
+  │        │                                  │
+  │        ▼                                  │
+  │   ┌─────────────────┐                     │
+  │   │   Engram        │                     │
+  │   │   Checkpoint    │                     │
+  │   │   ┌───────────┐ │                     │
+  │   │   │ 任务状态   │ │                     │
+  │   │   │ 执行进度   │ │                     │
+  │   │   │ 失败教训   │ │                     │
+  │   │   │ 下一步计划 │ │                     │
+  │   │   └───────────┘ │                     │
+  │   └────────┬────────┘                     │
+  │            │                              │
+  │            ▼                              │
+  │     Restore State ─────────────────────▶  │
+  │                                          ├─ recall_memory(关键词)
+  │                                          │    └─ handoff 自动置顶
+  │                                          │    └─ 附带历史失败上下文
+  │                                          │    └─ next_steps 执行验证
+  │                                          ├─ 接着做，不从零开始
+  │                                          └─ session_handoff(交接) ──▶ ...
 ```
 
-### MCP 客户端配置（Claude Code / Cursor）
-
-```json
-{
-  "mcpServers": {
-    "engram": {
-      "command": "engram",
-      "env": { "HF_ENDPOINT": "https://hf-mirror.com" }
-    }
-  }
-}
-```
-
-### 推荐写入 CLAUDE.md 的规则
-
-```markdown
-## Memory Rules
-
-- 接到多步任务：`create_task(name, goal)` — 创建跟踪任务
-- 每次任务开始：`recall_memory(query=任务关键词)` — 自动置顶 handoff，附带 failure 上下文
-- 全新知识：`store_memory(content, importance)`
-- 补充已有：`update_memory(memory_id, merged_content)`
-- 推翻已有：`update_memory(memory_id, new_content)`
-- 阶段性进展：`track_progress(feature, status, completion, task_id=X)`
-- 遇到错误：`track_failure(error, component, root_cause, task_id=X)`
-- 任务结束：`session_handoff(summary, completed, in_progress, blocked, next_steps, task_id=X)`
-- 查看任务全景：`get_task(task_id)` — 包含所有关联记忆
-```
+> **无论换了几个 Agent、跨了几次会话，任务状态始终在。**
 
 ---
 
-## 工作流：跨 Agent 接力
+## 恢复流程：跨 Agent 接力
 
 ```
 Agent A                             Agent B
@@ -101,122 +95,52 @@ Agent A                             Agent B
   │                                   └─ session_handoff(交接, task_id) ──▶ ...
 ```
 
-**核心循环**：create_task → recall → execute → track → handoff → repeat
+**核心循环**：`create_task` → `recall` → execute → `track` → `handoff` → repeat
 
 ---
 
-## MCP Tools
+## AI Agent Continuity 能力
 
-Engram 提供 **12 个 MCP 工具**：
+### 与 Memory Plugin 的本质区别
 
-### 核心
+| 维度             | Memory Plugin     | Engram — AI Agent Continuity                   |
+| ---------------- | ----------------- | ---------------------------------------------- |
+| **核心抽象**     | 记忆条目          | **Task + 状态**，以任务为中心组织              |
+| **核心动作**     | 存文本 → 检索文本 | 存状态 → **驱动下一步执行**                    |
+| **跨会话**       | 仅检索历史        | **结构化交接** + next_steps 执行验证           |
+| **工程上下文**   | 无                | **失败归因 + 进度追踪 + session outcome**      |
+| **召回质量**     | 原样返回          | **quality_score + error-aware + handoff 置顶** |
+| **数据增长**     | 无限膨胀          | **自动去重 / 衰减 / 剪枝**                     |
+| **会话连续性**   | 无                | **自动心跳 + 中断检测 + atexit 兜底**          |
+| **部署**         | 云端 API          | **本地优先**，零依赖                           |
 
-| 工具              | 用途                                                                                   |
-| ----------------- | -------------------------------------------------------------------------------------- |
-| `recall_memory`   | 混合检索记忆，支持 `memory_type` 过滤、handoff 自动置顶、附带 failure 上下文和质量评分 |
-| `store_memory`    | 存储新记忆，自动去重 / 合并 / 矛盾消解                                                 |
-| `update_memory`   | 按 ID 更新已有记忆                                                                     |
-| `session_handoff` | 结构化会话交接 + next_steps 执行验证（支持 `task_id` 关联）                            |
+### MCP 工具一览
 
-### 任务管理
+Engram 提供 **12 个 MCP 工具**，覆盖 AI Agent Continuity 的完整生命周期：
 
-| 工具          | 用途                                                        |
-| ------------- | ----------------------------------------------------------- |
-| `create_task` | 创建跟踪任务（name / goal），返回 task_id                   |
-| `update_task` | 更新任务状态 / 目标 / metadata                              |
-| `get_task`    | 获取任务详情 + 关联的全部 handoff / failure / progress 记忆 |
+| 分类     | 工具                 | 用途                                                                                   |
+| -------- | -------------------- | -------------------------------------------------------------------------------------- |
+| **核心** | `recall_memory`      | 混合检索记忆，支持 `memory_type` 过滤、handoff 自动置顶、附带 failure 上下文和质量评分 |
+|          | `store_memory`       | 存储新记忆，自动去重 / 合并 / 矛盾消解                                                 |
+|          | `update_memory`      | 按 ID 更新已有记忆                                                                     |
+|          | `session_handoff`    | 结构化会话交接 + next_steps 执行验证（支持 `task_id` 关联）                            |
+| **任务** | `create_task`        | 创建跟踪任务（name / goal），返回 task_id                                              |
+|          | `update_task`        | 更新任务状态 / 目标 / metadata                                                         |
+|          | `get_task`           | 获取任务详情 + 关联的全部 handoff / failure / progress 记忆                            |
+| **工程** | `track_failure`      | 结构化失败记录（支持 `task_id` 关联，按 component 可追溯）                             |
+|          | `track_progress`     | 功能进度快照（支持 `task_id` 关联）                                                    |
+|          | `session_outcome`    | 标记会话成功/失败，多次失败记忆额外降权                                                |
+| **维护** | `consolidate_memory` | 手动触发记忆整合（相似记忆聚类合并）                                                   |
+|          | `memory_stats`       | 记忆统计 + 工程指标概览                                                                |
 
-### 工程状态
+### 会话生命周期
 
-| 工具              | 用途                                                       |
-| ----------------- | ---------------------------------------------------------- |
-| `track_failure`   | 结构化失败记录（支持 `task_id` 关联，按 component 可追溯） |
-| `track_progress`  | 功能进度快照（支持 `task_id` 关联）                        |
-| `session_outcome` | 标记会话成功/失败，多次失败记忆额外降权                    |
+AI Agent Continuity 依赖自动化的会话生命周期管理，无需调用方显式传递 `session_id`：
 
-### 维护
-
-| 工具                 | 用途                                 |
-| -------------------- | ------------------------------------ |
-| `consolidate_memory` | 手动触发记忆整合（相似记忆聚类合并） |
-| `memory_stats`       | 记忆统计 + 工程指标概览              |
-
-### 重要性参考
-
-| 值          | 场景               |
-| ----------- | ------------------ |
-| **0.9–1.0** | 核心身份、永久事实 |
-| **0.7–0.8** | 架构决策、强偏好   |
-| **0.5**     | 普通项目事实       |
-| **0.2–0.3** | 临时会话上下文     |
-
----
-
-## 记忆机制
-
-### 艾宾浩斯遗忘曲线
-
-每条记忆有一个 **strength** 值，随时间按指数衰减：
-
-```
-effective_λ = base_λ × (1 - importance × 0.8)
-strength = importance × e^(-λ × days) × (1 + recall_count × 0.2)
-```
-
-| 类别         | λ    | 半衰期 | 适用                      |
-| ------------ | ---- | ------ | ------------------------- |
-| `strategy`   | 0.10 | ~38 天 | 被验证有效的方法论        |
-| `fact`       | 0.16 | ~24 天 | 用户偏好、技术选型        |
-| `assumption` | 0.20 | ~19 天 | 推断的上下文              |
-| `failure`    | 0.35 | ~11 天 | 踩过的坑、临时 workaround |
-
-> 策略记最久，失败记最短——环境会变，昨天的坑明天可能已经填上了。
-
-### 智能去重
-
-```
-相似度 ≥ 0.85 → REINFORCE   增加回忆次数
-相似度 0.65~0.84 → 检测矛盾
-  ├── 语义矛盾 → REPLACE    覆盖
-  └── 语义兼容 → MERGE      合并
-相似度 < 0.65 → NEW         新记忆
-```
-
-### 混合检索
-
-```
-score = 0.3 × BM25 + 0.7 × (语义相似度 × 衰减强度) + 图谱加成
-```
-
-- **BM25**：精确关键词匹配（DuckDB FTS）
-- **向量检索**：语义相似度（HNSW 索引加速）
-- **图谱扩展**：从命中记忆出发 BFS（深度 ≤ 3），发现关联知识
-
-### Recall 增强
-
-每次 `recall_memory` 返回的结果自动附带三个维度的增强信息：
-
-| 增强                   | 说明                                                                                |
-| ---------------------- | ----------------------------------------------------------------------------------- |
-| **Handoff Validation** | 检测 handoff 的 `next_steps` 是否被后续 session 执行，返回每步的执行状态            |
-| **Related Failures**   | 非 failure 类记忆如果涉及特定 component，自动附带该 component 的历史 failure 上下文 |
-| **Quality Score**      | 动态计算 `importance × recall频率 × session outcome` 综合质量分                     |
-
-```
-quality_score = clamp(importance × (1 + recall_bonus) × outcome_factor, 0, 1)
-  - recall_bonus = min(recall_count × 0.1, 0.5)
-  - outcome_factor = (success - failure × 0.5) 调整
-```
-
-> 新 Agent 接手时不仅知道"记住了什么"，还知道"哪些做了哪些没做"、"这块踩过什么坑"、"哪条记忆更可靠"。
-
-### 自动维护
-
-每 12 小时自动执行：
-
-- **整合**：相似度 ≥ 0.70 的记忆簇合并
-- **剪枝**：strength < 0.05 且无链式保护的记忆删除
-- **FTS 重建**：保持全文索引新鲜
+1. **心跳注册** — 每次 `recall_memory` / `store_memory` 调用时，服务端自动注册会话心跳
+2. **中断检测** — 下次 recall 时自动检测上一次会话是否异常中断，返回 `interrupted_sessions` 提醒
+3. **优雅关闭** — 进程退出时通过 `atexit` hook 自动标记会话结束
+4. **主动交接** — 会话结束前调用 `session_handoff` 记录执行上下文（推荐）
 
 ---
 
@@ -229,8 +153,9 @@ quality_score = clamp(importance × (1 + recall_bonus) × outcome_factor, 0, 1)
 └──────────────────┬───────────────────────────┘
                    │ stdio / HTTP
 ┌──────────────────▼───────────────────────────┐
-│    server.py (stdio)  ·  http_server.py      │
-│        12 MCP Tools  ·  APScheduler          │
+│  server.py (stdio) · http_server.py (REST)   │
+│  shared.py (session auto-inject · dispatch)  │
+│      12 MCP Tools  ·  APScheduler            │
 ├──────────────────────────────────────────────┤
 │  handlers.py — 业务逻辑                       │
 │  ┌─ Task ───────────────────────────────┐    │
@@ -250,32 +175,93 @@ quality_score = clamp(importance × (1 + recall_bonus) × outcome_factor, 0, 1)
 │                              │  batch_mode · user隔离│
 ├──────────────────────────────────────────────┤
 │              db.py — DuckDB                  │
-│  memories · tasks · session_outcomes         │
+│  memories · tasks · session_lifecycle        │
 │  向量HNSW  ·  BM25 FTS  ·  CRUD             │
 └──────────────────────────────────────────────┘
 ```
 
 **数据目录** `~/.engram/`：
 
-| 文件              | 说明                                                               |
-| ----------------- | ------------------------------------------------------------------ |
-| `memories.duckdb` | 向量数据库 — memories + tasks + session_outcomes（单文件，零运维） |
-| `graph.json`      | 语义图谱（支持 batch_mode、多用户隔离）                            |
-| `model_cache/`    | 嵌入模型缓存                                                       |
+| 文件              | 说明                                                                |
+| ----------------- | ------------------------------------------------------------------- |
+| `memories.duckdb` | 向量数据库 — memories + tasks + session_lifecycle（单文件，零运维） |
+| `graph.json`      | 语义图谱（支持 batch_mode、多用户隔离）                             |
+| `model_cache/`    | 嵌入模型缓存                                                        |
 
 ---
 
-## 与其他 Memory 系统的区别
+## 安装
 
-| 维度           | 普通 Memory       | Engram                                         |
-| -------------- | ----------------- | ---------------------------------------------- |
-| **核心抽象**   | 记忆条目          | **Task + 记忆**，以任务为中心组织              |
-| **核心动作**   | 存文本 → 检索文本 | 存状态 → **驱动下一步执行**                    |
-| **跨会话**     | 仅检索历史        | **结构化交接** + next_steps 执行验证           |
-| **工程上下文** | 无                | **失败归因 + 进度追踪 + session outcome**      |
-| **召回质量**   | 原样返回          | **quality_score + error-aware + handoff 置顶** |
-| **数据增长**   | 无限膨胀          | **自动去重 / 衰减 / 剪枝**                     |
-| **部署**       | 云端 API          | **本地优先**，零依赖                           |
+### 环境要求
+
+- Python 3.11+
+- 约 500MB 磁盘空间（嵌入模型缓存）
+
+### 通过 pip 安装
+
+```bash
+pip install mcp-engram
+engram-setup          # 下载嵌入模型（all-mpnet-base-v2）、初始化 DuckDB 数据库
+```
+
+### 从源码安装
+
+```bash
+git clone https://github.com/hugfeature/engram.git
+cd engram
+pip install -e ".[dev]"
+pytest tests/ -v       # 运行测试验证安装
+```
+
+### 配置 MCP 客户端
+
+在 Claude Code / Cursor 等 MCP 客户端中添加：
+
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "engram",
+      "env": { "HF_ENDPOINT": "https://hf-mirror.com" }
+    }
+  }
+}
+```
+
+> 国内用户建议设置 `HF_ENDPOINT` 使用镜像加速模型下载。
+
+### 推荐写入 CLAUDE.md 的 Agent 指令
+
+```markdown
+## Memory Rules
+
+- 接到多步任务：`create_task(name, goal)` — 创建跟踪任务
+- 每次任务开始：`recall_memory(query=任务关键词)` — 自动置顶 handoff，附带 failure 上下文
+- 全新知识：`store_memory(content, importance)`
+- 补充已有：`update_memory(memory_id, merged_content)`
+- 推翻已有：`update_memory(memory_id, new_content)`
+- 阶段性进展：`track_progress(feature, status, completion, task_id=X)`
+- 遇到错误：`track_failure(error, component, root_cause, task_id=X)`
+- 任务结束：`session_handoff(summary, completed, in_progress, blocked, next_steps, task_id=X)`
+- 查看任务全景：`get_task(task_id)` — 包含所有关联记忆
+```
+
+---
+
+## 兼容环境
+
+| 平台                          | 状态          |
+| ----------------------------- | ------------- |
+| macOS (Apple Silicon / Intel) | ✅ 完全支持   |
+| Linux (x86_64 / ARM64)        | ✅ 完全支持   |
+| Windows (WSL2)                | ✅ 支持       |
+| Windows (原生)                | ⚠️ 未充分测试 |
+
+| MCP 客户端          | 接入方式     |
+| ------------------- | ------------ |
+| Claude Code         | stdio / HTTP |
+| Cursor              | stdio        |
+| 其他 MCP 兼容客户端 | stdio / HTTP |
 
 ---
 
@@ -308,10 +294,85 @@ quality_score = clamp(importance × (1 + recall_bonus) × outcome_factor, 0, 1)
 
 ---
 
-## 环境变量
-
 <details>
-<summary>完整配置项</summary>
+<summary>技术文档</summary>
+
+### 记忆机制
+
+#### 艾宾浩斯遗忘曲线
+
+每条记忆有一个 **strength** 值，随时间按指数衰减：
+
+```
+effective_λ = base_λ × (1 - importance × 0.8)
+strength = importance × e^(-λ × days) × (1 + recall_count × 0.2)
+```
+
+| 类别         | λ    | 半衰期 | 适用                      |
+| ------------ | ---- | ------ | ------------------------- |
+| `strategy`   | 0.10 | ~38 天 | 被验证有效的方法论        |
+| `fact`       | 0.16 | ~24 天 | 用户偏好、技术选型        |
+| `assumption` | 0.20 | ~19 天 | 推断的上下文              |
+| `failure`    | 0.35 | ~11 天 | 踩过的坑、临时 workaround |
+
+> 策略记最久，失败记最短——环境会变，昨天的坑明天可能已经填上了。
+
+#### 智能去重与矛盾消解
+
+```
+相似度 ≥ 0.85 → REINFORCE   增加回忆次数
+相似度 0.65~0.84 → 检测矛盾
+  ├── 语义矛盾 → REPLACE    覆盖
+  └── 语义兼容 → MERGE      合并
+相似度 < 0.65 → NEW         新记忆
+```
+
+#### 混合检索
+
+```
+score = 0.3 × BM25 + 0.7 × (语义相似度 × 衰减强度) + 图谱加成
+```
+
+- **BM25**：精确关键词匹配（DuckDB FTS）
+- **向量检索**：语义相似度（HNSW 索引加速）
+- **图谱扩展**：从命中记忆出发 BFS（深度 ≤ 3），发现关联知识
+
+#### Recall 增强
+
+每次 `recall_memory` 自动附带三个维度的增强信息：
+
+| 增强                   | 说明                                                                                |
+| ---------------------- | ----------------------------------------------------------------------------------- |
+| **Handoff Validation** | 检测 handoff 的 `next_steps` 是否被后续 session 执行，返回每步的执行状态            |
+| **Related Failures**   | 非 failure 类记忆如果涉及特定 component，自动附带该 component 的历史 failure 上下文 |
+| **Quality Score**      | 动态计算 `importance × recall频率 × session outcome` 综合质量分                     |
+
+```
+quality_score = clamp(importance × (1 + recall_bonus) × outcome_factor, 0, 1)
+  - recall_bonus = min(recall_count × 0.1, 0.5)
+  - outcome_factor = (success - failure × 0.5) 调整
+```
+
+> 新 Agent 接手时不仅知道"记住了什么"，还知道"哪些做了哪些没做"、"这块踩过什么坑"、"哪条记忆更可靠"。
+
+#### 自动维护
+
+每 12 小时自动执行：
+
+- **整合**：相似度 ≥ 0.70 的记忆簇合并
+- **剪枝**：strength < 0.05 且无链式保护的记忆删除
+- **FTS 重建**：保持全文索引新鲜
+
+#### 重要性参考
+
+| 值          | 场景               |
+| ----------- | ------------------ |
+| **0.9–1.0** | 核心身份、永久事实 |
+| **0.7–0.8** | 架构决策、强偏好   |
+| **0.5**     | 普通项目事实       |
+| **0.2–0.3** | 临时会话上下文     |
+
+#### 环境变量
 
 | 变量                           | 默认值                  | 说明               |
 | ------------------------------ | ----------------------- | ------------------ |
@@ -341,26 +402,36 @@ quality_score = clamp(importance × (1 + recall_bonus) × outcome_factor, 0, 1)
 - [x] ~~Handoff Validation~~ — next_steps 执行状态检测 ✅
 - [x] ~~Task Context~~ — Task 一等实体，跨会话任务全景视图 ✅
 - [x] ~~Memory Quality Score~~ — 基于 importance + recall + outcome 动态评分 ✅
+- [x] ~~Session Lifecycle~~ — 自动心跳、中断检测、atexit 兜底 ✅
+- [ ] Continuity Demo — 可视化断点恢复体验
 - [ ] Eval Pipeline — 自动化质量回归测试
 - [ ] Multi-Agent Coordination — 多 Agent 并行任务分配与同步
 - [ ] Coding Agent 深度集成 — IDE 原生 Task 面板
 
 ---
 
-## 开发
+## 参与贡献
+
+欢迎通过以下方式参与：
+
+1. **提交 Issue** — 报告 Bug 或提出功能建议
+2. **提交 PR** — Fork → 新建分支 → 提交 PR
 
 ```bash
 git clone https://github.com/hugfeature/engram.git
 cd engram
 pip install -e ".[dev]"
-pytest tests/ -v
+pytest tests/ -v       # 确保测试通过
 ```
+
+## 项目负责人
+
+- [@hugfeature](https://github.com/hugfeature)
 
 ## License
 
-MIT
+[MIT](https://opensource.org/licenses/MIT)
 
 ---
 
-> **AI 不缺能力，缺的是"记住并持续执行"的能力。**
-> Engram 让 Agent 的任务——不论换了几个 Agent、跨了几次会话——都可以不中断地往前走。
+> **AI Agent Continuity — 不是让 Agent 记住更多，而是让任务永远不中断。**

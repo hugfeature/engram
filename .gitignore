@@ -10,3 +10,4 @@ build/
 .eggs/
 benchmark/data/
 benchmark/results/
+.aone_copilot/
