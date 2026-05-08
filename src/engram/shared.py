@@ -51,6 +51,8 @@ TOOL_REST_MAP: dict[str, str] = {
     "update_task": "/v1/tasks/update",
     "get_task": "/v1/tasks/get",
     "list_tasks": "/v1/tasks/list",
+    "restore_checkpoint": "/v1/checkpoints/restore",
+    "list_checkpoints": "/v1/checkpoints/list",
 }
 
 

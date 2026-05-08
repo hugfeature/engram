@@ -146,6 +146,51 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 """
 
+
+# Checkpoint v2 — Cognitive Continuation Layer
+#
+# 每个 checkpoint 是一个 task 在某个时刻的认知状态快照。
+# - kind: 'handoff'（Agent 主动） / 'auto'（事件驱动自动）
+# - checkpoint_reason 枚举：MANUAL_HANDOFF / PLAN_UPDATE / FAILURE /
+#                          WORKING_SET_SHIFT / TOOL_FINISHED / AUTO_SAVE
+# - must_not_redo: negative memory，结构化对象列表
+# - state_diff: 浅 diff（semantic 字段对，不追求 JSON Patch replay correctness）
+CHECKPOINT_SQL = """
+CREATE SEQUENCE IF NOT EXISTS checkpoint_id_seq START 1;
+
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id INTEGER PRIMARY KEY DEFAULT nextval('checkpoint_id_seq'),
+    task_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    parent_version INTEGER,
+    kind VARCHAR NOT NULL DEFAULT 'auto',
+    checkpoint_reason VARCHAR NOT NULL DEFAULT 'AUTO_SAVE',
+    triggered_by_event VARCHAR,
+
+    goal TEXT,
+    completed JSON DEFAULT '[]'::JSON,
+    in_progress JSON DEFAULT '[]'::JSON,
+    blocked JSON DEFAULT '[]'::JSON,
+    preferred_next JSON DEFAULT '[]'::JSON,
+    must_not_redo JSON DEFAULT '[]'::JSON,
+    must_preserve JSON DEFAULT '[]'::JSON,
+    working_set JSON DEFAULT '{}'::JSON,
+
+    state_diff JSON DEFAULT '{}'::JSON,
+    source_session_id VARCHAR,
+    source_memory_id INTEGER,
+
+    continuation_confidence DOUBLE,
+    confidence_breakdown JSON DEFAULT '{}'::JSON,
+    failure_signature VARCHAR,
+
+    user_id VARCHAR NOT NULL DEFAULT 'default',
+    created_at TIMESTAMP NOT NULL DEFAULT now(),
+
+    UNIQUE (task_id, version)
+);
+"""
+
 @dataclass
 class TaskRow:
     id: int
@@ -247,6 +292,25 @@ class MemoryDB:
         self.conn.execute(SESSION_OUTCOME_SQL)
         self.conn.execute(SESSION_LIFECYCLE_SQL)
         self.conn.execute(TASK_SQL)
+        self.conn.execute(CHECKPOINT_SQL)
+        # tasks 表加列：缓存最新 checkpoint 信息（避免每次查询时聚合）
+        for ddl in (
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS latest_checkpoint_version INTEGER DEFAULT 0",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS checkpoint_count INTEGER DEFAULT 0",
+        ):
+            try:
+                self.conn.execute(ddl)
+            except Exception as e:
+                log.debug("ALTER tasks (checkpoint cols) skipped: %s", e)
+        # checkpoints 表索引（task 内按 version 倒序查找最高频）
+        for ddl in (
+            "CREATE INDEX IF NOT EXISTS idx_checkpoints_task_version ON checkpoints(task_id, version DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(source_session_id)",
+        ):
+            try:
+                self.conn.execute(ddl)
+            except Exception as e:
+                log.debug("CREATE INDEX on checkpoints skipped: %s", e)
         self._init_vss()
 
     def _rebuild_fts_index(self):
