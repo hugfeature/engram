@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
+import uuid
 
 from mcp.types import TextContent
 
@@ -15,6 +17,10 @@ log = logging.getLogger("engram.shared")
 
 _db: MemoryDB | None = None
 _graph: MemoryGraph | None = None
+_current_session_id: str | None = None
+
+# Tools that participate in session lifecycle tracking
+_SESSION_AWARE_TOOLS = {"recall_memory", "store_memory", "track_failure", "track_progress"}
 
 
 def get_db() -> MemoryDB:
@@ -48,6 +54,33 @@ TOOL_REST_MAP: dict[str, str] = {
 }
 
 
+def _ensure_session_id() -> str:
+    """Lazily create a process-level session ID and register the atexit hook."""
+    global _current_session_id
+    if _current_session_id is None:
+        _current_session_id = f"auto-{uuid.uuid4().hex[:12]}"
+        atexit.register(_on_exit)
+        log.info("Session auto-created: %s", _current_session_id)
+    return _current_session_id
+
+
+def _on_exit():
+    """Mark the current session as ended when the process exits."""
+    if _current_session_id is None:
+        return
+    try:
+        db = get_db()
+        db.conn.execute(
+            """UPDATE session_lifecycle
+               SET ended_at = now(), end_type = 'process_exit'
+             WHERE session_id = ? AND ended_at IS NULL""",
+            [_current_session_id],
+        )
+        log.info("Session closed on exit: %s", _current_session_id)
+    except Exception as exc:
+        log.debug("Session close on exit failed (non-fatal): %s", exc)
+
+
 def _dispatch(name: str, arguments: dict) -> dict:
     """Core dispatch — look up handler, map args, execute. Returns raw dict."""
     db = get_db()
@@ -56,6 +89,10 @@ def _dispatch(name: str, arguments: dict) -> dict:
     handler = TOOL_HANDLERS.get(name)
     if not handler:
         return {"ok": False, "error": f"Unknown tool: {name}"}
+
+    # Auto-inject session_id for session-aware tools when caller omits it
+    if name in _SESSION_AWARE_TOOLS and "session_id" not in arguments:
+        arguments = {**arguments, "session_id": _ensure_session_id()}
 
     arg_map = ARG_MAPPING.get(name, {})
     kwargs = {}

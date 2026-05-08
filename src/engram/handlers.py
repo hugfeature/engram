@@ -105,6 +105,13 @@ def handle_recall(db: MemoryDB, graph: MemoryGraph, query: str,
     fetch_k = top_k * 3 if memory_type != "all" else top_k
     results = recall(query, db, graph, user_id, fetch_k)
 
+    # Session lifecycle: register/refresh heartbeat
+    if session_id:
+        try:
+            db.upsert_session(session_id, user_id)
+        except Exception as exc:
+            log.debug("Session upsert failed (non-fatal): %s", exc)
+
     if session_id and results:
         db.log_session_recall(session_id, [r.id for r in results], user_id)
 
@@ -215,7 +222,26 @@ def handle_recall(db: MemoryDB, graph: MemoryGraph, query: str,
                     entry["related_failures"] = failure_context[component]
         memories_out.append(entry)
 
-    return {"memoriesFound": len(results), "memories": memories_out}
+    # Detect interrupted sessions and attach reminder to response
+    interrupted_sessions = []
+    if session_id:
+        try:
+            interrupted_sessions = db.get_interrupted_sessions(user_id, stale_minutes=30)
+        except Exception as exc:
+            log.debug("Interrupted sessions check failed (non-fatal): %s", exc)
+
+    result = {"memoriesFound": len(results), "memories": memories_out}
+    if interrupted_sessions:
+        result["interrupted_sessions"] = [
+            {
+                "session_id": s["session_id"],
+                "started_at": str(s["started_at"]),
+                "last_active_at": str(s["last_active_at"]),
+                "hint": "Previous session ended unexpectedly. Consider recalling its context.",
+            }
+            for s in interrupted_sessions
+        ]
+    return result
 
 
 def handle_store(db: MemoryDB, graph: MemoryGraph, content: str,
@@ -351,6 +377,12 @@ def handle_session_handoff(db: MemoryDB, graph: MemoryGraph, summary: str,
         return _error("Embedding generation failed")
     mid = db.insert(content, handoff_embedding, 0.9, "strategy", user_id, metadata=meta)
     graph.index_memory_incremental(mid, handoff_embedding, db, user_id, 0.9, "strategy")
+
+    # Mark any active sessions for this user as ended via handoff
+    try:
+        db.cleanup_stale_sessions(user_id, stale_minutes=0)
+    except Exception as exc:
+        log.debug("Session cleanup on handoff failed (non-fatal): %s", exc)
 
     result = {"result": f"Session handoff recorded (id={mid})", "memory_id": mid}
     if task_id is not None:
