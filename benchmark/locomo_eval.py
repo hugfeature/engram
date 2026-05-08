@@ -299,7 +299,7 @@ def ingest(contents: list[str], db: MemoryDB, graph: MemoryGraph) -> dict[int, l
     for i, content in enumerate(contents):
         vec = embed(content)
         mid = db.insert(content, vec, importance=1.0, category="fact")
-        graph.index_memory(mid, vec, all_embs, importance=1.0, category="fact")
+        graph.index_memory_incremental(mid, vec, db, user_id="default", importance=1.0, category="fact")
         all_embs[mid] = vec
         if (i + 1) % 100 == 0:
             print(f"  ingested {i+1}/{len(contents)}", flush=True)
@@ -433,7 +433,7 @@ def run_benchmark(
             db = make_db(tmpdir)
             graph = MemoryGraph(graph_path=os.path.join(tmpdir, "graph.json"))
 
-            # Ingest
+            # Ingest (use batch_mode to suppress per-op flush overhead)
             turn_id_map: dict[str, int] = {}
             if mode == "turn":
                 turns = extract_turns(conv)
@@ -442,22 +442,33 @@ def run_benchmark(
                 print(f"  Ingesting {len(turns)} turns (batch embed) …")
                 all_vecs = embed_batch(contents)
                 all_embs: dict[int, list[float]] = {}
-                for i, (dia_id, content, vec) in enumerate(zip(dia_ids, contents, all_vecs)):
-                    mid = db.insert(content, vec, importance=1.0, category="fact")
-                    graph.index_memory(mid, vec, all_embs, importance=1.0, category="fact")
-                    all_embs[mid] = vec
-                    turn_id_map[dia_id] = mid
+                with graph.batch_mode():
+                    for i, (dia_id, content, vec) in enumerate(zip(dia_ids, contents, all_vecs)):
+                        mid = db.insert(content, vec, importance=1.0, category="fact")
+                        graph.index_memory_incremental(mid, vec, db, user_id="default", importance=1.0, category="fact")
+                        all_embs[mid] = vec
+                        turn_id_map[dia_id] = mid
                 print(f"    {len(turns)}/{len(turns)} done", flush=True)
             else:
                 obs = extract_observations(sample)
                 print(f"  Ingesting {len(obs)} observations (batch embed) …")
                 all_vecs = embed_batch(obs)
                 all_embs: dict[int, list[float]] = {}
-                for i, (content, vec) in enumerate(zip(obs, all_vecs)):
-                    mid = db.insert(content, vec, importance=1.0, category="fact")
-                    graph.index_memory(mid, vec, all_embs, importance=1.0, category="fact")
-                    all_embs[mid] = vec
+                with graph.batch_mode():
+                    for i, (content, vec) in enumerate(zip(obs, all_vecs)):
+                        mid = db.insert(content, vec, importance=1.0, category="fact")
+                        graph.index_memory_incremental(mid, vec, db, user_id="default", importance=1.0, category="fact")
+                        all_embs[mid] = vec
                 print(f"    {len(obs)}/{len(obs)} done", flush=True)
+
+            # Rebuild FTS index after bulk insert so BM25 channel works
+            try:
+                db.conn.execute(
+                    "PRAGMA create_fts_index('memories', 'id', 'content', overwrite=1)"
+                )
+                print("  FTS index rebuilt after ingest")
+            except Exception as fts_err:
+                print(f"  Warning: FTS rebuild failed: {fts_err}")
 
             mem_count = db.count()
             print(f"  Memory count: {mem_count}")
@@ -491,7 +502,15 @@ def run_benchmark(
                     results = rerank(question, results, top_k)
                 else:
                     results = sorted(results, key=lambda r: r.score, reverse=True)[:top_k]
-                context = "\n".join(r.content for r in results)
+
+                # Trim low-confidence tail: drop results scoring < 30% of top hit
+                if results:
+                    score_cutoff = results[0].score * 0.3
+                    results = [r for r in results if r.score >= score_cutoff] or results[:1]
+
+                # Sort by memory id (proxy for chronological order) for coherent context
+                context_ordered = sorted(results, key=lambda r: r.id)
+                context = "\n".join(r.content for r in context_ordered)
 
                 # Evidence hit
                 hit = check_evidence_hit(results, evidence, turn_id_map) if mode == "turn" else False

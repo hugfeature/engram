@@ -107,6 +107,44 @@ CREATE TABLE IF NOT EXISTS session_memory_log (
 );
 """
 
+SESSION_OUTCOME_SQL = """
+CREATE SEQUENCE IF NOT EXISTS session_outcome_id_seq START 1;
+
+CREATE TABLE IF NOT EXISTS session_outcome_log (
+    id INTEGER PRIMARY KEY DEFAULT nextval('session_outcome_id_seq'),
+    session_id VARCHAR NOT NULL,
+    user_id VARCHAR NOT NULL DEFAULT 'default',
+    outcome VARCHAR NOT NULL,
+    recorded_at TIMESTAMP NOT NULL DEFAULT now()
+);
+"""
+
+
+TASK_SQL = """
+CREATE SEQUENCE IF NOT EXISTS task_id_seq START 1;
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY DEFAULT nextval('task_id_seq'),
+    name VARCHAR NOT NULL,
+    goal TEXT NOT NULL DEFAULT '',
+    status VARCHAR NOT NULL DEFAULT 'planning',
+    user_id VARCHAR NOT NULL DEFAULT 'default',
+    created_at TIMESTAMP NOT NULL DEFAULT now(),
+    updated_at TIMESTAMP NOT NULL DEFAULT now(),
+    metadata JSON DEFAULT '{}'::JSON
+);
+"""
+
+@dataclass
+class TaskRow:
+    id: int
+    name: str
+    goal: str
+    status: str
+    user_id: str
+    created_at: datetime
+    updated_at: datetime
+    metadata: dict | None = field(default=None)
 
 @dataclass
 class MemoryRow:
@@ -195,6 +233,9 @@ class MemoryDB:
             log.warning("FTS extension load failed: %s", e)
         self._rebuild_fts_index()
         self.conn.execute(SESSION_LOG_SQL)
+        self.conn.execute(SESSION_OUTCOME_SQL)
+        self.conn.execute(TASK_SQL)
+        self._init_vss()
 
     def _rebuild_fts_index(self):
         """Rebuild the FTS index from scratch to include all current data."""
@@ -214,6 +255,44 @@ class MemoryDB:
         if self._fts_available and self._fts_dirty:
             self._rebuild_fts_index()
 
+    def _init_vss(self):
+        """Load VSS extension and create HNSW index if beneficial."""
+        self._vss_available = False
+        try:
+            self.conn.execute("INSTALL vss")
+            self.conn.execute("LOAD vss")
+            self.conn.execute("SET hnsw_enable_experimental_persistence = true")
+            self._vss_available = True
+            log.info("VSS extension loaded")
+            self._ensure_hnsw_index()
+        except Exception as e:
+            log.info("VSS extension unavailable: %s — using brute-force vector search", e)
+
+    def _ensure_hnsw_index(self):
+        """Create HNSW index on embedding column when memory count exceeds threshold."""
+        if not self._vss_available:
+            return
+        try:
+            total = self.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+            if total < 1000:
+                log.debug("Only %d memories, skipping HNSW index (threshold: 1000)", total)
+                return
+
+            existing = self.conn.execute(
+                "SELECT index_name FROM duckdb_indexes() WHERE table_name = 'memories'"
+            ).fetchall()
+            hnsw_names = [r[0] for r in existing if "hnsw" in r[0].lower()]
+            if hnsw_names:
+                log.debug("HNSW index already exists: %s", hnsw_names)
+                return
+
+            self.conn.execute(
+                "CREATE INDEX memories_hnsw_idx ON memories USING HNSW (embedding) WITH (metric = 'cosine')"
+            )
+            log.info("HNSW index created on memories.embedding (%d rows)", total)
+        except Exception as e:
+            log.warning("HNSW index creation failed (non-fatal): %s", e)
+
     def _float_cast(self) -> str:
         return f"FLOAT[{self._dim}]"
 
@@ -232,6 +311,7 @@ class MemoryDB:
         user_id: str = "default",
         metadata: dict | None = None,
     ) -> int:
+        self._check_conn()
         self._validate_embedding(embedding)
         meta_json = json.dumps(metadata or {}, ensure_ascii=False)
         cast = self._float_cast()
@@ -305,7 +385,7 @@ class MemoryDB:
         if not memory_ids:
             return 0
         placeholders = ",".join("?" for _ in memory_ids)
-        result = self.conn.execute(
+        row = self.conn.execute(
             f"""
             UPDATE memories
             SET importance = CASE
@@ -314,10 +394,69 @@ class MemoryDB:
                 ELSE importance + ?
             END
             WHERE id IN ({placeholders})
+            RETURNING id
             """,
             [delta, delta, delta] + memory_ids,
+        ).fetchall()
+        return len(row)
+
+    def log_session_outcome(self, session_id: str, outcome: str, user_id: str = "default"):
+        self.conn.execute(
+            "INSERT INTO session_outcome_log (session_id, user_id, outcome) VALUES (?, ?, ?)",
+            [session_id, user_id, outcome],
         )
-        return result.fetchone()[0]
+
+    def get_memory_failure_count(self, memory_ids: list[int], user_id: str = "default") -> dict[int, int]:
+        """Count how many failed sessions each memory was involved in."""
+        if not memory_ids:
+            return {}
+        placeholders = ",".join("?" for _ in memory_ids)
+        rows = self._fetchall_dicts(
+            f"""
+            SELECT sml.memory_id, COUNT(DISTINCT sol.session_id) AS fail_count
+            FROM session_memory_log sml
+            JOIN session_outcome_log sol
+              ON sml.session_id = sol.session_id AND sml.user_id = sol.user_id
+            WHERE sol.outcome = 'failure'
+              AND sml.user_id = ?
+              AND sml.memory_id IN ({placeholders})
+            GROUP BY sml.memory_id
+            """,
+            [user_id] + memory_ids,
+        )
+        return {r["memory_id"]: r["fail_count"] for r in rows}
+
+    def get_memory_outcome_counts(self, memory_ids: list[int],
+                                   user_id: str = "default") -> dict[int, dict[str, int]]:
+        """Count success and failure sessions for each memory.
+
+        Returns {memory_id: {"success": N, "failure": M}}.
+        """
+        if not memory_ids:
+            return {}
+        placeholders = ",".join("?" for _ in memory_ids)
+        rows = self._fetchall_dicts(
+            f"""
+            SELECT sml.memory_id, sol.outcome,
+                   COUNT(DISTINCT sol.session_id) AS cnt
+            FROM session_memory_log sml
+            JOIN session_outcome_log sol
+              ON sml.session_id = sol.session_id AND sml.user_id = sol.user_id
+            WHERE sml.user_id = ?
+              AND sml.memory_id IN ({placeholders})
+            GROUP BY sml.memory_id, sol.outcome
+            """,
+            [user_id] + memory_ids,
+        )
+        result: dict[int, dict[str, int]] = {}
+        for r in rows:
+            mid = r["memory_id"]
+            if mid not in result:
+                result[mid] = {"success": 0, "failure": 0}
+            outcome = r["outcome"]
+            if outcome in ("success", "failure"):
+                result[mid][outcome] = r["cnt"]
+        return result
 
     def delete(self, memory_id: int):
         self.conn.execute("DELETE FROM memories WHERE id = ?", [memory_id])
@@ -459,6 +598,11 @@ class MemoryDB:
         ).fetchone()
         return row[0]
 
+    def _check_conn(self):
+        """Raise if connection has been closed."""
+        if self.conn is None:
+            raise RuntimeError("MemoryDB connection is closed")
+
     def close(self):
         if self.conn:
             self.conn.close()
@@ -484,12 +628,28 @@ class MemoryDB:
         total = sum(categories.values())
         return {"total": total, "categories": categories}
 
-    def get_metadata_for_stats(self, user_id: str = "default") -> list[dict]:
-        """Return only metadata JSON for engineering stats (lightweight)."""
-        rows = self.conn.execute(
-            "SELECT metadata FROM memories WHERE user_id = ?",
-            [user_id],
-        ).fetchall()
+    def get_metadata_for_stats(self, user_id: str = "default",
+                               types: tuple[str, ...] | None = None) -> list[dict]:
+        """Return only metadata JSON for engineering stats (lightweight).
+
+        When *types* is given, only rows whose metadata->type matches are returned,
+        avoiding a full-table scan of all memories.
+        """
+        if types:
+            placeholders = ",".join("?" for _ in types)
+            rows = self.conn.execute(
+                f"""
+                SELECT metadata FROM memories
+                WHERE user_id = ?
+                  AND json_extract_string(metadata, '$.type') IN ({placeholders})
+                """,
+                [user_id] + list(types),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT metadata FROM memories WHERE user_id = ?",
+                [user_id],
+            ).fetchall()
         return [_parse_metadata(r[0]) for r in rows]
 
     def get_strength_data(self, user_id: str = "default") -> list[tuple]:
@@ -559,3 +719,115 @@ class MemoryDB:
             emb = list(r["embedding"]) if r["embedding"] else []
             result[r["id"]] = (m, emb)
         return result
+
+    # --- Task CRUD ---
+
+    def _row_to_task(self, row: dict) -> TaskRow:
+        return TaskRow(
+            id=row["id"],
+            name=row["name"],
+            goal=row["goal"],
+            status=row["status"],
+            user_id=row["user_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            metadata=_parse_metadata(row.get("metadata")),
+        )
+
+    def create_task(self, name: str, goal: str = "", status: str = "planning",
+                    user_id: str = "default", metadata: dict | None = None) -> int:
+        meta_json = json.dumps(metadata or {}, ensure_ascii=False)
+        result = self.conn.execute(
+            """
+            INSERT INTO tasks (name, goal, status, user_id, metadata)
+            VALUES (?, ?, ?, ?, ?::JSON)
+            RETURNING id
+            """,
+            [name, goal, status, user_id, meta_json],
+        ).fetchone()
+        return result[0]
+
+    def get_task(self, task_id: int) -> TaskRow | None:
+        row = self._fetchone_dict(
+            """
+            SELECT id, name, goal, status, user_id, created_at, updated_at, metadata
+            FROM tasks WHERE id = ?
+            """,
+            [task_id],
+        )
+        if not row:
+            return None
+        return self._row_to_task(row)
+
+    def update_task(self, task_id: int, status: str | None = None,
+                    goal: str | None = None, metadata: dict | None = None) -> bool:
+        sets = ["updated_at = now()"]
+        params: list = []
+        if status is not None:
+            sets.append("status = ?")
+            params.append(status)
+        if goal is not None:
+            sets.append("goal = ?")
+            params.append(goal)
+        if metadata is not None:
+            sets.append("metadata = ?::JSON")
+            params.append(json.dumps(metadata, ensure_ascii=False))
+        params.append(task_id)
+        row = self.conn.execute(
+            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ? RETURNING id",
+            params,
+        ).fetchone()
+        return row is not None
+
+    def list_tasks(self, user_id: str = "default", status: str | None = None) -> list[TaskRow]:
+        if status:
+            rows = self._fetchall_dicts(
+                """
+                SELECT id, name, goal, status, user_id, created_at, updated_at, metadata
+                FROM tasks WHERE user_id = ? AND status = ?
+                ORDER BY updated_at DESC
+                """,
+                [user_id, status],
+            )
+        else:
+            rows = self._fetchall_dicts(
+                """
+                SELECT id, name, goal, status, user_id, created_at, updated_at, metadata
+                FROM tasks WHERE user_id = ?
+                ORDER BY updated_at DESC
+                """,
+                [user_id],
+            )
+        return [self._row_to_task(r) for r in rows]
+
+    def get_task_memories(self, task_id: int, user_id: str = "default") -> list[MemoryRow]:
+        """Get all memories associated with a task via metadata.task_id."""
+        rows = self._fetchall_dicts(
+            """
+            SELECT id, user_id, content, importance, category,
+                   recall_count, created_at, last_accessed_at, metadata
+            FROM memories
+            WHERE user_id = ? AND json_extract_string(metadata, '$.task_id') = ?
+            ORDER BY created_at DESC
+            """,
+            [user_id, str(task_id)],
+        )
+        return [_row_to_memory(r) for r in rows]
+
+    def get_failures_by_component(self, component: str, user_id: str = "default",
+                                  limit: int = 5) -> list[MemoryRow]:
+        """Get failure memories for a given component, most recent first."""
+        rows = self._fetchall_dicts(
+            """
+            SELECT id, user_id, content, importance, category,
+                   recall_count, created_at, last_accessed_at, metadata
+            FROM memories
+            WHERE user_id = ?
+              AND category = 'failure'
+              AND json_extract_string(metadata, '$.component') = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            [user_id, component, limit],
+        )
+        return [_row_to_memory(r) for r in rows]

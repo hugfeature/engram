@@ -41,6 +41,10 @@ TOOL_REST_MAP: dict[str, str] = {
     "track_failure": "/v1/failure",
     "track_progress": "/v1/progress",
     "session_outcome": "/v1/session-outcome",
+    "create_task": "/v1/tasks",
+    "update_task": "/v1/tasks/update",
+    "get_task": "/v1/tasks/get",
+    "list_tasks": "/v1/tasks/list",
 }
 
 

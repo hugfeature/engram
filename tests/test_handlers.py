@@ -8,6 +8,8 @@ from engram.handlers import (
     handle_recall, handle_store, handle_update,
     handle_session_handoff, handle_consolidate, handle_stats,
     handle_session_outcome,
+    handle_track_failure, handle_track_progress,
+    handle_create_task, handle_update_task, handle_get_task, handle_list_tasks,
 )
 
 
@@ -172,3 +174,133 @@ class TestHandleRecallSessionLog:
         handle_recall(db, graph, query="no session test")
         ids = db.get_session_memories("nonexistent", "default")
         assert ids == []
+
+
+class TestHandleCreateTask:
+    def test_create_basic(self, env):
+        db, graph = env
+        result = handle_create_task(db, graph, name="test task", goal="do stuff")
+        assert "task_id" in result
+        assert "Task created" in result["result"]
+
+    def test_create_empty_name_rejected(self, env):
+        db, graph = env
+        result = handle_create_task(db, graph, name="")
+        assert "error" in result
+
+    def test_create_invalid_status_rejected(self, env):
+        db, graph = env
+        result = handle_create_task(db, graph, name="t", status="bogus")
+        assert "error" in result
+
+    def test_create_with_metadata(self, env):
+        db, graph = env
+        result = handle_create_task(db, graph, name="meta task", metadata={"priority": "high"})
+        task = db.get_task(result["task_id"])
+        assert task.metadata["priority"] == "high"
+
+
+class TestHandleUpdateTask:
+    def test_update_status(self, env):
+        db, graph = env
+        tid = handle_create_task(db, graph, name="update me")["task_id"]
+        result = handle_update_task(db, graph, task_id=tid, status="in_progress")
+        assert "Task updated" in result["result"]
+        task = db.get_task(tid)
+        assert task.status == "in_progress"
+
+    def test_update_nonexistent_rejected(self, env):
+        db, graph = env
+        result = handle_update_task(db, graph, task_id=9999)
+        assert "error" in result
+
+    def test_update_wrong_user_rejected(self, env):
+        db, graph = env
+        tid = handle_create_task(db, graph, name="alice task", user_id="alice")["task_id"]
+        result = handle_update_task(db, graph, task_id=tid, status="done", user_id="bob")
+        assert "error" in result
+
+    def test_update_invalid_task_id(self, env):
+        db, graph = env
+        result = handle_update_task(db, graph, task_id="abc")
+        assert "error" in result
+
+
+class TestHandleGetTask:
+    def test_get_basic(self, env):
+        db, graph = env
+        tid = handle_create_task(db, graph, name="get me")["task_id"]
+        result = handle_get_task(db, graph, task_id=tid)
+        assert result["task"]["name"] == "get me"
+        assert result["total_memories"] == 0
+
+    def test_get_with_associated_memories(self, env):
+        db, graph = env
+        tid = handle_create_task(db, graph, name="with memories")["task_id"]
+        handle_track_failure(db, graph, error="err", component="comp", task_id=tid)
+        handle_track_progress(db, graph, feature="feat", status="in_progress", task_id=tid)
+        result = handle_get_task(db, graph, task_id=tid)
+        assert result["total_memories"] == 2
+        assert len(result["failures"]) == 1
+        assert len(result["progress"]) == 1
+
+    def test_get_nonexistent_rejected(self, env):
+        db, graph = env
+        result = handle_get_task(db, graph, task_id=9999)
+        assert "error" in result
+
+    def test_get_wrong_user_rejected(self, env):
+        db, graph = env
+        tid = handle_create_task(db, graph, name="alice task", user_id="alice")["task_id"]
+        result = handle_get_task(db, graph, task_id=tid, user_id="bob")
+        assert "error" in result
+
+
+class TestHandleListTasks:
+    def test_list_empty(self, env):
+        db, graph = env
+        result = handle_list_tasks(db, graph)
+        assert result["total"] == 0
+        assert result["tasks"] == []
+
+    def test_list_with_tasks(self, env):
+        db, graph = env
+        handle_create_task(db, graph, name="task 1")
+        handle_create_task(db, graph, name="task 2", status="in_progress")
+        result = handle_list_tasks(db, graph)
+        assert result["total"] == 2
+
+    def test_list_filter_by_status(self, env):
+        db, graph = env
+        handle_create_task(db, graph, name="planning task")
+        handle_create_task(db, graph, name="active task", status="in_progress")
+        result = handle_list_tasks(db, graph, status="in_progress")
+        assert result["total"] == 1
+        assert result["tasks"][0]["name"] == "active task"
+
+
+class TestConsolidatorProtectsStructured:
+    """Consolidator should not merge handoff/failure/progress memories."""
+
+    def test_handoff_not_consolidated(self, env):
+        db, graph = env
+        handle_session_handoff(db, graph, summary="handoff A",
+                               completed=["x"], next_steps=["y"])
+        handle_session_handoff(db, graph, summary="handoff A",
+                               completed=["x"], next_steps=["y"])
+        from engram.consolidator import run_consolidate
+        results = run_consolidate(db, graph)
+        # Both handoffs should survive (not merged)
+        all_mems = db.get_all("default")
+        handoffs = [m for m in all_mems if (m.metadata or {}).get("type") == "handoff"]
+        assert len(handoffs) == 2
+
+    def test_failure_not_consolidated(self, env):
+        db, graph = env
+        handle_track_failure(db, graph, error="same error", component="comp")
+        handle_track_failure(db, graph, error="same error", component="comp")
+        from engram.consolidator import run_consolidate
+        results = run_consolidate(db, graph)
+        all_mems = db.get_all("default")
+        failures = [m for m in all_mems if (m.metadata or {}).get("type") == "failure"]
+        assert len(failures) == 2

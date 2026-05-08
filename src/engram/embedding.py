@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import threading
+from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -21,11 +22,10 @@ _model_lock = threading.Lock()
 _dimensions: int | None = None
 _degraded = False
 
-# Embedding result cache — avoids re-encoding identical text (e.g. during consolidation)
+# Embedding result cache — OrderedDict for O(1) LRU eviction
 _EMBED_CACHE_MAX = 512
 _EMBED_CACHE_MAX_KEY_LEN = 1000  # Limit debug key preview length
-_embed_cache: dict[str, list[float]] = {}
-_embed_cache_order: list[str] = []
+_embed_cache: OrderedDict[str, list[float]] = OrderedDict()
 _cache_lock = threading.Lock()
 
 
@@ -137,9 +137,7 @@ def embed(text: str) -> list[float]:
     with _cache_lock:
         cached = _embed_cache.get(cache_key)
         if cached is not None:
-            if cache_key in _embed_cache_order:
-                _embed_cache_order.remove(cache_key)
-            _embed_cache_order.append(cache_key)
+            _embed_cache.move_to_end(cache_key)
             return cached
     model = _get_model()
     if model is None:
@@ -150,12 +148,9 @@ def embed(text: str) -> list[float]:
         result = vec.tolist()
         with _cache_lock:
             _embed_cache[cache_key] = result
-            if cache_key in _embed_cache_order:
-                _embed_cache_order.remove(cache_key)
-            _embed_cache_order.append(cache_key)
-            while len(_embed_cache) > _EMBED_CACHE_MAX and _embed_cache_order:
-                oldest = _embed_cache_order.pop(0)
-                _embed_cache.pop(oldest, None)
+            _embed_cache.move_to_end(cache_key)
+            while len(_embed_cache) > _EMBED_CACHE_MAX:
+                _embed_cache.popitem(last=False)
         return result
     except Exception as e:
         log.error("Embedding encode failed for text (%d chars): %s", len(text), e)

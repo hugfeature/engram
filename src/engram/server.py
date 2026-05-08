@@ -1,4 +1,4 @@
-"""Engram MCP Server — stdio mode, 9 MCP tools."""
+"""Engram MCP Server — stdio mode, 12 MCP tools."""
 
 from __future__ import annotations
 
@@ -51,12 +51,12 @@ def main():
         if _scheduler:
             _scheduler.shutdown(wait=False)
             log.info("Scheduler shut down")
-        from .shared import _db, _graph
-        if _graph:
-            _graph.flush()
+        from . import shared as _shared
+        if _shared._graph:
+            _shared._graph.flush()
             log.info("Graph flushed")
-        if _db:
-            _db.close()
+        if _shared._db:
+            _shared._db.close()
             log.info("DB closed")
 
 

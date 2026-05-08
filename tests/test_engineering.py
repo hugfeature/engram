@@ -212,13 +212,14 @@ class TestEnhancedStats:
 
 
 class TestToolRegistration:
-    def test_all_9_tools_registered(self):
+    def test_all_tools_registered(self):
         from engram.tools import TOOL_SCHEMAS
         names = {t.name for t in TOOL_SCHEMAS}
         assert names == {
             "recall_memory", "store_memory", "update_memory",
             "session_handoff", "consolidate_memory", "memory_stats",
             "track_failure", "track_progress", "session_outcome",
+            "create_task", "update_task", "get_task", "list_tasks",
         }
 
     def test_handlers_registered(self):

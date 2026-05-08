@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import atexit
+import fcntl
 import json
 import logging
 import os
 import threading
 import time
-import warnings
 from collections import deque
 from typing import TYPE_CHECKING
 
@@ -74,10 +74,36 @@ class MemoryGraph:
     def _mark_dirty(self):
         self._dirty = True
 
+    @property
+    def _batch_active(self) -> bool:
+        return getattr(self, '_in_batch', False)
+
+    def batch_mode(self):
+        """Context manager that suppresses auto-save during bulk operations.
+
+        Usage:
+            with graph.batch_mode():
+                graph.index_memory_incremental(...)
+                graph.remove_node(...)
+            # single flush happens on exit
+        """
+        return _BatchContext(self)
+
     def _flush(self):
+        # Guard: skip flush if parent directory was already cleaned up (e.g. tmpdir)
+        parent_dir = os.path.dirname(self._path)
+        if parent_dir and not os.path.exists(parent_dir):
+            self._dirty = False
+            return
+
         tmp_path = self._path + ".tmp"
+        lock_path = self._path + ".lock"
+        lock_fd = None
         try:
             data = nx.node_link_data(self._graph)
+            # Acquire file lock to prevent concurrent writes from multiple processes
+            lock_fd = open(lock_path, "w")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
             os.replace(tmp_path, self._path)
@@ -96,9 +122,18 @@ class MemoryGraph:
             except OSError:
                 pass
             log.error("Failed to flush graph to %s: %s (will retry)", self._path, e)
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    lock_fd.close()
+                except OSError:
+                    pass
 
     def _save(self):
         if not self._dirty:
+            return
+        if self._batch_active:
             return
         now = time.monotonic()
         if now - self._last_flush_time < self._FLUSH_INTERVAL:
@@ -137,68 +172,6 @@ class MemoryGraph:
                 self._graph.remove_node(memory_id)
                 self._mark_dirty()
                 self._save()
-
-    def index_memory(
-        self,
-        memory_id: int,
-        embedding: list[float],
-        all_embeddings: dict[int, list[float]],
-        user_id: str = "default",
-        importance: float = 0.5,
-        category: str = "fact",
-    ):
-        """Build graph edges by comparing against all embeddings (O(n)).
-
-        .. deprecated::
-            Use ``index_memory_incremental`` instead, which uses DB vector search
-            and avoids loading all embeddings into memory.
-        """
-        warnings.warn(
-            "index_memory is deprecated — use index_memory_incremental instead",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        with self._lock:
-            self._graph.add_node(
-                memory_id,
-                user_id=user_id,
-                strength=1.0,
-                importance=importance,
-                category=category,
-            )
-
-            if not all_embeddings:
-                self._mark_dirty()
-                self._save()
-                return
-
-            new_vec = np.array(embedding)
-            similarities = []
-            for mid, emb in all_embeddings.items():
-                if mid == memory_id:
-                    continue
-                node_data = self._graph.nodes.get(mid, {})
-                if node_data.get("user_id", "default") != user_id:
-                    continue
-                sim = float(np.dot(new_vec, np.array(emb)))
-                if sim >= EDGE_THRESHOLD:
-                    similarities.append((mid, sim))
-
-            similarities.sort(key=lambda x: x[1], reverse=True)
-            for mid, sim in similarities[:MAX_EDGES]:
-                weight = sim * EDGE_WEIGHT
-                if self._graph.has_edge(memory_id, mid):
-                    old_w = self._graph[memory_id][mid].get("weight", 0)
-                    weight = min(1.0, old_w + weight * 0.1)
-                self._graph.add_edge(
-                    memory_id, mid, relation="semantic", weight=weight
-                )
-                self._graph.add_edge(
-                    mid, memory_id, relation="semantic", weight=weight
-                )
-
-            self._mark_dirty()
-            self._save()
 
     def index_memory_incremental(
         self,
@@ -311,7 +284,8 @@ class MemoryGraph:
             self._mark_dirty()
             self._save()
 
-    def chain_safe_to_prune(self, memory_id: int, threshold: float = PRUNE_THRESHOLD) -> bool:
+    def chain_safe_to_prune(self, memory_id: int, threshold: float = PRUNE_THRESHOLD,
+                            user_id: str | None = None) -> bool:
         with self._lock:
             if memory_id not in self._graph:
                 return True
@@ -319,6 +293,8 @@ class MemoryGraph:
                 self._graph.predecessors(memory_id)
             ):
                 data = self._graph.nodes.get(neighbor, {})
+                if user_id is not None and data.get("user_id", "default") != user_id:
+                    continue
                 if data.get("strength", 0) >= threshold:
                     return False
             return True
@@ -329,3 +305,22 @@ class MemoryGraph:
                 self._graph.nodes[memory_id]["strength"] = strength
                 self._mark_dirty()
                 self._save()
+
+
+class _BatchContext:
+    """Suppresses per-operation auto-save; flushes once on exit."""
+
+    def __init__(self, graph: MemoryGraph):
+        self._graph = graph
+
+    def __enter__(self):
+        self._graph._in_batch = True
+        return self._graph
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._graph._in_batch = False
+        try:
+            self._graph.flush()
+        except Exception as flush_err:
+            log.error("Batch flush failed: %s", flush_err)
+        return False
