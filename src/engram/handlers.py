@@ -14,6 +14,7 @@ from .retrieve import recall
 from .consolidator import run_consolidate
 from .decay import compute_strength, compute_quality_score
 from .pruner import maintenance
+from . import checkpoint
 
 log = logging.getLogger("engram.handlers")
 
@@ -337,7 +338,11 @@ def handle_session_handoff(db: MemoryDB, graph: MemoryGraph, summary: str,
                            in_progress: list[str] | None = None,
                            blocked: list[str] | None = None,
                            next_steps: list[str] | None = None,
+                           must_not_redo: list[dict] | None = None,
+                           must_preserve: list[str] | None = None,
+                           working_set: dict | None = None,
                            user_id: str = "default",
+                           session_id: str | None = None,
                            task_id: int | None = None) -> dict:
     if not summary or not summary.strip():
         return _error("summary must be non-empty")
@@ -387,6 +392,39 @@ def handle_session_handoff(db: MemoryDB, graph: MemoryGraph, summary: str,
     result = {"result": f"Session handoff recorded (id={mid})", "memory_id": mid}
     if task_id is not None:
         result["task_id"] = task_id
+
+    # Cognitive Continuation：写入 MANUAL_HANDOFF checkpoint（仅在 task_id 给定时）
+    if task_id is not None:
+        try:
+            task_row = db.get_task(task_id)
+            goal = task_row.goal if task_row else ""
+            ckpt_state = {
+                "goal": goal,
+                "completed": completed,
+                "in_progress": in_progress,
+                "blocked": blocked,
+                "preferred_next": next_steps,
+                "must_not_redo": must_not_redo or [],
+                "must_preserve": must_preserve or [],
+                "working_set": working_set or {},
+            }
+            ckpt = checkpoint.create_checkpoint(
+                db,
+                task_id=task_id,
+                reason=checkpoint.REASON_MANUAL_HANDOFF,
+                state=ckpt_state,
+                source_session_id=session_id,
+                source_memory_id=mid,
+                user_id=user_id,
+                triggered_by_event="session_handoff",
+            )
+            result["checkpoint_id"] = ckpt["checkpoint_id"]
+            result["checkpoint_version"] = ckpt["version"]
+            result["continuation_confidence"] = ckpt["continuation_confidence"]
+        except Exception as exc:
+            # checkpoint 失败不影响 handoff 主流程（向后兼容）
+            log.warning("Checkpoint creation on handoff failed (non-fatal): %s", exc)
+
     return result
 
 
@@ -516,6 +554,34 @@ def handle_track_failure(db: MemoryDB, graph: MemoryGraph, error: str,
     result = {"result": f"Failure tracked (id={mid})", "memory_id": mid}
     if task_id is not None:
         result["task_id"] = task_id
+
+    # Cognitive Continuation：FAILURE 强触发 checkpoint（不受 debounce 限制）
+    if task_id is not None:
+        try:
+            task_row = db.get_task(task_id)
+            goal = task_row.goal if task_row else ""
+            # 失败的 component 加入 working_set.tools，root_cause 进 blocked
+            ckpt_state = {
+                "goal": goal,
+                "blocked": [error] + ([root_cause] if root_cause else []),
+                "working_set": {"tools": [component]},
+            }
+            failure_sig = checkpoint.derive_failure_signature(component, severity)
+            ckpt_meta = checkpoint.create_checkpoint(
+                db,
+                task_id=task_id,
+                reason=checkpoint.REASON_FAILURE,
+                state=ckpt_state,
+                source_memory_id=mid,
+                user_id=user_id,
+                failure_signature=failure_sig,
+                triggered_by_event="track_failure",
+            )
+            result["checkpoint_version"] = ckpt_meta["version"]
+            result["checkpoint_reason"] = ckpt_meta["reason"]
+        except Exception as exc:
+            log.warning("Checkpoint creation on failure failed (non-fatal): %s", exc)
+
     return result
 
 
@@ -574,6 +640,39 @@ def handle_track_progress(db: MemoryDB, graph: MemoryGraph, feature: str,
     result = {"result": f"Progress tracked (id={mid})", "memory_id": mid}
     if task_id is not None:
         result["task_id"] = task_id
+
+    # Cognitive Continuation：event-first 决定是否写 auto checkpoint
+    # 仅在 task_id 给定时触发；done 状态进 completed，其他进 in_progress
+    if task_id is not None:
+        try:
+            task_row = db.get_task(task_id)
+            goal = task_row.goal if task_row else ""
+            feature_label = f"{feature} [{status}]"
+            payload_state = {
+                "goal": goal,
+                "completed": [feature_label] if status == "done" else [],
+                "in_progress": [feature_label] if status != "done" else [],
+                "blocked": list(blockers) if blockers else [],
+                "working_set": {"artifacts": [feature]},
+            }
+            should, reason = checkpoint.should_create_auto_checkpoint(
+                db, task_id, "progress", payload_state, user_id=user_id,
+            )
+            if should and reason:
+                ckpt_meta = checkpoint.create_checkpoint(
+                    db,
+                    task_id=task_id,
+                    reason=reason,
+                    state=payload_state,
+                    source_memory_id=mid,
+                    user_id=user_id,
+                    triggered_by_event="track_progress",
+                )
+                result["checkpoint_version"] = ckpt_meta["version"]
+                result["checkpoint_reason"] = ckpt_meta["reason"]
+        except Exception as exc:
+            log.warning("Checkpoint creation on progress failed (non-fatal): %s", exc)
+
     return result
 
 
@@ -716,7 +815,7 @@ def handle_get_task(db: MemoryDB, graph: MemoryGraph, task_id: int,
         else:
             other_memories.append(entry)
 
-    return {
+    result = {
         "task": {
             "id": task.id,
             "name": task.name,
@@ -732,6 +831,24 @@ def handle_get_task(db: MemoryDB, graph: MemoryGraph, task_id: int,
         "other_memories": other_memories,
         "total_memories": len(memories),
     }
+
+    # Cognitive Continuation：附带 latest_checkpoint（精简版，不含 related_memories
+    # 以避免响应膨胀；需要完整恢复请用 restore_checkpoint）
+    try:
+        latest = checkpoint.get_checkpoint(db, task_id, user_id=user_id)
+        if latest is not None:
+            result["latest_checkpoint"] = {
+                "version": latest["version"],
+                "kind": latest["kind"],
+                "checkpoint_reason": latest["reason"],
+                "created_at": latest["created_at"].isoformat() if latest.get("created_at") else None,
+                "failure_signature": latest.get("failure_signature"),
+                "continuation": checkpoint.build_continuation(latest),
+            }
+    except Exception as exc:
+        log.debug("get_task latest_checkpoint injection failed (non-fatal): %s", exc)
+
+    return result
 
 
 def handle_list_tasks(db: MemoryDB, graph: MemoryGraph,
@@ -755,6 +872,174 @@ def handle_list_tasks(db: MemoryDB, graph: MemoryGraph,
         "total": len(tasks),
     }
 
+
+def _validate_task_id(task_id) -> int | None:
+    """Coerce task_id to int; return None if invalid."""
+    if task_id is None:
+        return None
+    try:
+        return int(task_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def handle_restore_checkpoint(db: MemoryDB, graph: MemoryGraph,
+                              task_id, version: int | None = None,
+                              memory_restore_mode: str = "SELECTIVE",
+                              user_id: str = "default") -> dict:
+    """Restore a constrained continuation package from a task checkpoint.
+
+    Args:
+        task_id: target task
+        version: specific checkpoint version, or None for latest
+        memory_restore_mode: FULL / SELECTIVE (default) / NONE — controls
+            related memory recall to mitigate context pollution
+        user_id: tenant isolation
+
+    Returns:
+        {task_id, version, kind, reason, created_at, continuation, ...}
+        On no-checkpoint: {error: "no_checkpoint", fallback: {...}}
+    """
+    tid = _validate_task_id(task_id)
+    if tid is None:
+        return _error("task_id must be a valid integer")
+    user_id = _validate_user_id(user_id)
+
+    mode = (memory_restore_mode or "SELECTIVE").upper()
+    if mode not in checkpoint.VALID_RESTORE_MODES:
+        mode = "SELECTIVE"
+
+    ckpt_row = checkpoint.get_checkpoint(db, tid, version=version, user_id=user_id)
+    if ckpt_row is None:
+        # Fallback：老 task 无 checkpoint 时，引导调用 get_task + recall_memory
+        task_row = db.get_task(tid)
+        if task_row is None or task_row.user_id != user_id:
+            return _error(f"task {tid} not found")
+        memories = db.get_task_memories(tid, user_id)
+        return {
+            "ok": False,
+            "error": "no_checkpoint",
+            "task_id": tid,
+            "fallback": {
+                "task": {
+                    "id": task_row.id,
+                    "name": task_row.name,
+                    "goal": task_row.goal,
+                    "status": task_row.status,
+                },
+                "associated_memories_count": len(memories),
+                "hint": "No checkpoint exists for this task. Call recall_memory(query=task_name) and get_task(task_id) instead.",
+            },
+        }
+
+    continuation = checkpoint.build_continuation(ckpt_row)
+
+    result = {
+        "task_id": tid,
+        "version": ckpt_row["version"],
+        "kind": ckpt_row["kind"],
+        "checkpoint_reason": ckpt_row["reason"],
+        "created_at": ckpt_row["created_at"].isoformat() if ckpt_row.get("created_at") else None,
+        "source_session_id": ckpt_row.get("source_session_id"),
+        "failure_signature": ckpt_row.get("failure_signature"),
+        "continuation": continuation,
+        "memory_restore_mode": mode,
+    }
+
+    # Memory recall — controlled by mode to mitigate context pollution
+    if mode != "NONE":
+        try:
+            related, related_failures = _collect_continuation_memories(
+                db, graph, ckpt_row, mode, user_id,
+            )
+            result["related_memories"] = related
+            result["related_failures"] = related_failures
+            result["memory_filter_applied"] = (
+                "all_task_memories" if mode == "FULL"
+                else "quality>=0.5 + failure_forced"
+            )
+        except Exception as exc:
+            log.warning("Restore memory recall failed (non-fatal): %s", exc)
+            result["related_memories"] = []
+            result["related_failures"] = []
+
+    return result
+
+
+def _collect_continuation_memories(db: MemoryDB, graph: MemoryGraph,
+                                    ckpt_row: dict, mode: str,
+                                    user_id: str) -> tuple[list[dict], list[dict]]:
+    """Collect related memories for a checkpoint restore.
+
+    FULL: all task memories (cap 20).
+    SELECTIVE: importance >= 0.5 OR category=failure (cap 10).
+    """
+    task_id = ckpt_row["task_id"]
+    memories = db.get_task_memories(task_id, user_id)
+
+    if mode == "SELECTIVE":
+        memories = [m for m in memories if m.importance >= 0.5 or m.category == "failure"]
+        memories = memories[:10]
+    else:  # FULL
+        memories = memories[:20]
+
+    related = [
+        {
+            "memory_id": m.id,
+            "category": m.category,
+            "importance": round(m.importance, 3),
+            "content": m.content[:300],
+            "metadata_type": (m.metadata or {}).get("type", ""),
+        }
+        for m in memories
+    ]
+
+    # Always include failure context for components/tools referenced in working_set
+    working_set = ckpt_row["state"].get("working_set", {}) or {}
+    components: set[str] = set()
+    for key in ("tools", "artifacts"):
+        for v in working_set.get(key, []) or []:
+            if isinstance(v, str):
+                components.add(v)
+
+    related_failures: list[dict] = []
+    for comp in components:
+        failures = db.get_failures_by_component(comp, user_id, limit=3)
+        for f in failures:
+            meta = f.metadata or {}
+            related_failures.append({
+                "memory_id": f.id,
+                "component": comp,
+                "error": meta.get("error", ""),
+                "severity": meta.get("severity", ""),
+                "fix": meta.get("fix", ""),
+                "timestamp": meta.get("timestamp", ""),
+            })
+
+    return related, related_failures
+
+
+def handle_list_checkpoints(db: MemoryDB, graph: MemoryGraph,
+                            task_id, limit: int = 10,
+                            user_id: str = "default") -> dict:
+    """List checkpoint history for a task (latest first, no full state)."""
+    tid = _validate_task_id(task_id)
+    if tid is None:
+        return _error("task_id must be a valid integer")
+    user_id = _validate_user_id(user_id)
+    try:
+        limit = min(max(int(limit), 1), 100)
+    except (TypeError, ValueError):
+        limit = 10
+
+    rows = checkpoint.list_checkpoints(db, tid, limit=limit, user_id=user_id)
+    return {
+        "task_id": tid,
+        "checkpoints": rows,
+        "total": len(rows),
+    }
+
+
 TOOL_HANDLERS = {
     "recall_memory": handle_recall,
     "store_memory": handle_store,
@@ -769,6 +1054,8 @@ TOOL_HANDLERS = {
     "update_task": handle_update_task,
     "get_task": handle_get_task,
     "list_tasks": handle_list_tasks,
+    "restore_checkpoint": handle_restore_checkpoint,
+    "list_checkpoints": handle_list_checkpoints,
 }
 
 ARG_MAPPING = {
@@ -795,4 +1082,8 @@ ARG_MAPPING = {
                     "user_id": "user_id", "metadata": "metadata"},
     "get_task": {"task_id": "task_id", "user_id": "user_id"},
     "list_tasks": {"user_id": "user_id", "status": "status"},
+    "restore_checkpoint": {"task_id": "task_id", "version": "version",
+                           "memory_restore_mode": "memory_restore_mode",
+                           "user_id": "user_id"},
+    "list_checkpoints": {"task_id": "task_id", "limit": "limit", "user_id": "user_id"},
 }

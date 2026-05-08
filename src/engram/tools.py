@@ -392,4 +392,66 @@ TOOL_SCHEMAS: list[Tool] = [
             },
         },
     ),
+    Tool(
+        name="restore_checkpoint",
+        description="Restore a constrained continuation package from a task checkpoint. "
+                    "Use this when a new Agent takes over an interrupted task. Returns goal, "
+                    "completed/in_progress/blocked items, must_not_redo (negative memory), "
+                    "must_preserve (invariants), preferred_next, working_set, and "
+                    "continuation_confidence. Memory recall is controlled by memory_restore_mode "
+                    "to mitigate context pollution.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "integer",
+                    "description": "ID of the task to restore",
+                },
+                "version": {
+                    "type": "integer",
+                    "description": "Specific checkpoint version. Omit for the latest.",
+                },
+                "memory_restore_mode": {
+                    "type": "string",
+                    "enum": ["FULL", "SELECTIVE", "NONE"],
+                    "description": "FULL: all task memories (cap 20). "
+                                   "SELECTIVE (default): importance>=0.5 OR failure (cap 10). "
+                                   "NONE: no related memories, just the continuation package.",
+                    "default": "SELECTIVE",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "User identifier",
+                    "default": "default",
+                },
+            },
+            "required": ["task_id"],
+        },
+    ),
+    Tool(
+        name="list_checkpoints",
+        description="List checkpoint history for a task (latest first). "
+                    "Returns checkpoint metadata only (no full state) for debugging "
+                    "and visualization. Use restore_checkpoint to load a specific version.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "integer",
+                    "description": "ID of the task",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max checkpoints to return (1-100)",
+                    "default": 10,
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "User identifier",
+                    "default": "default",
+                },
+            },
+            "required": ["task_id"],
+        },
+    ),
 ]

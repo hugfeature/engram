@@ -220,6 +220,8 @@ class TestToolRegistration:
             "session_handoff", "consolidate_memory", "memory_stats",
             "track_failure", "track_progress", "session_outcome",
             "create_task", "update_task", "get_task", "list_tasks",
+            # Checkpoint v2 — Cognitive Continuation
+            "restore_checkpoint", "list_checkpoints",
         }
 
     def test_handlers_registered(self):
@@ -230,3 +232,8 @@ class TestToolRegistration:
         assert "track_failure" in ARG_MAPPING
         assert "track_progress" in ARG_MAPPING
         assert "session_outcome" in ARG_MAPPING
+        # Checkpoint v2
+        assert "restore_checkpoint" in TOOL_HANDLERS
+        assert "list_checkpoints" in TOOL_HANDLERS
+        assert "restore_checkpoint" in ARG_MAPPING
+        assert "list_checkpoints" in ARG_MAPPING
