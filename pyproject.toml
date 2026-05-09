@@ -40,6 +40,7 @@ engram = "engram.server:main"
 engram-setup = "engram.setup_cli:main"
 engram-http = "engram.http_server:main"
 engram-server = "engram.daemon:main"
+engram-session-hook = "engram.runtime.startup:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/engram"]
