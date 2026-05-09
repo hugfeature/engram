@@ -87,6 +87,34 @@ def recall(
             score=hybrid,
         )
 
+    # FTS-only fallback: when vector search returns nothing (e.g. all
+    # embeddings are NULL after a recover), FTS hits must still surface
+    # as candidates — otherwise recall returns 0 even though FTS found
+    # matching memories.
+    if not scored and fts_results:
+        log.info(
+            "Vector search returned 0 results; falling back to FTS-only "
+            "(%d candidates)", len(fts_results),
+        )
+        for m in fts_results:
+            if m.id in scored:
+                continue
+            days = (now - m.last_accessed_at.replace(tzinfo=timezone.utc)).total_seconds() / 86400
+            strength = compute_strength(m.category, m.importance, days, m.recall_count)
+            bm25_raw = fts_by_id.get(m.id, 0.0)
+            bm25_norm = bm25_raw / max_bm25
+            # Pure BM25 score — no vector component available
+            scored[m.id] = RecallResult(
+                id=m.id,
+                content=m.content,
+                category=m.category,
+                importance=m.importance,
+                strength=strength,
+                similarity=0.0,
+                bm25=bm25_norm,
+                score=bm25_norm * strength,
+            )
+
     seed_ids = [m.id for m in vector_results[:5]]
     if seed_ids:
         graph_neighbors = graph.expand(seed_ids, max_depth=GRAPH_MAX_DEPTH, user_id=user_id)

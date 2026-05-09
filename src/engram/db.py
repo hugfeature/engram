@@ -794,6 +794,49 @@ class MemoryDB:
                 log.debug("CREATE INDEX on checkpoints skipped: %s", e)
         self._init_vss()
         self._init_meta()
+        self._backfill_null_embeddings()
+
+    def _backfill_null_embeddings(self) -> None:
+        """Re-compute embeddings for memories that have NULL embedding.
+
+        After ``engram recover`` the embedding column is NULL because
+        embeddings are Tier 3 (disposable cache) and not stored in the
+        event log. We backfill them here so vector search works immediately
+        after a recovery, rather than waiting for each memory to be
+        individually accessed.
+        """
+        if self._readonly or self._embedding_stale:
+            return
+        try:
+            rows = self.conn.execute(
+                "SELECT id, content FROM memories WHERE embedding IS NULL"
+            ).fetchall()
+        except Exception:
+            return
+        if not rows:
+            return
+        log.info(
+            "Found %d memories with NULL embedding — backfilling", len(rows),
+        )
+        from .embedding import embed
+        cast = self._float_cast()
+        filled = 0
+        for memory_id, content in rows:
+            try:
+                vec = embed(content)
+                self.conn.execute(
+                    f"UPDATE memories SET embedding = ?::{cast} WHERE id = ?",
+                    [vec, memory_id],
+                )
+                filled += 1
+            except Exception as exc:
+                log.warning(
+                    "Embedding backfill failed for memory %d: %s",
+                    memory_id, exc,
+                )
+        if filled:
+            log.info("Embedding backfill complete: %d/%d filled", filled, len(rows))
+            self._checkpoint_after_extension_op("embedding backfill")
 
     def _init_meta(self) -> None:
         """Seed engram_meta with current process identity.
