@@ -84,7 +84,15 @@ def _on_exit():
 
 
 def _dispatch(name: str, arguments: dict) -> dict:
-    """Core dispatch — look up handler, map args, execute. Returns raw dict."""
+    """Core dispatch — look up handler, map args, execute. Returns raw dict.
+
+    Translates ``DegradedModeError`` into a structured response so MCP
+    clients can branch on ``code='degraded_mode'`` and surface the
+    ``recover_command`` to the user.
+    """
+    from .db import DegradedModeError
+    from .handlers import _degraded_error
+
     db = get_db()
     graph = get_graph()
 
@@ -94,7 +102,10 @@ def _dispatch(name: str, arguments: dict) -> dict:
 
     # Auto-inject session_id for session-aware tools when caller omits it
     if name in _SESSION_AWARE_TOOLS and "session_id" not in arguments:
-        arguments = {**arguments, "session_id": _ensure_session_id()}
+        try:
+            arguments = {**arguments, "session_id": _ensure_session_id()}
+        except DegradedModeError as exc:
+            return _degraded_error(exc)
 
     arg_map = ARG_MAPPING.get(name, {})
     kwargs = {}
@@ -102,7 +113,10 @@ def _dispatch(name: str, arguments: dict) -> dict:
         if mcp_key in arguments:
             kwargs[handler_key] = arguments[mcp_key]
 
-    return handler(db, graph, **kwargs)
+    try:
+        return handler(db, graph, **kwargs)
+    except DegradedModeError as exc:
+        return _degraded_error(exc)
 
 
 def dispatch_tool(name: str, arguments: dict) -> list[TextContent]:

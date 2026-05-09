@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mcp-engram"
 dynamic = ["version"]
-description = "AI Agent Continuity Engine — task-centric memory, session handoff with validation, error-aware recall, Ebbinghaus decay, hybrid retrieval (BM25+vector+graph), quality scoring. Local-first, zero cloud dependency."
+description = "Durable Agent Runtime — append-only event log, replay-based recovery, cross-session task continuity, agent handoff. Local-first, zero cloud dependency."
 readme = "README.md"
 license = "MIT"
 authors = [

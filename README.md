@@ -1,17 +1,42 @@
 # Engram
 
-**Cognitive Continuation Layer for LLM Agents**
+**Durable Agent Runtime — cross-session task continuity for MCP-aware coding agents**
 
-> Engram 恢复的是 agent 的 **cognition**，不是 machine 的 **execution**——这是与 Temporal / LangGraph 的根本差异。
->
-> 跨会话的 **Memory** 解决"知道"，跨中断的 **Continuity** 解决"接着做"。
-> Agent 可替换，任务不中断；按需召回上下文，不靠无限堆 token；数据始终保留在本机。
->
-> 定位：Claude Code / Cursor 等 MCP 客户端的 **cognitive continuation layer**，不是又一个通用 agent runtime / workflow engine。
+> Engram 让 Agent 在中断、重启、跨 session 后能恢复**任务执行状态与工作上下文**。
+> 不是又一个向量库 / 长期记忆库——主轴是 **runtime durability + execution continuity**。
+> 定位：Claude Code / Cursor / OpenHands / Devin 类 runtime infra 的连续性层。
 
 [![PyPI](https://img.shields.io/pypi/v/mcp-engram)](https://pypi.org/project/mcp-engram/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+
+---
+
+## 两条铁律 / Two Laws
+
+> **Rule 1.** Event log is the only durability primitive.
+> **Rule 2.** If it cannot be replayed, it is not critical state.
+
+任何宣称"必须不丢"的数据，必须先写 `~/.engram/events/*.jsonl`（append-only, fsync），
+DuckDB 只是它的 projection layer。
+
+## 三层架构 / Tiered Architecture
+
+```
+Tier 1 — Runtime Continuity Layer  (Source of Truth, must never be lost)
+  tasks · checkpoints · session lifecycle · handoff events
+  → append-only event log (~/.engram/events/) + replay-recoverable
+
+Tier 2 — Semantic Recall Layer    (Degradable, readonly-recoverable)
+  memories.content · metadata · summaries · semantic graph
+  → DuckDB projection from event log
+
+Tier 3 — Derived Retrieval Cache  (Disposable, rebuildable)
+  embeddings · FTS · vector index · rerank cache
+  → never participates in recovery; rebuilt on demand
+```
+
+DB 损坏不会静默重置：进入 **readonly degraded mode**，用 `engram-setup recover` 显式重建。
 
 ---
 
@@ -263,6 +288,59 @@ MCP 客户端配置（Claude Code / Cursor）：
 - [ ] ~~Multi-Agent Coordination — 多 Agent 并行任务分配与同步~~ → **Deferred**：属于通用 orchestration 范畴，与项目定位冲突，让上层框架（LangGraph / AutoGen）解决。
 - [ ] ~~跨模型 next_steps 中间表示~~ → **Deferred**：主流 MCP 客户端使用同档模型，自然语言 next_steps 已足够，过度工程化收益低。
 - [ ] Coding Agent 深度集成 — IDE 原生 Task 面板（保留，依赖 Checkpoint v2 完成）
+
+---
+
+## Changelog
+
+### v0.10.0 — Durable Agent Runtime（架构重构）
+
+定位升级：从 *AI Memory System* 转向 **Durable Agent Runtime**。
+主轴：`runtime durability + execution continuity`，向量召回降级为辅助。
+
+**两条铁律**
+
+> Event log is the only durability primitive.
+> If it cannot be replayed, it is not critical state.
+
+**新增**
+
+- ✨ **Append-only Event Log**：`~/.engram/events/events-YYYYMMDD.jsonl`，fsync 写入，按天滚动；Tier 1（task / checkpoint / session）写入路径全程经过日志。
+- ✨ **Replay-based Recovery**：DuckDB 缺失/损坏时可从 event log 完整重建 Tier 1。
+- ✨ **CLI**：`engram-setup doctor`（健康检查）、`engram-setup recover [--since YYYYMMDD] [--promote]`（dry-run 重建）。
+- ✨ **`engram_meta` 表**：暴露 `schema_version` / `engram_version` / `duckdb_version` / `embedding_model` / `embedding_dim` / `embedding_stale` / `last_boot_at`，供 MCP 客户端读取做版本协商。
+- ✨ **Readonly Degraded Mode**：DB 不可写时进入只读模式，写操作抛 `DegradedModeError`；HTTP 返回 503 + `recover_command`，MCP 返回 `{ok: false, code: "degraded_mode", recover_command: "engram recover"}`。
+- ✨ `tasks` 表预留 `parent_task_id` / `retry_of_task_id` 列（暂不实现，避免未来破坏性迁移）。
+- ✨ `/health` 增加 `db_readonly` / `embedding_stale` / `residue_files` / `engram_meta` 字段。
+
+**⚠️ 行为变更（Breaking-ish）**
+
+- **DuckDB 损坏不再静默重建空库**：原来的 `os.replace(db, db + ".corrupt")` + 自动建空库逻辑被移除。损坏时抛 `DatabaseCorruptionError`，原文件以 `<db>.corrupt.<timestamp>` 隔离到 `~/.engram/backups/`，由用户显式 `engram-setup recover` 处理。
+  - 想保留旧行为：`ENGRAM_ALLOW_RESET=1 engram-server run`
+- **Embedding 模型/维度变化不再自动 ALTER 列**：原来的"全表清零 + ALTER COLUMN"被移除，改为标记 `embedding_stale=true`，向量检索自动 fallback 到 BM25/FTS，写入路径不阻断。
+- **WAL 启动恢复路径改进**：先尝试 `FORCE CHECKPOINT` 抢救数据，失败才将 WAL 隔离为 `<db>.wal-recovery.<timestamp>`（带时间戳，永不互相覆盖）。
+- **Shutdown 自动 CHECKPOINT**：HTTP server 关闭时主动 flush WAL，避免下次启动有残留。
+
+**升级路径**
+
+```bash
+pip install -U mcp-engram          # 安装命令不变
+engram-setup doctor                # 升级后建议跑一次健康检查
+```
+
+- 现有 `~/.engram/memories.duckdb` 直接复用，schema 自动 `ALTER ... ADD COLUMN IF NOT EXISTS`。
+- Event log 从此刻起累积；升级前写入的数据仍依赖 DB 文件本身（无 event log 可 replay）。
+- MCP client 配置不需要改。
+
+**回归**
+
+- 348 tests passed（新增 17 个：`test_event_log` / `test_recover` / `test_degraded_mode`）。
+- 0 lint error。
+
+### v0.9.x（历史）
+
+- Checkpoint v2 — 版本化 cognitive checkpoint，event-first 触发（6 类 reason），`restore_checkpoint` / `list_checkpoints` 上线。
+- Task 一等实体；Session Lifecycle；Handoff Validation；Memory Quality Score；Error-aware Memory。
 
 ---
 
