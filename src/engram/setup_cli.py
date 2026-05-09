@@ -92,6 +92,14 @@ def _cmd_doctor() -> int:
             "corruption. Inspect, then delete manually if no longer needed.",
             file=sys.stderr,
         )
+    backups = info.get("backups") or {}
+    if backups.get("live_count", 0) > backups.get("retain", 0):
+        print(
+            f"\nNOTE: {backups['live_count']} live backups exceed retention "
+            f"limit ({backups['retain']}). Surplus will be archived to "
+            f"{backups.get('dir')}/archive on next boot.",
+            file=sys.stderr,
+        )
     if info.get("readonly"):
         print(
             "\nDB is in readonly degraded mode. Run `engram-setup recover` to rebuild.",
@@ -133,11 +141,18 @@ def _cmd_recover(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     else:
-        print(
-            "\nPromoted. Original DB backed up at:\n  "
-            f"{report.backup_path}",
-            file=sys.stderr,
-        )
+        if report.backup_path:
+            print(
+                "\nPromoted. Original DB backed up at:\n  "
+                f"{report.backup_path}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "\nPromoted. (No original DB to back up — "
+                "recovered from event log only.)",
+                file=sys.stderr,
+            )
     if report.errors:
         return 2
     return 0

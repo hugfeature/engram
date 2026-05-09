@@ -293,6 +293,52 @@ MCP 客户端配置（Claude Code / Cursor）：
 
 ## Changelog
 
+### v0.11.0 — Operational Hardening
+
+主轴：在 v0.10 的"两条铁律"基础上，把 **运维可见性** 和 **灾难性增长防护** 补齐。零配置默认开启，向前完全兼容 v0.10。
+
+**新增**
+
+- ✨ **周期性 Snapshot + Replay 加速**（`snapshot.py`）：每写入 N 条 event（默认 1000）或每 H 小时（默认 1）异步快照 DuckDB 文件到 `~/.engram/snapshots/snapshot-seq{N}-{ts}.duckdb`。`engram-setup recover` 优先从最新 snapshot 加载并只 replay `seq > snapshot_seq` 的事件，长期运行的 engram 不再因事件累积而拖慢恢复。
+- ✨ **Backup 自动归档策略**（`maintenance.py`）：`~/.engram/backups/` 中受管文件（`memories-pre-recover-*` / `memories-pre-duckdb-upgrade-*`）超过 `ENGRAM_BACKUP_RETAIN`（默认 10）时，最旧的归档到 `backups/archive/`（**只移动不删除**，可恢复）。
+- ✨ **DuckDB 版本升级自动备份**：检测到 `duckdb_version` 跨 minor/major 变化（如 `1.5 → 1.6`、`0.9 → 0.10`）时，启动前 `cp` 当前 DB 到 `backups/memories-pre-duckdb-upgrade-<old>-to-<new>-<ts>.duckdb`，并写一条 `runtime.duckdb_upgrade` event 锚定时间。
+- ✨ **MCP tool `get_runtime_health`**：让 LLM（Claude Code / Cursor）能主动查询 engram 健康状态。返回 `advice` 数组（可读建议）+ 完整 `doctor()` 字段，degraded mode 时 LLM 可主动提示用户跑 `engram-setup recover`。
+- ✨ **`engram-setup doctor` 输出增强**：新增 `backups`（`live_count` / `retain` / `archive_count` / `live_recent`）和 `snapshots`（`count` / `latest_seq` / `latest_size_bytes`）章节；超出 retention 时打印归档提示。
+- ✨ **Recover 报告增强**：新增 `snapshot_used` / `snapshot_seq` 字段，可清楚看到本次 recover 是从哪个 snapshot 启动的。
+
+**新增 Event Kinds**（不参与 Tier 1 replay，仅供运维审计）
+
+```
+snapshot.create            # {snapshot_path, seq, db_size_bytes}
+runtime.duckdb_upgrade     # {old_version, new_version, backup_path}
+maintenance.backup_pruned  # {archived: [...], kept, dir}
+```
+
+**新增 Env Vars**
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `ENGRAM_BACKUP_RETAIN` | 10 | `backups/` 保留份数，超出归档到 `archive/` |
+| `ENGRAM_SNAPSHOT_INTERVAL_EVENTS` | 1000 | 每写入多少 event 触发一次 snapshot |
+| `ENGRAM_SNAPSHOT_INTERVAL_HOURS` | 1.0 | 距离上次 snapshot 最长间隔（小时） |
+| `ENGRAM_SNAPSHOT_RETAIN` | 5 | snapshot 保留份数（旧的删除） |
+
+**升级路径**
+
+```bash
+pip install -U mcp-engram      # 安装命令不变
+engram-setup doctor            # 看到 backups + snapshots 新章节即升级成功
+```
+
+- 完全向前兼容 v0.10：snapshot 不存在时 recover 自动退化为全量 replay
+- 无需修改 MCP client 配置；`get_runtime_health` 是新工具，老 client 不受影响
+- 后台 maintenance 线程仅在主运行时进程启动（短期工具脚本如 doctor / recover 不触发）
+
+**回归**
+
+- 381 tests passed（v0.10 的 348 + 新增 33：`test_backup_pruner` / `test_duckdb_upgrade` / `test_runtime_health_tool` / `test_snapshot`）
+- 0 lint error
+
 ### v0.10.0 — Durable Agent Runtime（架构重构）
 
 定位升级：从 *AI Memory System* 转向 **Durable Agent Runtime**。

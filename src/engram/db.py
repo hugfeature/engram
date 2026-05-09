@@ -517,7 +517,46 @@ class MemoryDB:
             )
         self.conn = _connect_with_retry(db_path)
         self._dim = dim or _dim()
+        # Populated by _init_meta(): the duckdb_version recorded by the
+        # previous boot, BEFORE this boot overwrote it. Maintenance hook
+        # uses this to decide whether to make a pre-upgrade backup.
+        self.previous_duckdb_version: str | None = None
+        self.current_duckdb_version: str | None = None
         self._init_schema()
+        # Best-effort: kick off async maintenance (backup pruning + duckdb
+        # upgrade detection). Never blocks boot, never raises.
+        self._schedule_maintenance()
+
+    def _schedule_maintenance(self) -> None:
+        """Hook P1-3 + P1-5 + P1-1 into the boot path on a daemon thread.
+
+        Order:
+          - maintenance (backup pruning + duckdb upgrade detect) is one-shot
+            and runs on its own thread.
+          - snapshot scheduler is a long-lived daemon thread idempotently
+            started once per process.
+        Both are best-effort: any failure is logged at debug and cannot
+        block boot.
+        """
+        # Skip background work entirely for short-lived utility opens
+        # (recover dry-run, tests, doctor) where ``log_writes=False`` already
+        # signals "this is not a primary runtime instance".
+        if not self._log_writes:
+            return
+        try:
+            from .maintenance import schedule_startup_maintenance
+            schedule_startup_maintenance(
+                db_path=self._db_path,
+                old_duckdb_version=self.previous_duckdb_version,
+                new_duckdb_version=self.current_duckdb_version,
+            )
+        except Exception as exc:
+            log.debug("maintenance scheduling skipped: %s", exc)
+        try:
+            from .snapshot import ensure_started as ensure_snapshot_started
+            ensure_snapshot_started(db_path=self._db_path)
+        except Exception as exc:
+            log.debug("snapshot scheduler skipped: %s", exc)
 
     # ---- durability primitives ----
 
@@ -693,6 +732,10 @@ class MemoryDB:
           - embedding_dim         : effective dim of memories.embedding
           - embedding_stale       : '1' if drift detected, else '0'
           - last_boot_at          : ISO8601
+
+        Side effect: stores the *previous* duckdb_version on ``self`` as
+        ``previous_duckdb_version`` so the maintenance hook can detect
+        upgrade-driven file format changes before they cause silent issues.
         """
         try:
             from . import __version__ as engram_version
@@ -703,6 +746,10 @@ class MemoryDB:
         except Exception:
             duckdb_version = "unknown"
         boot_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+        # Capture previous values BEFORE the upsert overwrites them.
+        self.previous_duckdb_version = self.get_meta("duckdb_version")
+        self.current_duckdb_version = duckdb_version
 
         rows = [
             ("schema_version", str(ENGRAM_SCHEMA_VERSION)),

@@ -454,4 +454,21 @@ TOOL_SCHEMAS: list[Tool] = [
             "required": ["task_id"],
         },
     ),
+    Tool(
+        name="get_runtime_health",
+        description="Read-only runtime health report for the engram backend. "
+                    "Returns DB status (readonly / embedding_stale), event log "
+                    "summary (kinds + max seq), backups inventory, residue "
+                    "files (corruption indicators), and engram_meta. Call this "
+                    "when memory tools start returning 'degraded_mode' errors, "
+                    "or proactively at session start to detect operator-action "
+                    "needed (e.g. residue files present → suggest "
+                    "`engram-setup recover`). Always safe to call; never "
+                    "modifies state.",
+        inputSchema={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    ),
 ]
