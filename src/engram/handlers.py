@@ -249,13 +249,7 @@ def handle_recall(db: MemoryDB, graph: MemoryGraph, query: str,
     result = {"memoriesFound": len(results), "memories": memories_out}
     if interrupted_sessions:
         result["interrupted_sessions"] = [
-            {
-                "session_id": s["session_id"],
-                "started_at": str(s["started_at"]),
-                "last_active_at": str(s["last_active_at"]),
-                "hint": "Previous session ended unexpectedly. Consider recalling its context.",
-            }
-            for s in interrupted_sessions
+            _build_recovery_hint(s) for s in interrupted_sessions
         ]
     return result
 
@@ -978,6 +972,22 @@ def handle_restore_checkpoint(db: MemoryDB, graph: MemoryGraph,
             result["related_memories"] = []
             result["related_failures"] = []
 
+    # Continuity Metrics — compare restored checkpoint against its parent
+    try:
+        from . import continuity as _cont
+        parent_version = ckpt_row.get("parent_version")
+        if parent_version is not None:
+            score = _cont.evaluate_from_checkpoints(
+                db, tid,
+                before_version=parent_version,
+                after_version=ckpt_row["version"],
+                user_id=user_id,
+            )
+            if score is not None:
+                result["continuity_score"] = score.to_dict()
+    except Exception as exc:
+        log.debug("Continuity score computation failed (non-fatal): %s", exc)
+
     return result
 
 
@@ -1095,6 +1105,108 @@ def handle_get_runtime_health(db: MemoryDB, graph: MemoryGraph, **_kw) -> dict:
     return {"ok": True, "advice": advice, **info}
 
 
+# --- Interruption Taxonomy (v0.12) ---
+
+def handle_report_interruption(db: MemoryDB, graph: MemoryGraph,
+                               reason: str,
+                               context: dict | None = None,
+                               session_id: str | None = None,
+                               user_id: str = "default") -> dict:
+    """LLM-reported interruption reason.
+
+    Called by the LLM when it detects an imminent interruption (e.g. context
+    window overflow, rate limit). The reason is stored in process-level state
+    and flushed to session_lifecycle on process exit via atexit.
+
+    If session_id is provided, the session is also updated immediately so the
+    taxonomy is visible even if atexit doesn't fire.
+    """
+    from .db import VALID_INTERRUPTION_REASONS, INTERRUPTION_UNKNOWN
+    from .shared import set_interruption_report
+
+    user_id = _validate_user_id(user_id)
+    if reason not in VALID_INTERRUPTION_REASONS:
+        return _error(f"Invalid interruption reason '{reason}'. "
+                      f"Valid: {sorted(VALID_INTERRUPTION_REASONS)}")
+
+    set_interruption_report(reason, context)
+
+    if session_id:
+        try:
+            db.end_session(
+                session_id,
+                end_type="interrupted",
+                interruption_reason=reason,
+                interruption_context=context,
+            )
+        except Exception as exc:
+            log.warning("Immediate session close failed (will retry on exit): %s", exc)
+
+    return {
+        "ok": True,
+        "reason": reason,
+        "result": f"Interruption reported: {reason}. Session will be classified on exit.",
+    }
+
+
+def _build_recovery_hint(session: dict) -> dict:
+    """Build a taxonomy-aware recovery hint for an interrupted session.
+
+    Returns a dict with session_id, timing info, interruption_reason,
+    recovery_strategy, and a human-readable hint.
+    """
+    from .db import RECOVERY_STRATEGIES, INTERRUPTION_UNKNOWN
+
+    reason = session.get("interruption_reason") or INTERRUPTION_UNKNOWN
+    strategy = RECOVERY_STRATEGIES.get(reason, RECOVERY_STRATEGIES[INTERRUPTION_UNKNOWN])
+
+    result = {
+        "session_id": session["session_id"],
+        "started_at": str(session["started_at"]),
+        "last_active_at": str(session["last_active_at"]),
+        "interruption_reason": reason,
+        "recovery_strategy": strategy["action"],
+        "memory_restore_mode": strategy.get("memory_restore_mode", "NONE"),
+        "hint": strategy["hint"],
+    }
+    context = session.get("interruption_context")
+    if context and context != {}:
+        result["interruption_context"] = context
+    return result
+
+
+def handle_evaluate_continuity(db: MemoryDB, graph: MemoryGraph,
+                               task_id, before_version: int | None = None,
+                               after_version: int | None = None,
+                               actions_taken_after_restore: list[str] | None = None,
+                               user_id: str = "default") -> dict:
+    """Evaluate continuity metrics between two checkpoint versions."""
+    from . import continuity as _cont
+
+    tid = _validate_task_id(task_id)
+    if tid is None:
+        return _error("task_id must be a valid integer")
+    user_id = _validate_user_id(user_id)
+
+    score = _cont.evaluate_from_checkpoints(
+        db, tid,
+        before_version=before_version,
+        after_version=after_version,
+        user_id=user_id,
+        actions_taken_after_restore=actions_taken_after_restore,
+    )
+    if score is None:
+        return _error("Need at least 2 checkpoints to evaluate continuity")
+
+    return {
+        "ok": True,
+        "task_id": tid,
+        "before_version": before_version,
+        "after_version": after_version,
+        "continuity_score": score.to_dict(),
+    }
+
+
 TOOL_HANDLERS = {
     "recall_memory": handle_recall,
     "store_memory": handle_store,
@@ -1112,6 +1224,8 @@ TOOL_HANDLERS = {
     "restore_checkpoint": handle_restore_checkpoint,
     "list_checkpoints": handle_list_checkpoints,
     "get_runtime_health": handle_get_runtime_health,
+    "report_interruption": handle_report_interruption,
+    "evaluate_continuity": handle_evaluate_continuity,
 }
 
 ARG_MAPPING = {
@@ -1143,4 +1257,10 @@ ARG_MAPPING = {
                            "user_id": "user_id"},
     "list_checkpoints": {"task_id": "task_id", "limit": "limit", "user_id": "user_id"},
     "get_runtime_health": {},  # No input args; doctor reads everything from disk.
+    "report_interruption": {"reason": "reason", "context": "context",
+                            "session_id": "session_id", "user_id": "user_id"},
+    "evaluate_continuity": {"task_id": "task_id", "before_version": "before_version",
+                            "after_version": "after_version",
+                            "actions_taken_after_restore": "actions_taken_after_restore",
+                            "user_id": "user_id"},
 }

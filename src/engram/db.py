@@ -405,9 +405,61 @@ CREATE TABLE IF NOT EXISTS session_lifecycle (
     started_at TIMESTAMP NOT NULL DEFAULT now(),
     last_active_at TIMESTAMP NOT NULL DEFAULT now(),
     ended_at TIMESTAMP,
-    end_type VARCHAR
+    end_type VARCHAR,
+    interruption_reason VARCHAR,
+    interruption_context JSON DEFAULT '{}'::JSON
 );
 """
+
+# --- Interruption Taxonomy (v0.12) ---
+# 6-value enum for classifying WHY a session was interrupted.
+# Used in session_lifecycle.interruption_reason and recovery routing.
+INTERRUPTION_OVERFLOW = "overflow"          # Context window full / token limit
+INTERRUPTION_USER_AWAY = "user_away"        # User closed / long inactivity
+INTERRUPTION_TOOL_FAILURE = "tool_failure"  # Consecutive tool call failures
+INTERRUPTION_CRASH = "crash"               # Process died without atexit
+INTERRUPTION_RATE_LIMIT = "rate_limit"      # API throttling
+INTERRUPTION_UNKNOWN = "unknown"            # Cannot determine (fallback)
+
+VALID_INTERRUPTION_REASONS = {
+    INTERRUPTION_OVERFLOW, INTERRUPTION_USER_AWAY, INTERRUPTION_TOOL_FAILURE,
+    INTERRUPTION_CRASH, INTERRUPTION_RATE_LIMIT, INTERRUPTION_UNKNOWN,
+}
+
+# Recovery strategy per interruption reason — consumed by handlers.
+RECOVERY_STRATEGIES: dict[str, dict] = {
+    INTERRUPTION_OVERFLOW: {
+        "action": "restore_checkpoint",
+        "memory_restore_mode": "SELECTIVE",
+        "hint": "Context window was full. Restore checkpoint and compress context before continuing.",
+    },
+    INTERRUPTION_USER_AWAY: {
+        "action": "show_summary",
+        "memory_restore_mode": "NONE",
+        "hint": "User was away. Show a brief handoff summary to re-orient.",
+    },
+    INTERRUPTION_TOOL_FAILURE: {
+        "action": "restore_checkpoint",
+        "memory_restore_mode": "SELECTIVE",
+        "hint": "Tools failed repeatedly. Restore checkpoint, review failure records, and consider alternative approaches.",
+        "include_failures": True,
+    },
+    INTERRUPTION_CRASH: {
+        "action": "restore_checkpoint",
+        "memory_restore_mode": "FULL",
+        "hint": "Process crashed unexpectedly. Full checkpoint restore recommended; verify data integrity.",
+    },
+    INTERRUPTION_RATE_LIMIT: {
+        "action": "restore_checkpoint",
+        "memory_restore_mode": "SELECTIVE",
+        "hint": "API rate limit hit. Restore checkpoint; consider switching models or waiting before retrying.",
+    },
+    INTERRUPTION_UNKNOWN: {
+        "action": "show_summary",
+        "memory_restore_mode": "NONE",
+        "hint": "Previous session ended unexpectedly. Consider recalling its context.",
+    },
+}
 
 # engram_meta — process/version/runtime contract.
 # This table is what MCP clients (Claude Code, Cursor, ...) inspect to
@@ -783,6 +835,15 @@ class MemoryDB:
                 self.conn.execute(ddl)
             except Exception as e:
                 log.debug("ALTER tasks (extra cols) skipped: %s", e)
+        # session_lifecycle 表加列：v0.12 Interruption Taxonomy
+        for ddl in (
+            "ALTER TABLE session_lifecycle ADD COLUMN IF NOT EXISTS interruption_reason VARCHAR",
+            "ALTER TABLE session_lifecycle ADD COLUMN IF NOT EXISTS interruption_context JSON DEFAULT '{}'::JSON",
+        ):
+            try:
+                self.conn.execute(ddl)
+            except Exception as exc:
+                log.debug("ALTER session_lifecycle (taxonomy cols) skipped: %s", exc)
         # checkpoints 表索引（task 内按 version 倒序查找最高频）
         for ddl in (
             "CREATE INDEX IF NOT EXISTS idx_checkpoints_task_version ON checkpoints(task_id, version DESC)",
@@ -1602,35 +1663,74 @@ class MemoryDB:
                 "user_id": user_id,
             })
 
-    def end_session(self, session_id: str, end_type: str = "handoff"):
-        """Mark a session as ended (handoff / outcome)."""
+    def end_session(self, session_id: str, end_type: str = "handoff",
+                    interruption_reason: str | None = None,
+                    interruption_context: dict | None = None):
+        """Mark a session as ended.
+
+        Args:
+            session_id: Session to close.
+            end_type: One of handoff / outcome / process_exit / interrupted.
+            interruption_reason: One of VALID_INTERRUPTION_REASONS (v0.12).
+                Only meaningful when end_type == 'interrupted' or 'process_exit'.
+            interruption_context: Optional structured context (e.g. last error,
+                token count, failure count).
+        """
         self._assert_writable()
+        context_json = json.dumps(interruption_context or {}, ensure_ascii=False)
         self.conn.execute(
             """UPDATE session_lifecycle
-            SET ended_at = now(), last_active_at = now(), end_type = ?
+            SET ended_at = now(), last_active_at = now(), end_type = ?,
+                interruption_reason = ?, interruption_context = ?::JSON
             WHERE session_id = ?""",
-            [end_type, session_id],
+            [end_type, interruption_reason, context_json, session_id],
         )
-        self._emit_event("session.end", {
+        event_payload: dict = {
             "session_id": session_id,
             "end_type": end_type,
-        })
+        }
+        if interruption_reason:
+            event_payload["interruption_reason"] = interruption_reason
+        if interruption_context:
+            event_payload["interruption_context"] = interruption_context
+        self._emit_event("session.end", event_payload)
 
     def get_interrupted_sessions(self, user_id: str = "default",
                                  stale_minutes: int = 30) -> list[dict]:
-        """Find sessions that started but never ended.
+        """Find sessions that started but never ended, or ended with interruption.
 
-        A session is interrupted if ended_at IS NULL and last_active_at
-        is older than stale_minutes ago.
+        Returns both:
+        - Sessions with ended_at IS NULL and stale heartbeat (not yet classified).
+        - Sessions already classified as interrupted (end_type='interrupted')
+          from the last 24 hours, so the new Agent can see recent interruptions
+          with their taxonomy.
         """
-        return self._fetchall_dicts(
-            """SELECT session_id, started_at, last_active_at
+        # Unclosed stale sessions
+        unclosed = self._fetchall_dicts(
+            """SELECT session_id, started_at, last_active_at,
+                      interruption_reason, interruption_context
             FROM session_lifecycle
             WHERE user_id = ? AND ended_at IS NULL
               AND last_active_at < now() - INTERVAL '1 MINUTE' * ?
             ORDER BY last_active_at DESC LIMIT 5""",
             [user_id, stale_minutes],
         )
+        # Recently classified interrupted sessions (last 24h)
+        recent_interrupted = self._fetchall_dicts(
+            """SELECT session_id, started_at, last_active_at,
+                      interruption_reason, interruption_context
+            FROM session_lifecycle
+            WHERE user_id = ? AND end_type = 'interrupted'
+              AND ended_at > now() - INTERVAL '24 HOURS'
+              AND interruption_reason IS NOT NULL
+            ORDER BY ended_at DESC LIMIT 3""",
+            [user_id],
+        )
+        seen = {r["session_id"] for r in unclosed}
+        for row in recent_interrupted:
+            if row["session_id"] not in seen:
+                unclosed.append(row)
+        return unclosed
 
     def get_session_activity_summary(self, session_id: str,
                                      user_id: str = "default") -> dict:
@@ -1678,24 +1778,72 @@ class MemoryDB:
 
     def cleanup_stale_sessions(self, user_id: str = "default",
                                stale_minutes: int = 30):
-        """Mark old interrupted sessions as ended to avoid accumulation."""
+        """Mark old interrupted sessions as ended and classify interruption reason.
+
+        Heuristic classification for sessions that were never explicitly closed:
+        - Sessions with recent track_failure events → tool_failure
+        - Very short sessions (< 2 min active) → crash (likely killed before atexit)
+        - All others → user_away (most common: user closed the tab/terminal)
+        """
         self._assert_writable()
-        # Pre-fetch IDs so we can emit one event per closed session for replay.
         stale_rows = self._fetchall_dicts(
-            """SELECT session_id FROM session_lifecycle
+            """SELECT session_id, started_at, last_active_at
+            FROM session_lifecycle
             WHERE user_id = ? AND ended_at IS NULL
               AND last_active_at < now() - INTERVAL '1 MINUTE' * ?""",
             [user_id, stale_minutes],
         )
-        self.conn.execute(
-            """UPDATE session_lifecycle
-            SET ended_at = last_active_at, end_type = 'interrupted'
-            WHERE user_id = ? AND ended_at IS NULL
-              AND last_active_at < now() - INTERVAL '1 MINUTE' * ?""",
-            [user_id, stale_minutes],
-        )
-        for r in stale_rows:
+        for row in stale_rows:
+            reason = self._classify_stale_session(row, user_id)
+            context = {"classified_by": "cleanup_stale_sessions"}
+            context_json = json.dumps(context, ensure_ascii=False)
+            self.conn.execute(
+                """UPDATE session_lifecycle
+                SET ended_at = last_active_at, end_type = 'interrupted',
+                    interruption_reason = ?,
+                    interruption_context = ?::JSON
+                WHERE session_id = ?""",
+                [reason, context_json, row["session_id"]],
+            )
             self._emit_event("session.end", {
-                "session_id": r["session_id"],
+                "session_id": row["session_id"],
                 "end_type": "interrupted",
+                "interruption_reason": reason,
             })
+
+    def _classify_stale_session(self, session_row: dict,
+                                user_id: str) -> str:
+        """Heuristic classification of why a stale session was interrupted.
+
+        Signal priority:
+        1. Recent failures in event log → tool_failure
+        2. Very short session (< 2 min) → crash
+        3. Default → user_away
+        """
+        session_id = session_row["session_id"]
+        started = session_row["started_at"]
+        last_active = session_row["last_active_at"]
+
+        # Check for recent failure events in the session window
+        try:
+            failure_count = self.conn.execute(
+                """SELECT count(*) FROM memories
+                WHERE user_id = ? AND category = 'failure'
+                  AND created_at BETWEEN ? AND ?""",
+                [user_id, started, last_active],
+            ).fetchone()[0]
+            if failure_count >= 2:
+                return INTERRUPTION_TOOL_FAILURE
+        except Exception:
+            pass
+
+        # Very short session → likely crash (killed before any meaningful work)
+        try:
+            if started and last_active:
+                duration_seconds = (last_active - started).total_seconds()
+                if duration_seconds < 120:
+                    return INTERRUPTION_CRASH
+        except Exception:
+            pass
+
+        return INTERRUPTION_USER_AWAY

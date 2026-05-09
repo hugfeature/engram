@@ -275,13 +275,22 @@ MCP 客户端配置（Claude Code / Cursor）：
 
 - [x] ~~**Checkpoint v2**~~ — 版本化 cognitive checkpoint，event-first 触发（6 类 reason），`restore_checkpoint` / `list_checkpoints` 上线，支持 constrained continuation（must_not_redo 作为 negative memory / must_preserve / preferred_next / working_set / continuation_confidence） ✅
 
+### 已交付（Interruption Taxonomy）
+
+- [x] ~~**Interruption Taxonomy**~~ — 6 类中断分类（overflow / user_away / tool_failure / crash / rate_limit / unknown），按类型路由恢复策略。新增 `report_interruption` MCP tool 供 LLM 主动上报；`cleanup_stale_sessions` 自动启发式分类；recall 的 `interrupted_sessions` hint 按中断类型给出针对性恢复建议 ✅
+
+### 已交付（Chaos Continuity Test + Continuity Metrics）
+
+- [x] ~~**Continuity Metrics**~~ — 6 维指标引擎（`continuity.py`）：Goal Retention / Action Consistency / Failure Recall / Working Set Stability / Replanning Rate / Redundant Exploration。`restore_checkpoint` 自动附带 `continuity_score`，新增 `evaluate_continuity` MCP tool 供主动评估 ✅
+- [x] ~~**Chaos Continuity Test**~~ — 5 大中断场景自动化测试：正常 handoff（基准）/ SIGTERM / kill -9 crash / failure mid-session / working set drift，全部通过并量化恢复质量 ✅
+
+### 已交付（P1-6 Event Log Gzip Rotate）
+
+- [x] ~~**Event Log Gzip Rotate**~~ — 非当天的 `events-YYYYMMDD.jsonl` 在 boot 时自动 gzip 压缩为 `.jsonl.gz`，节省磁盘空间。recover / iter_events 透明读取 `.gz` 文件。压缩前验证行数一致，安全无损 ✅
+
 ### 进行中（Cognitive Continuation 强化）
 
-- [ ] **Interruption Taxonomy** — 中断分类（overflow / user_away / tool_failure / crash / rate_limit / handoff），按类型路由恢复策略
 - [ ] **Behavioral Verification 落表** — `handoff_verifications` 持久化，作为对外差异化能力
-- [ ] **Continuity Metrics** — 6 维指标：Goal Retention / Action Consistency / Failure Recall / Working Set Stability / Replanning Rate / Redundant Exploration
-- [ ] **Intent-Outcome 两阶段记录** — `track_intent` + `track_progress` 配对，缓解工具副作用不可逆问题
-- [ ] **Chaos Continuity Test** — 真实 Coding Agent 执行中强杀 → 另一 Agent restore 接手，自动比对 6 维指标
 
 ### 延后 / 不做（Deferred）
 
@@ -292,6 +301,92 @@ MCP 客户端配置（Claude Code / Cursor）：
 ---
 
 ## Changelog
+
+### v0.13.1 — P1-6 Event Log Gzip Rotate
+
+主轴：**永久保留事件日志也不爆盘**。
+
+**新增**
+
+- ✨ **Event log gzip rotate**（`event_log.py`）：`rotate_old_files()` 方法将非当天的 `.jsonl` 文件 gzip 压缩为 `.jsonl.gz`。压缩前后行数校验，确保零数据丢失。
+- ✨ **透明读取 `.jsonl.gz`**（`event_log.py`）：`_sorted_event_files()` 同时识别 `.jsonl` 和 `.jsonl.gz`；`_iter_file()` 根据后缀自动选择 `open` 或 `gzip.open`。同日期同时存在两种格式时 `.jsonl` 优先。
+- ✨ **Boot 自动 rotate**（`maintenance.py`）：`schedule_startup_maintenance()` 在 daemon 线程中自动调用 `rotate_event_logs()`，不阻塞启动。
+- ✨ **Recover 透明兼容**：`recover()` 通过 `iter_events()` 间接受益，无需任何修改即可从 `.gz` 文件恢复。
+
+**升级路径**
+
+```bash
+pip install -U mcp-engram      # 安装不变
+```
+
+- 完全向前兼容 v0.13.0：旧的 `.jsonl` 文件照常读取，首次启动后自动压缩历史文件
+
+**回归**
+
+- 456 tests passed（v0.13.0 的 441 + 新增 15：`test_event_log_rotate` 15）
+- 0 lint error
+
+### v0.13.0 — Chaos Continuity Test + Continuity Metrics
+
+主轴：**量化 Agent 跨中断恢复的认知质量**，回答 "checkpoint restore 到底好不好" 这个核心问题。
+
+**新增**
+
+- ✨ **6 维 Continuity Metrics 引擎**（`continuity.py`）：每次 checkpoint restore 自动计算 6 维得分 + 加权 composite 评分。维度：Goal Retention（目标保持度）/ Action Consistency（行动一致性）/ Failure Recall（失败记忆召回率）/ Working Set Stability（工作集稳定度）/ Replanning Rate（重规划率）/ Redundant Exploration（冗余探索率）。
+- ✨ **MCP tool `evaluate_continuity`**（`tools.py` / `handlers.py`）：LLM 可主动评估任意两个 checkpoint 版本之间的 continuity score。支持传入 `actions_taken_after_restore` 衡量 redundant exploration。
+- ✨ **`restore_checkpoint` 自动附带 `continuity_score`**（`handlers.py`）：restore 时自动对比 parent_version，在响应中嵌入 6 维评分。LLM 可据此判断 "这次恢复的质量够不够好，是否需要额外补偿"。
+- ✨ **Chaos Continuity Test 测试套件**（`test_chaos_continuity.py`）：5 大场景自动化验证 —— S1: Normal Handoff (baseline) / S2: SIGTERM (atexit fires) / S3: kill -9 Crash / S4: Failure Mid-Session / S5: Working Set Drift。
+
+**升级路径**
+
+```bash
+pip install -U mcp-engram      # 安装不变
+```
+
+- 完全向前兼容 v0.12：`evaluate_continuity` 是新工具，不影响已有 client
+- `restore_checkpoint` 的 `continuity_score` 是可选输出，旧 client 忽略即可
+
+**回归**
+
+- 441 tests passed（v0.12 的 404 + 新增 37：`test_continuity_metrics` 28 + `test_chaos_continuity` 9）
+- 0 lint error
+
+### v0.12.0 — Interruption Taxonomy
+
+主轴：让下一个 Agent **知道上一个 Agent 是怎么中断的**，并据此选择最优恢复策略，而非千篇一律的 "session ended unexpectedly"。
+
+**新增**
+
+- ✨ **6 类中断分类**（`db.py`）：`overflow` / `user_away` / `tool_failure` / `crash` / `rate_limit` / `unknown`，每类对应一套恢复策略（restore_checkpoint + memory_restore_mode + hint）。
+- ✨ **MCP tool `report_interruption`**（`tools.py` / `handlers.py`）：LLM 在检测到即将中断时（如 context window 快满、API 限流）主动调用，记录中断原因。该原因在进程退出时写入 `session_lifecycle`，下一个 Agent 可据此获得针对性恢复建议。
+- ✨ **Stale session 自动分类**（`db.py`）：`cleanup_stale_sessions` 现在通过启发式规则自动分类中断原因：session < 2min → `crash`；≥ 2 条 failure 记忆 → `tool_failure`；其他 → `user_away`。
+- ✨ **Taxonomy-aware recall hints**（`handlers.py`）：`recall_memory` 返回的 `interrupted_sessions` 不再是千篇一律的提示，而是按中断类型给出针对性恢复策略（`recovery_strategy` / `memory_restore_mode` / `hint`）。
+- ✨ **atexit 中断感知**（`shared.py`）：`_on_exit` 现在检查 LLM 是否通过 `report_interruption` 预先报告了中断原因，有则写入 session_lifecycle，无则标记为正常 `process_exit`。
+
+**Schema 变更**
+
+- `session_lifecycle` 新增 `interruption_reason VARCHAR` + `interruption_context JSON` 两列
+- 向前完全兼容：旧数据的 `interruption_reason = NULL` 自动视为 `unknown`；schema 迁移通过 `ALTER TABLE ADD COLUMN IF NOT EXISTS` 实现
+
+**新增 Event 字段**
+
+- `session.end` 事件新增可选字段：`interruption_reason` / `interruption_context`
+- `engram recover` 的 `_replay_session_end` 已支持回放这两个字段
+
+**升级路径**
+
+```bash
+pip install -U mcp-engram      # 安装不变
+engram-setup doctor            # session_lifecycle 表自动加列
+```
+
+- 完全向前兼容 v0.11：旧 session 的 `interruption_reason` 为 NULL，recall hint 回退到 `unknown` 策略
+- 新增的 `report_interruption` 工具是可选的；不调用时行为与 v0.11 完全一致
+
+**回归**
+
+- 404 tests passed（v0.11 的 387 + 新增 17：`test_interruption_taxonomy`）
+- 0 lint error
 
 ### v0.11.0 — Operational Hardening
 

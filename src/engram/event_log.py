@@ -28,6 +28,7 @@ returning. This trades throughput for "no lost events on power loss".
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import os
@@ -137,6 +138,78 @@ class EventLog:
         for path in self._sorted_event_files(since_date):
             yield from self._iter_file(path)
 
+    def rotate_old_files(self) -> list[str]:
+        """Gzip-compress event files older than today.
+
+        Only compresses ``.jsonl`` files whose date stamp is strictly before
+        today (UTC).  The active file (today) is never touched.
+
+        Safety: after writing the ``.jsonl.gz`` file we verify the line
+        count matches the original before removing the uncompressed copy.
+
+        Returns:
+            List of paths that were successfully compressed.
+        """
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        compressed: list[str] = []
+
+        try:
+            names = [
+                n for n in os.listdir(self._dir)
+                if n.startswith("events-") and n.endswith(".jsonl")
+            ]
+        except FileNotFoundError:
+            return compressed
+
+        for name in sorted(names):
+            date_part = name[len("events-"):-len(".jsonl")]
+            if date_part >= today:
+                continue  # never compress today's active file
+
+            src_path = os.path.join(self._dir, name)
+            gz_path = src_path + ".gz"
+
+            if os.path.exists(gz_path):
+                # Already compressed — just remove the leftover .jsonl
+                # (could happen if a previous rotate was interrupted after
+                # writing .gz but before removing the source).
+                try:
+                    os.remove(src_path)
+                    log.info("Removed leftover %s (gz already exists)", name)
+                except OSError as exc:
+                    log.warning("Failed to remove leftover %s: %s", name, exc)
+                continue
+
+            try:
+                source_lines = _count_lines(src_path)
+                _gzip_file(src_path, gz_path)
+                gz_lines = _count_gz_lines(gz_path)
+
+                if gz_lines != source_lines:
+                    log.error(
+                        "Line count mismatch for %s: src=%d gz=%d — keeping original",
+                        name, source_lines, gz_lines,
+                    )
+                    try:
+                        os.remove(gz_path)
+                    except OSError:
+                        pass
+                    continue
+
+                os.remove(src_path)
+                compressed.append(gz_path)
+                log.info("Rotated %s → %s.gz (%d lines)", name, name, source_lines)
+            except Exception as exc:
+                log.warning("Failed to rotate %s: %s", name, exc)
+                # Clean up partial .gz to avoid confusion
+                try:
+                    if os.path.exists(gz_path):
+                        os.remove(gz_path)
+                except OSError:
+                    pass
+
+        return compressed
+
     # ---- internals ----
 
     def _current_file_path(self) -> str:
@@ -204,20 +277,39 @@ class EventLog:
         return max_seq
 
     def _sorted_event_files(self, since_date: str | None) -> list[str]:
+        """Return event file paths in chronological order (.jsonl and .jsonl.gz).
+
+        When both ``events-YYYYMMDD.jsonl`` and ``events-YYYYMMDD.jsonl.gz``
+        exist for the same date, the uncompressed file takes precedence
+        (it is the actively-written or not-yet-cleaned-up copy).
+        """
         try:
-            names = [
-                n for n in os.listdir(self._dir)
-                if n.startswith("events-") and n.endswith(".jsonl")
-            ]
+            all_names = os.listdir(self._dir)
         except FileNotFoundError:
             return []
+
+        date_to_name: dict[str, str] = {}
+        for name in all_names:
+            if not name.startswith("events-"):
+                continue
+            if name.endswith(".jsonl.gz"):
+                date_part = name[len("events-"):-len(".jsonl.gz")]
+                # .jsonl takes precedence over .jsonl.gz for the same date
+                if date_part not in date_to_name:
+                    date_to_name[date_part] = name
+            elif name.endswith(".jsonl"):
+                date_part = name[len("events-"):-len(".jsonl")]
+                date_to_name[date_part] = name  # always overwrite .gz entry
+
         if since_date:
-            names = [n for n in names if n[len("events-"):-len(".jsonl")] >= since_date]
-        names.sort()
-        return [os.path.join(self._dir, n) for n in names]
+            date_to_name = {d: n for d, n in date_to_name.items() if d >= since_date}
+
+        sorted_dates = sorted(date_to_name)
+        return [os.path.join(self._dir, date_to_name[d]) for d in sorted_dates]
 
     def _iter_file(self, path: str) -> Iterator[dict]:
-        with open(path, "r", encoding="utf-8") as f:
+        opener = gzip.open if path.endswith(".gz") else open
+        with opener(path, "rt", encoding="utf-8") as f:
             for lineno, raw in enumerate(f, start=1):
                 raw = raw.strip()
                 if not raw:
@@ -226,6 +318,36 @@ class EventLog:
                     yield json.loads(raw)
                 except json.JSONDecodeError as exc:
                     log.error("Skipping malformed event %s:%d: %s", path, lineno, exc)
+
+
+def _count_lines(path: str) -> int:
+    """Count non-empty lines in a plain text file."""
+    count = 0
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                count += 1
+    return count
+
+
+def _gzip_file(src: str, dst: str) -> None:
+    """Compress *src* into *dst* using gzip level 6 (good balance)."""
+    with open(src, "rb") as f_in, gzip.open(dst, "wb", compresslevel=6) as f_out:
+        while True:
+            chunk = f_in.read(1 << 16)  # 64 KiB
+            if not chunk:
+                break
+            f_out.write(chunk)
+
+
+def _count_gz_lines(path: str) -> int:
+    """Count non-empty lines in a gzip-compressed text file."""
+    count = 0
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                count += 1
+    return count
 
 
 def _utc_now_iso() -> str:

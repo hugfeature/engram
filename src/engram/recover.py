@@ -356,13 +356,22 @@ def _replay_session_start(db: MemoryDB, p: dict) -> None:
 
 
 def _replay_session_end(db: MemoryDB, p: dict) -> None:
+    interruption_reason = p.get("interruption_reason")
+    interruption_context = p.get("interruption_context")
+    context_json = json.dumps(interruption_context or {}, ensure_ascii=False)
     db.conn.execute(
         """UPDATE session_lifecycle
            SET ended_at = COALESCE(ended_at, now()),
                last_active_at = now(),
-               end_type = ?
+               end_type = ?,
+               interruption_reason = COALESCE(?, interruption_reason),
+               interruption_context = CASE
+                   WHEN ? != '{}' THEN ?::JSON
+                   ELSE interruption_context
+               END
            WHERE session_id = ?""",
-        [p.get("end_type", "handoff"), p["session_id"]],
+        [p.get("end_type", "handoff"), interruption_reason,
+         context_json, context_json, p["session_id"]],
     )
 
 
