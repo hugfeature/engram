@@ -242,6 +242,29 @@ def detect_duckdb_upgrade(
 
 
 # ---------------------------------------------------------------------------
+# Event log rotation
+# ---------------------------------------------------------------------------
+
+def rotate_event_logs() -> list[str]:
+    """Gzip-compress old event log files to save disk space.
+
+    Delegates to ``EventLog.rotate_old_files()`` on the default event log.
+    Only compresses files older than today (UTC); the active file is never
+    touched.  Safe to call repeatedly — already-compressed files are skipped.
+
+    Returns:
+        List of paths that were successfully compressed.
+    """
+    try:
+        from .event_log import get_event_log
+        event_log = get_event_log()
+        return event_log.rotate_old_files()
+    except Exception as exc:
+        log.warning("Event log rotation failed: %s", exc)
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Async startup hook
 # ---------------------------------------------------------------------------
 
@@ -269,6 +292,10 @@ def schedule_startup_maintenance(
             prune_backups()
         except Exception as exc:
             log.warning("prune_backups failed: %s", exc)
+        try:
+            rotate_event_logs()
+        except Exception as exc:
+            log.warning("rotate_event_logs failed: %s", exc)
 
     t = threading.Thread(target=_run, name="engram-maintenance", daemon=True)
     t.start()

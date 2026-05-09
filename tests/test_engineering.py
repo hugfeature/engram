@@ -224,6 +224,10 @@ class TestToolRegistration:
             "restore_checkpoint", "list_checkpoints",
             # P1-4 — operational health probe
             "get_runtime_health",
+            # v0.12 — Interruption Taxonomy
+            "report_interruption",
+            # v0.13 — Continuity Metrics
+            "evaluate_continuity",
         }
 
     def test_handlers_registered(self):

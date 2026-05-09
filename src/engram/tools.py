@@ -471,4 +471,86 @@ TOOL_SCHEMAS: list[Tool] = [
             "additionalProperties": False,
         },
     ),
+    Tool(
+        name="report_interruption",
+        description="Report an imminent interruption reason so the session taxonomy is "
+                    "recorded for the next Agent. Call this BEFORE the session ends when "
+                    "you detect: context window overflow, rate limiting, or repeated tool "
+                    "failures. The reason is stored and flushed to session_lifecycle on "
+                    "process exit, enabling the next Agent to receive a targeted recovery "
+                    "strategy instead of a generic 'session ended unexpectedly' hint.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "enum": ["overflow", "user_away", "tool_failure",
+                             "crash", "rate_limit", "unknown"],
+                    "description": "Why the session is being interrupted. "
+                                   "'overflow': context window full. "
+                                   "'rate_limit': API throttling. "
+                                   "'tool_failure': consecutive tool errors. "
+                                   "'user_away': user closed/inactive. "
+                                   "'crash': unexpected process death. "
+                                   "'unknown': cannot determine.",
+                },
+                "context": {
+                    "type": "object",
+                    "description": "Optional structured context (e.g. "
+                                   "{'token_count': 195000, 'max_tokens': 200000} "
+                                   "for overflow, or {'error': '429 Too Many Requests'} "
+                                   "for rate_limit).",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Session identifier. If provided, the session "
+                                   "is immediately closed with the given reason.",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "User identifier",
+                    "default": "default",
+                },
+            },
+            "required": ["reason"],
+        },
+    ),
+    Tool(
+        name="evaluate_continuity",
+        description="Evaluate how well cognitive state survived across checkpoint versions. "
+                    "Returns 6 continuity metrics: Goal Retention, Action Consistency, "
+                    "Failure Recall, Working Set Stability, Replanning Rate, Redundant "
+                    "Exploration, plus a weighted composite score. Call after restoring a "
+                    "checkpoint to quantify recovery quality, or to compare any two "
+                    "checkpoint versions of the same task.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "integer",
+                    "description": "ID of the task to evaluate",
+                },
+                "before_version": {
+                    "type": "integer",
+                    "description": "Checkpoint version before interruption. Omit for second-to-last.",
+                },
+                "after_version": {
+                    "type": "integer",
+                    "description": "Checkpoint version after restore. Omit for latest.",
+                },
+                "actions_taken_after_restore": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Actions the new Agent performed after restoring "
+                                   "(for redundant_exploration scoring). Optional.",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "User identifier",
+                    "default": "default",
+                },
+            },
+            "required": ["task_id"],
+        },
+    ),
 ]

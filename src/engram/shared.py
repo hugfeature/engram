@@ -53,6 +53,8 @@ TOOL_REST_MAP: dict[str, str] = {
     "list_tasks": "/v1/tasks/list",
     "restore_checkpoint": "/v1/checkpoints/restore",
     "list_checkpoints": "/v1/checkpoints/list",
+    "report_interruption": "/v1/report-interruption",
+    "evaluate_continuity": "/v1/continuity",
 }
 
 
@@ -67,20 +69,51 @@ def _ensure_session_id() -> str:
 
 
 def _on_exit():
-    """Mark the current session as ended when the process exits."""
+    """Mark the current session as ended when the process exits.
+
+    Because atexit *did* fire, we know this is NOT a crash (SIGKILL/OOM).
+    We classify the exit reason based on session signals:
+    - If an LLM explicitly reported an interruption reason earlier
+      (via report_interruption), we honour that.
+    - Otherwise we mark it as process_exit with no interruption_reason
+      (normal shutdown).
+    """
     if _current_session_id is None:
         return
     try:
         db = get_db()
-        db.conn.execute(
-            """UPDATE session_lifecycle
-               SET ended_at = now(), end_type = 'process_exit'
-             WHERE session_id = ? AND ended_at IS NULL""",
-            [_current_session_id],
+        # If the LLM already reported an interruption reason during this
+        # session (via report_interruption tool), honour it instead of
+        # overwriting with a generic process_exit.
+        reason = _reported_interruption_reason
+        context = _reported_interruption_context or {}
+        if reason:
+            context.setdefault("exit_source", "atexit_with_report")
+        db.end_session(
+            _current_session_id,
+            end_type="process_exit",
+            interruption_reason=reason,
+            interruption_context=context if context else None,
         )
-        log.info("Session closed on exit: %s", _current_session_id)
+        log.info("Session closed on exit: %s (reason=%s)", _current_session_id, reason or "normal")
     except Exception as exc:
         log.debug("Session close on exit failed (non-fatal): %s", exc)
+
+
+# --- LLM-reported interruption state (set via report_interruption tool) ---
+_reported_interruption_reason: str | None = None
+_reported_interruption_context: dict | None = None
+
+
+def set_interruption_report(reason: str, context: dict | None = None):
+    """Called by report_interruption handler to record LLM-reported reason.
+
+    This is consumed by _on_exit() so the final session.end event
+    carries the correct interruption taxonomy.
+    """
+    global _reported_interruption_reason, _reported_interruption_context
+    _reported_interruption_reason = reason
+    _reported_interruption_context = context
 
 
 def _dispatch(name: str, arguments: dict) -> dict:
