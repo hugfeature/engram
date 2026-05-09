@@ -5,7 +5,7 @@ import logging
 import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, create_model
 from mcp.server import Server as MCPServer
@@ -82,6 +82,11 @@ async def lifespan(app: FastAPI):
             log.error("Graph flush on shutdown failed: %s", e)
     if shared._db is not None:
         try:
+            # Flush WAL so next start has nothing to replay/move aside.
+            shared._db.checkpoint()
+        except Exception as e:
+            log.warning("CHECKPOINT on shutdown failed (non-fatal): %s", e)
+        try:
             shared._db.close()
         except Exception as e:
             log.error("DB close on shutdown failed: %s", e)
@@ -91,6 +96,42 @@ async def lifespan(app: FastAPI):
 # --- FastAPI App ---
 
 app = FastAPI(title="Engram", version=__version__, lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def _degraded_mode_handler(request: Request, exc: Exception):
+    """Translate runtime durability errors to clean HTTP responses.
+
+    DegradedModeError -> HTTP 503 (clients should call `engram recover`).
+    DatabaseCorruptionError -> HTTP 503 with backup path.
+    Other unexpected exceptions fall through to FastAPI default handling.
+    """
+    from .db import DegradedModeError, DatabaseCorruptionError
+    if isinstance(exc, DegradedModeError):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "code": "degraded_mode",
+                "error": str(exc),
+                "recover_command": exc.recover_command,
+                "db_path": exc.db_path,
+            },
+        )
+    if isinstance(exc, DatabaseCorruptionError):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "code": "database_corrupt",
+                "error": str(exc),
+                "recover_command": exc.recover_command,
+                "db_path": exc.db_path,
+                "backup_path": exc.backup_path,
+            },
+        )
+    raise exc
+
 
 # Mount MCP at /mcp
 app.mount("/mcp", session_mgr.handle_request)
@@ -194,23 +235,39 @@ def tools_list():
 def health():
     fts_ok = False
     db_ok = False
+    db_readonly = False
+    embedding_stale = False
+    residue: list[str] = []
+    meta: dict[str, str] = {}
     try:
         if shared._db is not None:
             shared._db.conn.execute("SELECT 1").fetchone()
             db_ok = True
             fts_ok = shared._db.fts_available
+            db_readonly = shared._db.readonly
+            embedding_stale = shared._db.embedding_stale
+            residue = shared._db.residue_files
+            meta = shared._db.all_meta()
     except Exception:
         pass
     graph_ok = shared._graph is not None
     degraded = is_degraded()
-    status = "ok" if (db_ok and graph_ok and not degraded) else "degraded"
+    status = (
+        "ok"
+        if (db_ok and graph_ok and not degraded and not db_readonly)
+        else "degraded"
+    )
     return {
         "status": status,
         "version": __version__,
         "db": db_ok,
+        "db_readonly": db_readonly,
         "graph": graph_ok,
         "fts": fts_ok,
         "embedding_degraded": degraded,
+        "embedding_stale": embedding_stale,
+        "residue_files": residue,
+        "engram_meta": meta,
         "transports": ["rest", "mcp-streamable-http"],
     }
 

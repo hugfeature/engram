@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from .db import MemoryDB
+from .db import MemoryDB, DegradedModeError
 from .graph import MemoryGraph
 from .embedding import embed
 from .config import DEDUP_SEARCH_THRESHOLD
@@ -24,6 +24,21 @@ MAX_CONTENT_LENGTH = 100_000  # 100KB
 def _error(msg: str) -> dict:
     """Standardized error response — all handlers use this."""
     return {"ok": False, "error": msg}
+
+
+def _degraded_error(exc: DegradedModeError) -> dict:
+    """Structured response for readonly degraded mode.
+
+    MCP clients (Claude Code / Cursor) can branch on ``code='degraded_mode'``
+    and surface ``recover_command`` to the user.
+    """
+    return {
+        "ok": False,
+        "code": "degraded_mode",
+        "error": str(exc),
+        "recover_command": exc.recover_command,
+        "db_path": exc.db_path,
+    }
 
 
 def _validate_user_id(user_id: str) -> str:

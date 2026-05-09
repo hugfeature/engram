@@ -111,9 +111,32 @@ def cmd_run(host: str, port: int) -> None:
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
+    # Pre-flight: warn loudly if there are recovery artifacts on disk so
+    # operators see them before serving any traffic.
+    _warn_on_residue()
+
     from engram.http_server import main as serve_main
     sys.argv = ["engram-server", "--host", host, "--port", str(port)]
     serve_main()
+
+
+def _warn_on_residue() -> None:
+    """Surface .corrupt.* / .wal-recovery.* near the DB file."""
+    try:
+        from engram.db import _scan_residue, DB_PATH
+    except Exception:
+        return
+    files = _scan_residue(DB_PATH)
+    if not files:
+        return
+    sys.stderr.write(
+        "\n[engram] WARNING: corruption-recovery artifacts present:\n"
+    )
+    for f in files:
+        sys.stderr.write(f"  - {f}\n")
+    sys.stderr.write(
+        "  Inspect with `engram-setup doctor`; recover with `engram-setup recover`.\n\n"
+    )
 
 
 def main() -> None:

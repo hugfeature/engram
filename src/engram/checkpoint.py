@@ -467,6 +467,42 @@ def create_checkpoint(
         db.conn.execute("ROLLBACK")
         raise
 
+    # Tier 1 — checkpoints are the cognitive backbone of continuity, MUST
+    # be in the event log so a destroyed DuckDB can be replayed back.
+    # We log the full state payload (no embeddings) so replay is total.
+    try:
+        db._emit_event("checkpoint.write", {
+            "checkpoint_id": checkpoint_id,
+            "task_id": task_id,
+            "version": new_version,
+            "parent_version": parent_version,
+            "kind": kind,
+            "checkpoint_reason": reason,
+            "triggered_by_event": triggered_by_event,
+            "user_id": user_id,
+            "state": {
+                "goal": state.get("goal", "") or "",
+                "completed": _as_list(state.get("completed")),
+                "in_progress": _as_list(state.get("in_progress")),
+                "blocked": _as_list(state.get("blocked")),
+                "preferred_next": _as_list(state.get("preferred_next")),
+                "must_not_redo": state["must_not_redo"],
+                "must_preserve": _as_list(state.get("must_preserve")),
+                "working_set": _as_dict(state.get("working_set")),
+            },
+            "state_diff": state_diff,
+            "source_session_id": source_session_id,
+            "source_memory_id": source_memory_id,
+            "continuation_confidence": confidence,
+            "confidence_breakdown": breakdown,
+            "failure_signature": failure_signature,
+        })
+    except Exception as exc:
+        log.error("checkpoint.write event log append FAILED: %s", exc)
+        # Re-raise so the runtime contract is honoured: a checkpoint that
+        # isn't in the event log isn't considered durably persisted.
+        raise
+
     return {
         "checkpoint_id": checkpoint_id,
         "version": new_version,

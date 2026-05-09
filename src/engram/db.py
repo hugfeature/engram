@@ -1,10 +1,30 @@
-"""DuckDB storage layer — schema, CRUD, vector search, FTS."""
+"""DuckDB storage layer — schema, CRUD, vector search, FTS.
+
+Engram architecture (v0.10+):
+    Tier 1 (Source of Truth): tasks / checkpoints / session_lifecycle / ...
+        backed by ``~/.engram/events/*.jsonl`` (append-only event log).
+    Tier 2 (Degradable):      memories content / metadata / graph
+        materialized in this DuckDB file.
+    Tier 3 (Disposable):      embeddings / FTS / vector index
+        rebuildable from Tier 2.
+
+Two laws this module enforces:
+    1. Event log is the only durability primitive.
+    2. If it cannot be replayed, it is not critical state.
+
+If DuckDB cannot be opened or schema is unsafe to use, MemoryDB enters
+**readonly degraded mode** instead of silently creating a fresh database.
+The previous "rename to .corrupt and continue" behaviour caused users to
+lose runtime state without warning and is now removed.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
+import shutil
+import time as _time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 
@@ -17,23 +37,105 @@ log = logging.getLogger("engram.db")
 
 ENGRAM_DIR = os.path.join(os.path.expanduser("~"), ".engram")
 DB_PATH = os.path.join(ENGRAM_DIR, "memories.duckdb")
+_BACKUP_DIR = os.path.join(ENGRAM_DIR, "backups")
+
+# Engram-internal schema version. Bump when Tier-1 / Tier-2 SQL schema
+# changes in a way that needs explicit handling.
+ENGRAM_SCHEMA_VERSION = 1
+
+# Toggle: only when explicitly set, MemoryDB is allowed to wipe a corrupt
+# database file and start fresh. Default = forbidden (we prefer degraded
+# mode + explicit ``engram recover`` over silent data loss).
+ENV_ALLOW_RESET = "ENGRAM_ALLOW_RESET"
 
 _DEFAULT_DIM = 768
 
 
+class DegradedModeError(RuntimeError):
+    """Raised when a write is attempted while MemoryDB is in readonly degraded mode.
+
+    The error message and ``recover_command`` attribute should be surfaced
+    to the user / MCP client so they can run ``engram recover`` explicitly.
+    """
+
+    def __init__(self, reason: str, db_path: str):
+        super().__init__(reason)
+        self.reason = reason
+        self.db_path = db_path
+        self.recover_command = "engram recover"
+
+
+class DatabaseCorruptionError(RuntimeError):
+    """Raised when DuckDB cannot be opened and silent recovery is disabled."""
+
+    def __init__(self, db_path: str, original: BaseException, backup_path: str | None = None):
+        msg = (
+            f"DuckDB file at {db_path} cannot be opened "
+            f"({original.__class__.__name__}: {original}). "
+            f"Engram will not silently create a fresh database "
+            f"(would lose runtime state). "
+        )
+        if backup_path:
+            msg += f"Original file isolated at {backup_path}. "
+        msg += (
+            "Run `engram recover` to rebuild from the event log, or set "
+            f"{ENV_ALLOW_RESET}=1 to allow a fresh start."
+        )
+        super().__init__(msg)
+        self.db_path = db_path
+        self.original = original
+        self.backup_path = backup_path
+        self.recover_command = "engram recover"
+
 def _dim() -> int:
+    """Detect embedding dimension, with mismatch detection.
+
+    If the DB already exists and has memories, check that the cached/stored
+    dimension matches the current model dimension.  If not, return the DB's
+    existing dimension so _init_schema doesn't CREATE TABLE with the wrong
+    FLOAT[N] and cause all INSERTs to fail.
+    """
     cache = os.path.join(ENGRAM_DIR, ".dim_cache")
+
+    # 1) Try reading from dim_cache first
+    cached_dim = None
     try:
         with open(cache) as f:
             line = f.read().strip()
             if ":" in line:
                 model, dim_str = line.rsplit(":", 1)
                 if model == MODEL_NAME:
-                    return int(dim_str)
+                    cached_dim = int(dim_str)
             else:
-                return int(line)
+                cached_dim = int(line)
     except Exception:
         pass
+
+    # 2) Detect actual dimension: try reading from existing DB
+    db_dim = _read_db_dimension(DB_PATH)
+
+    if db_dim is not None and cached_dim is not None and db_dim != cached_dim:
+        log.warning(
+            "Dimension mismatch! DB has FLOAT[%d] but dim_cache says %d. "
+           "Trusting DB dimension to avoid INSERT failures.",
+            db_dim, cached_dim,
+        )
+        # Update cache to match reality
+        try:
+            os.makedirs(ENGRAM_DIR, exist_ok=True)
+            with open(cache, "w") as f:
+                f.write(f"{MODEL_NAME}:{db_dim}")
+        except Exception:
+            pass
+        return db_dim
+
+    if db_dim is not None:
+        return db_dim
+
+    if cached_dim is not None:
+        return cached_dim
+
+    # 3) No existing data — detect from model
     try:
         dim = get_dimensions()
         os.makedirs(ENGRAM_DIR, exist_ok=True)
@@ -44,34 +146,152 @@ def _dim() -> int:
         return _DEFAULT_DIM
 
 
-def _recover_wal(db_path: str) -> None:
-    """Remove corrupted WAL file so DuckDB can start fresh from checkpoint."""
-    wal = db_path + ".wal"
-    if not os.path.exists(wal):
-        return
-    log.warning("WAL file exists at startup: %s (%d bytes)", wal, os.path.getsize(wal))
-    bak = wal + ".recovery"
+def _read_db_dimension(db_path: str) -> int | None:
+    """Read the actual embedding dimension from an existing DB.
+
+    Returns None if DB doesn't exist, is empty, or can't be read.
+    """
+    if not os.path.exists(db_path):
+        return None
     try:
-        os.replace(wal, bak)
-        log.warning("WAL moved to %s for recovery", bak)
-    except OSError as e:
-        log.error("Failed to move WAL: %s", e)
+        conn = duckdb.connect(db_path, read_only=True)
+        try:
+            row = conn.execute(
+                "SELECT array_length(embedding) FROM memories LIMIT 1"
+            ).fetchone()
+            if row is not None and row[0] is not None:
+                return int(row[0])
+        finally:
+            conn.close()
+    except Exception:
+        log.debug("Could not read DB dimension: %s", exc_info=True)
+    return None
+
+
+def _force_checkpoint(db_path: str) -> bool:
+    """Try to open the DB read-write and run FORCE CHECKPOINT.
+
+    Returns True if checkpoint succeeded (WAL absorbed into main file).
+    This preserves data that would otherwise be lost when we move the WAL.
+    """
+    wal = db_path + ".wal"
+    if not os.path.exists(wal) or os.path.getsize(wal) == 0:
+        return True  # nothing to checkpoint
+    try:
+        conn = duckdb.connect(db_path)
+        try:
+            conn.execute("FORCE CHECKPOINT")
+            log.info("Forced checkpoint succeeded — WAL data preserved")
+            return True
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning("Force checkpoint failed: %s", e)
+        return False
+
+
+def _ts_suffix() -> str:
+    return _time.strftime("%Y%m%d-%H%M%S")
+
+
+def _isolate_corrupt_file(path: str, label: str) -> str | None:
+    """Move a corrupt artifact aside with a timestamped suffix.
+
+    Never overwrites a previous isolation: each call gets a unique suffix.
+    """
+    if not os.path.exists(path):
+        return None
+    target = f"{path}.{label}.{_ts_suffix()}"
+    try:
+        os.replace(path, target)
+        log.warning("Isolated %s artifact: %s -> %s", label, path, target)
+        return target
+    except OSError as exc:
+        log.error("Failed to isolate %s file %s: %s", label, path, exc)
+        return None
+
+
+def _recover_wal(db_path: str) -> str | None:
+    """Try hard to keep WAL data, only move it aside as last resort.
+
+    Sequence:
+      1. If no WAL or empty WAL → nothing to do.
+      2. Try ``_force_checkpoint()`` to absorb WAL into the main file.
+         Success means we kept all unflushed writes.
+      3. If checkpoint fails (truly corrupt WAL), move the WAL aside with
+         a timestamped suffix so an operator can inspect it later.
+         Returns the backup path so callers can surface it.
+    """
+    wal = db_path + ".wal"
+    if not os.path.exists(wal) or os.path.getsize(wal) == 0:
+        return None
+
+    if _force_checkpoint(db_path):
+        # WAL was successfully absorbed; DuckDB removes the file itself.
+        return None
+
+    log.warning(
+        "WAL file present and could not be checkpointed: %s (%d bytes). "
+        "Moving aside; any unflushed writes will be lost.",
+        wal, os.path.getsize(wal),
+    )
+    return _isolate_corrupt_file(wal, "wal-recovery")
+
+
+def _scan_residue(db_path: str) -> list[str]:
+    """Find leftover .corrupt.* / .wal-recovery.* artifacts to warn about."""
+    db_dir = os.path.dirname(db_path) or "."
+    base = os.path.basename(db_path)
+    try:
+        names = os.listdir(db_dir)
+    except FileNotFoundError:
+        return []
+    return sorted(
+        os.path.join(db_dir, n)
+        for n in names
+        if n.startswith(base + ".") and (".corrupt." in n or ".wal-recovery." in n)
+    )
 
 
 def _connect_with_retry(db_path: str) -> duckdb.DuckDBPyConnection:
-    """Connect to DuckDB with automatic WAL recovery on failure."""
+    """Connect to DuckDB.
+
+    Failure policy (Engram v0.10+):
+        1. Try to open the file as-is.
+        2. If that fails AND a WAL is present, move the WAL aside (timestamped)
+           and try again — this trades the last unflushed transactions for the
+           ability to read everything previously checkpointed.
+        3. If it still fails, raise ``DatabaseCorruptionError``. We DO NOT
+           silently rename the file and create a fresh database — that would
+           destroy Tier 1 runtime state without the user noticing.
+
+    Escape hatch: setting env ``ENGRAM_ALLOW_RESET=1`` re-enables the old
+    behaviour for users who explicitly want a clean slate.
+    """
     try:
         return duckdb.connect(db_path)
-    except (duckdb.IOException, duckdb.InternalException) as e:
-        log.warning("DuckDB connect failed: %s — attempting WAL recovery", e)
+    except (duckdb.IOException, duckdb.InternalException) as first_err:
+        log.warning("DuckDB connect failed: %s — attempting WAL isolation", first_err)
         _recover_wal(db_path)
         try:
             return duckdb.connect(db_path)
-        except Exception:
-            log.error("DuckDB still fails after WAL recovery, creating fresh DB")
+        except Exception as second_err:
+            allow_reset = os.environ.get(ENV_ALLOW_RESET, "").strip() in ("1", "true", "yes")
+            backup_path: str | None = None
             if os.path.exists(db_path):
-                os.replace(db_path, db_path + ".corrupt")
-            return duckdb.connect(db_path)
+                backup_path = _isolate_corrupt_file(db_path, "corrupt")
+            if allow_reset:
+                log.error(
+                    "DuckDB unrecoverable; %s=1 set, creating fresh database. "
+                    "Original isolated at %s",
+                    ENV_ALLOW_RESET, backup_path,
+                )
+                return duckdb.connect(db_path)
+            raise DatabaseCorruptionError(
+                db_path=db_path,
+                original=second_err,
+                backup_path=backup_path,
+            ) from second_err
 
 
 def _schema_sql(dim: int) -> str:
@@ -128,6 +348,17 @@ CREATE TABLE IF NOT EXISTS session_lifecycle (
     last_active_at TIMESTAMP NOT NULL DEFAULT now(),
     ended_at TIMESTAMP,
     end_type VARCHAR
+);
+"""
+
+# engram_meta — process/version/runtime contract.
+# This table is what MCP clients (Claude Code, Cursor, ...) inspect to
+# negotiate compatibility. Keys are app-defined; values are stringly typed.
+ENGRAM_META_SQL = """
+CREATE TABLE IF NOT EXISTS engram_meta (
+    key VARCHAR PRIMARY KEY,
+    value VARCHAR NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT now()
 );
 """
 
@@ -246,14 +477,110 @@ def _row_to_memory(row: dict) -> MemoryRow:
 
 
 class MemoryDB:
-    def __init__(self, db_path: str = DB_PATH, dim: int | None = None):
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    """DuckDB projection layer for Engram.
+
+    Tier 1 writes (tasks / checkpoints / sessions) MUST also be appended to
+    the event log via ``self._event_log``. Tier 2/3 writes (memories / FTS /
+    embeddings) are best-effort logged for replay completeness.
+
+    When ``_readonly`` is True, every write method short-circuits with
+    ``DegradedModeError``. The HTTP/MCP layer is expected to translate that
+    into a 503 / structured error containing ``recover_command``.
+    """
+
+    def __init__(
+        self,
+        db_path: str = DB_PATH,
+        dim: int | None = None,
+        *,
+        log_writes: bool = True,
+    ):
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self._db_path = db_path
         self._fts_available = False
         self._fts_dirty = True  # Force rebuild on first search
+        self._readonly = False
+        self._readonly_reason: str | None = None
+        # Tier 3 quality flag: True when embeddings in DB no longer match the
+        # current model. Reads still work (we just can't do vector search until
+        # re-embed); writes are NOT blocked because content is the source of truth.
+        self._embedding_stale = False
+        # Lazy event-log handle. Tests can monkeypatch ``_event_log`` to a Mock.
+        self._event_log = None
+        self._log_writes = log_writes
+        # Residue files surfaced for diagnostics (consumed by daemon/CLI).
+        self._residue_files: list[str] = _scan_residue(db_path)
+        if self._residue_files:
+            log.warning(
+                "Residue files detected near %s — may indicate prior corruption: %s",
+                db_path, self._residue_files,
+            )
         self.conn = _connect_with_retry(db_path)
         self._dim = dim or _dim()
         self._init_schema()
+
+    # ---- durability primitives ----
+
+    def _get_event_log(self):
+        """Lazily attach to the singleton event log.
+
+        Returns None when logging is disabled (tests) or when the log can't
+        be opened — Tier-2/3 writes proceed regardless; Tier-1 helpers MUST
+        also call ``_assert_writable()`` first.
+        """
+        if not self._log_writes:
+            return None
+        if self._event_log is None:
+            try:
+                from .event_log import get_event_log
+                self._event_log = get_event_log()
+            except Exception as exc:  # pragma: no cover — defensive
+                log.error("Failed to attach event log: %s", exc)
+                self._event_log = None
+        return self._event_log
+
+    def _emit_event(self, kind: str, payload: dict) -> None:
+        """Append a Tier-1/Tier-2 event. Never raises through to callers
+        of Tier-2 paths; Tier-1 helpers should let exceptions propagate
+        (they're caught at the handler boundary)."""
+        log_ = self._get_event_log()
+        if log_ is None:
+            return
+        log_.append(kind, payload)
+
+    def _assert_writable(self) -> None:
+        if self._readonly:
+            raise DegradedModeError(
+                self._readonly_reason or "MemoryDB is in readonly degraded mode",
+                self._db_path,
+            )
+
+    def enter_degraded_mode(self, reason: str) -> None:
+        """Force the DB into readonly degraded mode (e.g. on partial schema)."""
+        self._readonly = True
+        self._readonly_reason = reason
+        log.error("MemoryDB entering readonly degraded mode: %s", reason)
+
+    @property
+    def readonly(self) -> bool:
+        return self._readonly
+
+    @property
+    def embedding_stale(self) -> bool:
+        return self._embedding_stale
+
+    @property
+    def residue_files(self) -> list[str]:
+        return list(self._residue_files)
+
+    def checkpoint(self) -> None:
+        """Flush WAL into the main file. Safe to call on shutdown."""
+        if self._readonly or self.conn is None:
+            return
+        try:
+            self.conn.execute("CHECKPOINT")
+        except Exception as exc:
+            log.warning("CHECKPOINT failed (non-fatal): %s", exc)
 
     @property
     def fts_available(self) -> bool:
@@ -274,8 +601,45 @@ class MemoryDB:
         cols = [d[0] for d in result.description]
         return [dict(zip(cols, row)) for row in result.fetchall()]
 
+    def _detect_embedding_drift(self) -> None:
+        """Compare on-disk embedding column dim with current model dim.
+
+        v0.10 policy change: we DO NOT auto-migrate (ALTER TABLE drops every
+        existing embedding) and we DO NOT raise. Instead we set
+        ``self._embedding_stale = True`` so retrieve.py can fall back to FTS,
+        and emit a clear warning telling the user to re-embed explicitly.
+
+        Rationale: embedding is Tier 3 (disposable cache). A model swap must
+        not silently null out user-visible content nor crash the runtime.
+        """
+        try:
+            row = self.conn.execute(
+                "SELECT array_length(embedding) FROM memories LIMIT 1"
+            ).fetchone()
+            if row is None or row[0] is None:
+                return  # empty table — fresh schema will use current dim
+            db_dim = int(row[0])
+        except Exception:
+            return  # memories table doesn't exist yet
+
+        if db_dim == self._dim:
+            return
+
+        self._embedding_stale = True
+        log.warning(
+            "Embedding dimension drift detected: DB column=FLOAT[%d], "
+            "current model=%s wants FLOAT[%d]. Vector search will fall back "
+            "to BM25/FTS until you re-embed. Run `engram reembed` (or restart "
+            "with the previous ENGRAM_MODEL) to restore vector recall.",
+            db_dim, MODEL_NAME, self._dim,
+        )
+        # Pin the dim we'll keep using for new inserts to whatever the table
+        # already has, so writes don't break.
+        self._dim = db_dim
+
     def _init_schema(self):
         self.conn.execute("CREATE SEQUENCE IF NOT EXISTS memory_id_seq START 1")
+        self._detect_embedding_drift()
         self.conn.execute(_schema_sql(self._dim))
         try:
             self.conn.execute(
@@ -293,15 +657,19 @@ class MemoryDB:
         self.conn.execute(SESSION_LIFECYCLE_SQL)
         self.conn.execute(TASK_SQL)
         self.conn.execute(CHECKPOINT_SQL)
-        # tasks 表加列：缓存最新 checkpoint 信息（避免每次查询时聚合）
+        self.conn.execute(ENGRAM_META_SQL)
+        # tasks 表加列：缓存最新 checkpoint + 为未来 execution graph 留位
+        # (parent_task_id / retry_of_task_id 暂不实现读写, 仅留位避免破坏性迁移)
         for ddl in (
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS latest_checkpoint_version INTEGER DEFAULT 0",
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS checkpoint_count INTEGER DEFAULT 0",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS parent_task_id INTEGER",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS retry_of_task_id INTEGER",
         ):
             try:
                 self.conn.execute(ddl)
             except Exception as e:
-                log.debug("ALTER tasks (checkpoint cols) skipped: %s", e)
+                log.debug("ALTER tasks (extra cols) skipped: %s", e)
         # checkpoints 表索引（task 内按 version 倒序查找最高频）
         for ddl in (
             "CREATE INDEX IF NOT EXISTS idx_checkpoints_task_version ON checkpoints(task_id, version DESC)",
@@ -312,6 +680,68 @@ class MemoryDB:
             except Exception as e:
                 log.debug("CREATE INDEX on checkpoints skipped: %s", e)
         self._init_vss()
+        self._init_meta()
+
+    def _init_meta(self) -> None:
+        """Seed engram_meta with current process identity.
+
+        Records (idempotent upsert):
+          - schema_version        : ENGRAM_SCHEMA_VERSION
+          - engram_version        : package version
+          - duckdb_version        : runtime duckdb library version
+          - embedding_model       : MODEL_NAME at boot time
+          - embedding_dim         : effective dim of memories.embedding
+          - embedding_stale       : '1' if drift detected, else '0'
+          - last_boot_at          : ISO8601
+        """
+        try:
+            from . import __version__ as engram_version
+        except Exception:
+            engram_version = "0.0.0"
+        try:
+            duckdb_version = duckdb.__version__
+        except Exception:
+            duckdb_version = "unknown"
+        boot_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+        rows = [
+            ("schema_version", str(ENGRAM_SCHEMA_VERSION)),
+            ("engram_version", engram_version),
+            ("duckdb_version", duckdb_version),
+            ("embedding_model", MODEL_NAME),
+            ("embedding_dim", str(self._dim)),
+            ("embedding_stale", "1" if self._embedding_stale else "0"),
+            ("last_boot_at", boot_ts),
+        ]
+        for key, value in rows:
+            try:
+                self.conn.execute(
+                    """INSERT INTO engram_meta (key, value)
+                       VALUES (?, ?)
+                       ON CONFLICT (key) DO UPDATE SET value = excluded.value,
+                                                       updated_at = now()""",
+                    [key, value],
+                )
+            except Exception as exc:
+                log.debug("engram_meta upsert failed for %s (non-fatal): %s", key, exc)
+
+    def get_meta(self, key: str) -> str | None:
+        try:
+            row = self.conn.execute(
+                "SELECT value FROM engram_meta WHERE key = ?", [key]
+            ).fetchone()
+        except Exception:
+            return None
+        return row[0] if row else None
+
+    def all_meta(self) -> dict[str, str]:
+        try:
+            rows = self.conn.execute(
+                "SELECT key, value FROM engram_meta"
+            ).fetchall()
+        except Exception:
+            return {}
+        return {r[0]: r[1] for r in rows}
 
     def _rebuild_fts_index(self):
         """Rebuild the FTS index from scratch to include all current data."""
@@ -387,6 +817,7 @@ class MemoryDB:
         user_id: str = "default",
         metadata: dict | None = None,
     ) -> int:
+        self._assert_writable()
         self._check_conn()
         self._validate_embedding(embedding)
         meta_json = json.dumps(metadata or {}, ensure_ascii=False)
@@ -400,7 +831,20 @@ class MemoryDB:
             [user_id, content, embedding, importance, category, meta_json],
         ).fetchone()
         self._fts_dirty = True
-        return result[0]
+        memory_id = result[0]
+        # Tier 2 event — embedding intentionally omitted (Tier 3 cache).
+        try:
+            self._emit_event("memory.store", {
+                "memory_id": memory_id,
+                "user_id": user_id,
+                "content": content,
+                "importance": importance,
+                "category": category,
+                "metadata": metadata or {},
+            })
+        except Exception as exc:
+            log.warning("memory.store event log append failed: %s", exc)
+        return memory_id
 
     def update(
         self,
@@ -410,6 +854,7 @@ class MemoryDB:
         importance: float | None = None,
         metadata: dict | None = None,
     ):
+        self._assert_writable()
         self._validate_embedding(embedding)
         cast = self._float_cast()
         sets = [f"content = ?", f"embedding = ?::{cast}", "last_accessed_at = now()"]
@@ -426,6 +871,15 @@ class MemoryDB:
             params,
         )
         self._fts_dirty = True
+        try:
+            self._emit_event("memory.update", {
+                "memory_id": memory_id,
+                "content": content,
+                "importance": importance,
+                "metadata": metadata,
+            })
+        except Exception as exc:
+            log.warning("memory.update event log append failed: %s", exc)
 
     def bump_recall(self, memory_id: int):
         self.conn.execute(
@@ -440,11 +894,18 @@ class MemoryDB:
     def log_session_recall(self, session_id: str, memory_ids: list[int], user_id: str = "default"):
         if not memory_ids:
             return
+        self._assert_writable()
         rows = [[session_id, mid, user_id] for mid in memory_ids]
         self.conn.executemany(
             "INSERT INTO session_memory_log (session_id, memory_id, user_id) VALUES (?, ?, ?)",
             rows,
         )
+        # Tier 1 event — session.memory_recall is part of runtime narrative.
+        self._emit_event("session.memory_recall", {
+            "session_id": session_id,
+            "user_id": user_id,
+            "memory_ids": list(memory_ids),
+        })
 
     def get_session_memories(self, session_id: str, user_id: str = "default") -> list[int]:
         rows = self._fetchall_dicts(
@@ -477,10 +938,16 @@ class MemoryDB:
         return len(row)
 
     def log_session_outcome(self, session_id: str, outcome: str, user_id: str = "default"):
+        self._assert_writable()
         self.conn.execute(
             "INSERT INTO session_outcome_log (session_id, user_id, outcome) VALUES (?, ?, ?)",
             [session_id, user_id, outcome],
         )
+        self._emit_event("session.outcome", {
+            "session_id": session_id,
+            "user_id": user_id,
+            "outcome": outcome,
+        })
 
     def get_memory_failure_count(self, memory_ids: list[int], user_id: str = "default") -> dict[int, int]:
         """Count how many failed sessions each memory was involved in."""
@@ -535,8 +1002,13 @@ class MemoryDB:
         return result
 
     def delete(self, memory_id: int):
+        self._assert_writable()
         self.conn.execute("DELETE FROM memories WHERE id = ?", [memory_id])
         self._fts_dirty = True
+        try:
+            self._emit_event("memory.delete", {"memory_id": memory_id})
+        except Exception as exc:
+            log.warning("memory.delete event log append failed: %s", exc)
 
     def get_by_id(self, memory_id: int) -> MemoryRow | None:
         row = self._fetchone_dict(
@@ -812,6 +1284,7 @@ class MemoryDB:
 
     def create_task(self, name: str, goal: str = "", status: str = "planning",
                     user_id: str = "default", metadata: dict | None = None) -> int:
+        self._assert_writable()
         meta_json = json.dumps(metadata or {}, ensure_ascii=False)
         result = self.conn.execute(
             """
@@ -821,7 +1294,17 @@ class MemoryDB:
             """,
             [name, goal, status, user_id, meta_json],
         ).fetchone()
-        return result[0]
+        task_id = result[0]
+        # Tier 1 — task lifecycle is critical runtime state, MUST be in event log.
+        self._emit_event("task.create", {
+            "task_id": task_id,
+            "name": name,
+            "goal": goal,
+            "status": status,
+            "user_id": user_id,
+            "metadata": metadata or {},
+        })
+        return task_id
 
     def get_task(self, task_id: int) -> TaskRow | None:
         row = self._fetchone_dict(
@@ -837,6 +1320,7 @@ class MemoryDB:
 
     def update_task(self, task_id: int, status: str | None = None,
                     goal: str | None = None, metadata: dict | None = None) -> bool:
+        self._assert_writable()
         sets = ["updated_at = now()"]
         params: list = []
         if status is not None:
@@ -853,7 +1337,15 @@ class MemoryDB:
             f"UPDATE tasks SET {', '.join(sets)} WHERE id = ? RETURNING id",
             params,
         ).fetchone()
-        return row is not None
+        updated = row is not None
+        if updated:
+            self._emit_event("task.update", {
+                "task_id": task_id,
+                "status": status,
+                "goal": goal,
+                "metadata": metadata,
+            })
+        return updated
 
     def list_tasks(self, user_id: str = "default", status: str | None = None) -> list[TaskRow]:
         if status:
@@ -912,21 +1404,38 @@ class MemoryDB:
 
     def upsert_session(self, session_id: str, user_id: str = "default"):
         """Register a new session or refresh its heartbeat."""
+        self._assert_writable()
+        # Distinguish creation vs heartbeat for the event log:
+        # only the first call per session_id should emit session.start.
+        existing = self.conn.execute(
+            "SELECT 1 FROM session_lifecycle WHERE session_id = ?",
+            [session_id],
+        ).fetchone()
         self.conn.execute(
             """INSERT INTO session_lifecycle (session_id, user_id)
             VALUES (?, ?)
             ON CONFLICT (session_id) DO UPDATE SET last_active_at = now()""",
             [session_id, user_id],
         )
+        if existing is None:
+            self._emit_event("session.start", {
+                "session_id": session_id,
+                "user_id": user_id,
+            })
 
     def end_session(self, session_id: str, end_type: str = "handoff"):
         """Mark a session as ended (handoff / outcome)."""
+        self._assert_writable()
         self.conn.execute(
             """UPDATE session_lifecycle
             SET ended_at = now(), last_active_at = now(), end_type = ?
             WHERE session_id = ?""",
             [end_type, session_id],
         )
+        self._emit_event("session.end", {
+            "session_id": session_id,
+            "end_type": end_type,
+        })
 
     def get_interrupted_sessions(self, user_id: str = "default",
                                  stale_minutes: int = 30) -> list[dict]:
@@ -991,6 +1500,14 @@ class MemoryDB:
     def cleanup_stale_sessions(self, user_id: str = "default",
                                stale_minutes: int = 30):
         """Mark old interrupted sessions as ended to avoid accumulation."""
+        self._assert_writable()
+        # Pre-fetch IDs so we can emit one event per closed session for replay.
+        stale_rows = self._fetchall_dicts(
+            """SELECT session_id FROM session_lifecycle
+            WHERE user_id = ? AND ended_at IS NULL
+              AND last_active_at < now() - INTERVAL '1 MINUTE' * ?""",
+            [user_id, stale_minutes],
+        )
         self.conn.execute(
             """UPDATE session_lifecycle
             SET ended_at = last_active_at, end_type = 'interrupted'
@@ -998,3 +1515,8 @@ class MemoryDB:
               AND last_active_at < now() - INTERVAL '1 MINUTE' * ?""",
             [user_id, stale_minutes],
         )
+        for r in stale_rows:
+            self._emit_event("session.end", {
+                "session_id": r["session_id"],
+                "end_type": "interrupted",
+            })
