@@ -49,6 +49,10 @@ class RecoverReport:
     errors: list[str] = field(default_factory=list)
     promoted: bool = False
     backup_path: str | None = None
+    # P1-1: when a snapshot was used as the base, record which one so users
+    # can verify they're recovering from the expected point in time.
+    snapshot_used: bool = False
+    snapshot_seq: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -60,6 +64,8 @@ class RecoverReport:
             "errors": list(self.errors),
             "promoted": self.promoted,
             "backup_path": self.backup_path,
+            "snapshot_used": self.snapshot_used,
+            "snapshot_seq": self.snapshot_seq,
         }
 
 
@@ -115,13 +121,24 @@ def recover(
         since_date=since_date,
     )
 
-    # Build the fresh DB without event-log writes (we're replaying, not creating
-    # new history). MemoryDB constructor handles schema creation.
+    # P1-1: snapshot-aware base. If a snapshot exists AND the user is not
+    # asking for a partial replay (since_date), we copy that snapshot in as
+    # the base DB and only replay events with seq > snapshot.seq.
+    # When since_date is set the user is explicitly asking for "events from
+    # date X onward" — we honor that and skip the snapshot fast-path so the
+    # output reflects exactly that window.
+    base_seq = _try_seed_from_snapshot(output_db, since_date)
+    if base_seq > 0:
+        report.snapshot_seq = base_seq
+        report.snapshot_used = True
+
+    # Build the DB. If snapshot was seeded, MemoryDB just opens the existing
+    # file and re-runs idempotent _init_schema (CREATE ... IF NOT EXISTS).
     db = MemoryDB(db_path=output_db, log_writes=False)
     try:
         log_ = EventLog(event_dir=event_dir)
         events = log_.iter_events(since_date=since_date)
-        _replay_events(db, events, report)
+        _replay_events(db, events, report, min_seq=base_seq)
         db.checkpoint()
     finally:
         db.close()
@@ -132,8 +149,44 @@ def recover(
     return report
 
 
-def _replay_events(db: MemoryDB, events: Iterable[dict], report: RecoverReport) -> None:
+def _try_seed_from_snapshot(output_db: str, since_date: str | None) -> int:
+    """If a snapshot is available and the request is a full replay, copy it
+    into ``output_db`` and return its seq. Returns 0 to signal "no seed used"."""
+    if since_date:
+        return 0
+    try:
+        from .snapshot import latest_snapshot
+        snap = latest_snapshot()
+    except Exception as exc:
+        log.debug("snapshot lookup failed: %s", exc)
+        return 0
+    if snap is None:
+        return 0
+    try:
+        shutil.copy2(snap.path, output_db)
+        log.info("recover seeded from snapshot seq=%d path=%s", snap.seq, snap.path)
+        return snap.seq
+    except OSError as exc:
+        log.warning("snapshot seed failed (%s); falling back to full replay", exc)
+        # Make sure we don't leave a half-copied file behind.
+        try:
+            os.remove(output_db)
+        except OSError:
+            pass
+        return 0
+
+
+def _replay_events(
+    db: MemoryDB,
+    events: Iterable[dict],
+    report: RecoverReport,
+    *,
+    min_seq: int = 0,
+) -> None:
     for event in events:
+        seq = event.get("seq", 0)
+        if seq <= min_seq:
+            continue  # already represented in the snapshot base
         kind = event.get("kind")
         payload = event.get("payload") or {}
         if kind not in _REPLAYABLE:
@@ -388,11 +441,42 @@ def _promote(recovered_db: str, target_db: str) -> tuple[str | None, bool]:
 def doctor(db_path: str = DB_PATH, event_dir: str = DEFAULT_EVENT_DIR) -> dict:
     """Quick read-only health report. Safe to run in degraded mode."""
     from .db import _scan_residue
+    from .maintenance import (
+        BACKUP_DIR,
+        ARCHIVE_DIR,
+        _list_managed_backups,
+        _read_retain_count,
+    )
+    live_backups = _list_managed_backups(BACKUP_DIR)
+    archived_backups = _list_managed_backups(ARCHIVE_DIR)
+    # P1-1 snapshot inventory.
+    try:
+        from .snapshot import list_snapshots, SNAPSHOT_DIR, latest_snapshot
+        all_snaps = list_snapshots(SNAPSHOT_DIR)
+        latest = latest_snapshot(SNAPSHOT_DIR)
+        snapshot_info = {
+            "dir": SNAPSHOT_DIR,
+            "count": len(all_snaps),
+            "latest_seq": latest.seq if latest else 0,
+            "latest_path": latest.path if latest else None,
+            "latest_size_bytes": latest.size_bytes if latest else 0,
+        }
+    except Exception as exc:
+        snapshot_info = {"error": str(exc)}
     info: dict = {
         "db_path": db_path,
         "db_exists": os.path.exists(db_path),
         "event_dir": event_dir,
         "residue_files": _scan_residue(db_path),
+        "backups": {
+            "dir": BACKUP_DIR,
+            "live_count": len(live_backups),
+            "archive_count": len(archived_backups),
+            "retain": _read_retain_count(),
+            # Show only the newest 3 to keep doctor output skimmable.
+            "live_recent": [os.path.basename(p) for p in live_backups[-3:]],
+        },
+        "snapshots": snapshot_info,
     }
     try:
         log_ = EventLog(event_dir=event_dir)

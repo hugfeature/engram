@@ -222,6 +222,8 @@ class TestToolRegistration:
             "create_task", "update_task", "get_task", "list_tasks",
             # Checkpoint v2 — Cognitive Continuation
             "restore_checkpoint", "list_checkpoints",
+            # P1-4 — operational health probe
+            "get_runtime_health",
         }
 
     def test_handlers_registered(self):

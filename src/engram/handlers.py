@@ -1055,6 +1055,46 @@ def handle_list_checkpoints(db: MemoryDB, graph: MemoryGraph,
     }
 
 
+def handle_get_runtime_health(db: MemoryDB, graph: MemoryGraph, **_kw) -> dict:
+    """Expose ``recover.doctor()`` as an MCP tool result.
+
+    Notes for callers:
+      - Always returns ``{"ok": True, ...}`` because this is a *read-only*
+        diagnostic; even DB-corrupt scenarios should still produce data.
+      - Includes a top-level ``advice`` field summarising what the operator
+        should do (recover / clean residue / nothing). LLMs should read it
+        first instead of re-deriving from the raw fields.
+    """
+    from .recover import doctor
+    info = doctor()
+
+    advice: list[str] = []
+    if info.get("readonly"):
+        advice.append(
+            "DB is in readonly degraded mode. Run `engram-setup recover` "
+            "to rebuild from the event log."
+        )
+    if info.get("residue_files"):
+        advice.append(
+            f"{len(info['residue_files'])} residue file(s) present "
+            "(prior corruption). Inspect, then delete manually if no longer "
+            "needed."
+        )
+    if info.get("embedding_stale"):
+        advice.append(
+            "Embedding column dim drifted from the active model. Vector "
+            "recall is falling back to BM25 until you re-embed."
+        )
+    backups = info.get("backups") or {}
+    if backups.get("live_count", 0) > backups.get("retain", 0):
+        advice.append(
+            f"{backups['live_count']} live backups exceed retention "
+            f"({backups['retain']}); surplus will archive on next boot."
+        )
+
+    return {"ok": True, "advice": advice, **info}
+
+
 TOOL_HANDLERS = {
     "recall_memory": handle_recall,
     "store_memory": handle_store,
@@ -1071,6 +1111,7 @@ TOOL_HANDLERS = {
     "list_tasks": handle_list_tasks,
     "restore_checkpoint": handle_restore_checkpoint,
     "list_checkpoints": handle_list_checkpoints,
+    "get_runtime_health": handle_get_runtime_health,
 }
 
 ARG_MAPPING = {
@@ -1101,4 +1142,5 @@ ARG_MAPPING = {
                            "memory_restore_mode": "memory_restore_mode",
                            "user_id": "user_id"},
     "list_checkpoints": {"task_id": "task_id", "limit": "limit", "user_id": "user_id"},
+    "get_runtime_health": {},  # No input args; doctor reads everything from disk.
 }

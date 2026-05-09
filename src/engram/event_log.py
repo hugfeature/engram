@@ -60,7 +60,16 @@ TIER2_KINDS = frozenset({
     "memory.delete",
 })
 
-VALID_KINDS = TIER1_KINDS | TIER2_KINDS
+# Runtime/maintenance event kinds — operational anchors, not state.
+# These are NOT replayed into the DB; they exist so an operator can answer
+# "what did the runtime do, and when?" by reading the event log alone.
+RUNTIME_KINDS = frozenset({
+    "snapshot.create",          # payload: {snapshot_path, seq, db_size_bytes}
+    "runtime.duckdb_upgrade",   # payload: {old_version, new_version, backup_path}
+    "maintenance.backup_pruned",  # payload: {archived: [...], kept: int, dir}
+})
+
+VALID_KINDS = TIER1_KINDS | TIER2_KINDS | RUNTIME_KINDS
 
 
 class EventLogError(RuntimeError):
