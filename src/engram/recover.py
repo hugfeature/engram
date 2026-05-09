@@ -92,6 +92,7 @@ def recover(
     since_date: str | None = None,
     promote: bool = False,
     target_db: str = DB_PATH,
+    snapshot_dir: str | None = None,
 ) -> RecoverReport:
     """Replay events into a fresh DuckDB; optionally promote it to active.
 
@@ -103,6 +104,13 @@ def recover(
         promote:     if True, move ``target_db`` to backups/ and swap in the
                      recovered DB. If False (default), only build it.
         target_db:   the production DB path that will be replaced on promote.
+        snapshot_dir: directory to look for snapshots in. None = use the
+                     default (``~/.engram/snapshots/``) ONLY when
+                     ``event_dir`` is also the default — otherwise we
+                     refuse to mix a custom event log with global
+                     snapshots (would yield wrong replay state). Pass
+                     an explicit path to force the fast-path; pass an
+                     empty string to disable it.
     """
     if output_dir is None:
         output_dir = os.path.join(ENGRAM_DIR, f"recovered-{_ts_suffix()}")
@@ -127,7 +135,16 @@ def recover(
     # When since_date is set the user is explicitly asking for "events from
     # date X onward" — we honor that and skip the snapshot fast-path so the
     # output reflects exactly that window.
-    base_seq = _try_seed_from_snapshot(output_db, since_date)
+    #
+    # Safety: only consult snapshots when event_dir + snapshot_dir are
+    # consistent. A custom event_dir paired with the default global
+    # snapshot_dir would seed the recovered DB from production state that
+    # has nothing to do with the event log being replayed (this happens in
+    # tests and in any caller that points at a non-default event_dir).
+    effective_snapshot_dir = _resolve_snapshot_dir(event_dir, snapshot_dir)
+    base_seq = _try_seed_from_snapshot(
+        output_db, since_date, snapshot_dir=effective_snapshot_dir,
+    )
     if base_seq > 0:
         report.snapshot_seq = base_seq
         report.snapshot_used = True
@@ -149,14 +166,43 @@ def recover(
     return report
 
 
-def _try_seed_from_snapshot(output_db: str, since_date: str | None) -> int:
+def _resolve_snapshot_dir(event_dir: str, override: str | None) -> str | None:
+    """Pick a snapshot dir that is consistent with the event log being replayed.
+
+    Rules:
+      - override is "" (empty string)  -> snapshots disabled outright.
+      - override is a non-empty path   -> use it verbatim (caller knows best).
+      - override is None and event_dir is the default
+                                       -> use the global snapshot dir.
+      - override is None and event_dir is custom
+                                       -> snapshots disabled (returns None)
+                                          to avoid mixing data sources.
+    """
+    if override == "":
+        return None
+    if override is not None:
+        return override
+    if os.path.realpath(event_dir) == os.path.realpath(DEFAULT_EVENT_DIR):
+        from .snapshot import SNAPSHOT_DIR
+        return SNAPSHOT_DIR
+    return None
+
+
+def _try_seed_from_snapshot(
+    output_db: str,
+    since_date: str | None,
+    *,
+    snapshot_dir: str | None,
+) -> int:
     """If a snapshot is available and the request is a full replay, copy it
     into ``output_db`` and return its seq. Returns 0 to signal "no seed used"."""
     if since_date:
         return 0
+    if snapshot_dir is None:
+        return 0
     try:
         from .snapshot import latest_snapshot
-        snap = latest_snapshot()
+        snap = latest_snapshot(snapshot_dir)
     except Exception as exc:
         log.debug("snapshot lookup failed: %s", exc)
         return 0

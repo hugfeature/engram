@@ -56,6 +56,16 @@ async def lifespan(app: FastAPI):
     try:
         get_db()
     except Exception as e:
+        # DatabaseLockedError gets surfaced specifically: another engram is
+        # already running and the DB file is healthy. Refuse to serve, do
+        # NOT proceed in degraded mode (that would imply data loss when
+        # there is none).
+        from .db import DatabaseLockedError
+        if isinstance(e, DatabaseLockedError):
+            log.error(
+                "DB is locked by another process — refusing to start. %s", e
+            )
+            raise SystemExit(2) from e
         log.error("DB init failed (degraded mode): %s", e)
     try:
         get_graph()
@@ -272,6 +282,23 @@ def health():
     }
 
 
+def _port_in_use(host: str, port: int) -> bool:
+    """Return True if another process is already bound to ``host:port``.
+
+    We probe with a short connection attempt rather than listing sockets so
+    the check works on macOS / Linux without root or extra deps. False on
+    any error (we'd rather try and fail loudly than refuse to start because
+    the probe itself broke).
+    """
+    import socket
+    probe_host = host if host not in ("0.0.0.0", "::") else "127.0.0.1"
+    try:
+        with socket.create_connection((probe_host, port), timeout=0.5):
+            return True
+    except (OSError, socket.timeout):
+        return False
+
+
 def main():
     import uvicorn
 
@@ -279,6 +306,19 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8900)
     args = parser.parse_args()
+
+    # Pre-flight: refuse to start if the port is already taken. Without this
+    # check, two engram processes race for the DuckDB lock and the loser
+    # used to mis-classify the lock conflict as DB corruption (v0.10/v0.11
+    # bug, fixed in v0.11.1). Catching it here is cheaper and clearer.
+    if _port_in_use(args.host, args.port):
+        log.error(
+            "Port %s:%d is already in use — another engram server is "
+            "probably running. Stop it first (`engram-server stop` or "
+            "`launchctl unload ~/Library/LaunchAgents/com.engram.server.plist`).",
+            args.host, args.port,
+        )
+        sys.exit(2)
 
     log.info(f"Engram server starting on {args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)
