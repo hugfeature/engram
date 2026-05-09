@@ -265,7 +265,12 @@ def test_seed_from_snapshot_copies_when_full_replay(tmp_path, monkeypatch):
     monkeypatch.setattr(snap_mod, "latest_snapshot", lambda *a, **kw: info)
 
     output_db = tmp_path / "output.duckdb"
-    seq = _try_seed_from_snapshot(str(output_db), since_date=None)
+    # Pass an explicit snapshot_dir to opt into the fast-path. The
+    # monkeypatched latest_snapshot ignores its argument, but recover()'s
+    # caller-supplied snapshot_dir is what unlocks the seed step.
+    seq = _try_seed_from_snapshot(
+        str(output_db), since_date=None, snapshot_dir=str(snap_dir),
+    )
     assert seq == 200
     assert output_db.exists()
     # Output is a working DB.
@@ -289,7 +294,10 @@ def test_seed_from_snapshot_skipped_when_since_date_set(tmp_path, monkeypatch):
     monkeypatch.setattr(snap_mod, "latest_snapshot", lambda *a, **kw: info)
 
     output_db = tmp_path / "output.duckdb"
-    seq = _try_seed_from_snapshot(str(output_db), since_date="20260101")
+    seq = _try_seed_from_snapshot(
+        str(output_db), since_date="20260101",
+        snapshot_dir=str(tmp_path / "snapshots"),
+    )
     # Partial replay window must NOT use a snapshot — would skip events.
     assert seq == 0
     assert not output_db.exists()
@@ -301,7 +309,10 @@ def test_seed_from_snapshot_no_op_without_snapshot(tmp_path, monkeypatch):
 
     monkeypatch.setattr(snap_mod, "latest_snapshot", lambda *a, **kw: None)
     output_db = tmp_path / "output.duckdb"
-    seq = _try_seed_from_snapshot(str(output_db), since_date=None)
+    seq = _try_seed_from_snapshot(
+        str(output_db), since_date=None,
+        snapshot_dir=str(tmp_path / "snapshots"),
+    )
     assert seq == 0
     assert not output_db.exists()
 
@@ -350,23 +361,25 @@ def test_recover_with_snapshot_matches_full_replay(tmp_path, monkeypatch):
 
         monkeypatch.setattr(snap_mod, "latest_snapshot", lambda *a, **kw: snap)
 
-        # 4a. Recover WITH snapshot fast-path.
+        # 4a. Recover WITH snapshot fast-path. Custom event_dir means the
+        # snapshot fast-path is opt-in: caller must pass snapshot_dir.
         out_with = tmp_path / "with-snapshot"
         report_with = recover(
             event_dir=str(event_dir),
             output_dir=str(out_with),
             promote=False,
+            snapshot_dir=str(snap_dir),
         )
         assert report_with.snapshot_used is True
         assert report_with.snapshot_seq == snap.seq
 
-        # 4b. Recover WITHOUT snapshot (force fallback).
-        monkeypatch.setattr(snap_mod, "latest_snapshot", lambda *a, **kw: None)
+        # 4b. Recover WITHOUT snapshot (force fallback by passing "").
         out_full = tmp_path / "full-replay"
         report_full = recover(
             event_dir=str(event_dir),
             output_dir=str(out_full),
             promote=False,
+            snapshot_dir="",
         )
         assert report_full.snapshot_used is False
 

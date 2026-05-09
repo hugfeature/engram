@@ -87,6 +87,37 @@ class DatabaseCorruptionError(RuntimeError):
         self.backup_path = backup_path
         self.recover_command = "engram recover"
 
+
+class DatabaseLockedError(RuntimeError):
+    """Raised when DuckDB refuses to open because another process holds the lock.
+
+    This is NOT corruption — the file is healthy, someone else is just using
+    it. Callers MUST NOT rename, move, or alter the DB file in this case.
+    The right action is to refuse to start the second process and surface
+    a clear "engram is already running" message to the operator.
+    """
+
+    def __init__(self, db_path: str, original: BaseException):
+        super().__init__(
+            f"DuckDB file at {db_path} is locked by another process "
+            f"({original}). The DB file is healthy — do NOT delete or "
+            "rename it. Stop the other engram process first "
+            "(`engram-server stop` or `launchctl unload`), then retry."
+        )
+        self.db_path = db_path
+        self.original = original
+
+
+def _is_lock_conflict(exc: BaseException) -> bool:
+    """Recognize DuckDB's "file lock held by another process" error.
+
+    DuckDB raises this as ``IOException`` with a message containing
+    "Conflicting lock". We match on substring because the exception type
+    is shared with real "file is corrupt" IO errors.
+    """
+    msg = str(exc).lower()
+    return "conflicting lock" in msg or "could not set lock" in msg
+
 def _dim() -> int:
     """Detect embedding dimension, with mismatch detection.
 
@@ -173,6 +204,12 @@ def _force_checkpoint(db_path: str) -> bool:
 
     Returns True if checkpoint succeeded (WAL absorbed into main file).
     This preserves data that would otherwise be lost when we move the WAL.
+
+    Raises:
+        DatabaseLockedError: if the DB is held by another process. We
+            propagate this rather than swallowing it because the caller
+            must NOT proceed with WAL isolation in that case (the WAL
+            is healthy and being actively written by another engram).
     """
     wal = db_path + ".wal"
     if not os.path.exists(wal) or os.path.getsize(wal) == 0:
@@ -186,6 +223,8 @@ def _force_checkpoint(db_path: str) -> bool:
         finally:
             conn.close()
     except Exception as e:
+        if _is_lock_conflict(e):
+            raise DatabaseLockedError(db_path, e) from e
         log.warning("Force checkpoint failed: %s", e)
         return False
 
@@ -226,6 +265,9 @@ def _recover_wal(db_path: str) -> str | None:
     if not os.path.exists(wal) or os.path.getsize(wal) == 0:
         return None
 
+    # Note: _force_checkpoint may raise DatabaseLockedError. We deliberately
+    # let that propagate — moving a WAL aside while another process is
+    # actively writing to it would silently lose that process's data.
     if _force_checkpoint(db_path):
         # WAL was successfully absorbed; DuckDB removes the file itself.
         return None
@@ -256,26 +298,42 @@ def _scan_residue(db_path: str) -> list[str]:
 def _connect_with_retry(db_path: str) -> duckdb.DuckDBPyConnection:
     """Connect to DuckDB.
 
-    Failure policy (Engram v0.10+):
+    Failure policy (Engram v0.11.1+):
         1. Try to open the file as-is.
-        2. If that fails AND a WAL is present, move the WAL aside (timestamped)
-           and try again — this trades the last unflushed transactions for the
-           ability to read everything previously checkpointed.
-        3. If it still fails, raise ``DatabaseCorruptionError``. We DO NOT
-           silently rename the file and create a fresh database — that would
-           destroy Tier 1 runtime state without the user noticing.
+        2. **If the failure is a lock conflict** (another process holds
+           the DB), raise ``DatabaseLockedError`` IMMEDIATELY. The DB
+           file is healthy; we MUST NOT touch it in this case.
+        3. Otherwise, if a WAL is present, try to checkpoint or move it
+           aside (timestamped) and retry — trading unflushed writes for
+           the ability to read previously committed data.
+        4. If it still fails, raise ``DatabaseCorruptionError``. We DO NOT
+           silently rename the file and create a fresh database.
 
-    Escape hatch: setting env ``ENGRAM_ALLOW_RESET=1`` re-enables the old
-    behaviour for users who explicitly want a clean slate.
+    Escape hatch: setting env ``ENGRAM_ALLOW_RESET=1`` re-enables the
+    "create fresh DB" behaviour for users who explicitly want a clean slate.
+    Lock conflicts are NOT affected by this env — a locked file is healthy
+    and can never benefit from a reset.
     """
     try:
         return duckdb.connect(db_path)
     except (duckdb.IOException, duckdb.InternalException) as first_err:
+        # CRITICAL: lock conflict means another engram is already running.
+        # The file is fine — fail loudly without touching it.
+        if _is_lock_conflict(first_err):
+            raise DatabaseLockedError(db_path, first_err) from first_err
+
         log.warning("DuckDB connect failed: %s — attempting WAL isolation", first_err)
-        _recover_wal(db_path)
+        try:
+            _recover_wal(db_path)
+        except DatabaseLockedError:
+            # Lock contention surfaced during WAL recovery — same story:
+            # don't touch the file, surface a clear error.
+            raise
         try:
             return duckdb.connect(db_path)
         except Exception as second_err:
+            if _is_lock_conflict(second_err):
+                raise DatabaseLockedError(db_path, second_err) from second_err
             allow_reset = os.environ.get(ENV_ALLOW_RESET, "").strip() in ("1", "true", "yes")
             backup_path: str | None = None
             if os.path.exists(db_path):
