@@ -679,6 +679,22 @@ class MemoryDB:
         except Exception as exc:
             log.warning("CHECKPOINT failed (non-fatal): %s", exc)
 
+    def _checkpoint_after_extension_op(self, label: str) -> None:
+        """Flush WAL immediately after an extension-heavy operation.
+
+        DuckDB 1.5.x cannot replay WAL entries that reference extension
+        internal tables (FTS ``fts_main_*``, VSS HNSW structures) when
+        the extension is not yet loaded at WAL-replay time.  By
+        checkpointing right after these operations we ensure the WAL
+        never contains extension-specific entries — so even a hard kill
+        (SIGKILL / OOM) leaves a replayable WAL.
+        """
+        try:
+            self.conn.execute("CHECKPOINT")
+            log.debug("Post-%s CHECKPOINT succeeded", label)
+        except Exception as exc:
+            log.warning("Post-%s CHECKPOINT failed (non-fatal): %s", label, exc)
+
     @property
     def fts_available(self) -> bool:
         return self._fts_available
@@ -849,7 +865,14 @@ class MemoryDB:
         return {r[0]: r[1] for r in rows}
 
     def _rebuild_fts_index(self):
-        """Rebuild the FTS index from scratch to include all current data."""
+        """Rebuild the FTS index from scratch to include all current data.
+
+        After rebuilding we immediately CHECKPOINT so the FTS internal
+        tables (``fts_main_memories*``) are flushed into the main DB file.
+        DuckDB 1.5.x cannot replay FTS WAL entries when the extension is
+        not yet loaded, so a stale WAL containing FTS ops causes
+        ``INTERNAL Error: GetDefaultDatabase`` on cold start after a crash.
+        """
         try:
             self.conn.execute(
                 "PRAGMA create_fts_index('memories', 'id', 'content', overwrite=1)"
@@ -857,6 +880,7 @@ class MemoryDB:
             self._fts_available = True
             self._fts_dirty = False
             log.info("FTS index rebuilt successfully")
+            self._checkpoint_after_extension_op("FTS rebuild")
         except Exception as e:
             self._fts_available = False
             log.warning("FTS index rebuild failed: %s — BM25 search unavailable", e)
@@ -867,7 +891,13 @@ class MemoryDB:
             self._rebuild_fts_index()
 
     def _init_vss(self):
-        """Load VSS extension and create HNSW index if beneficial."""
+        """Load VSS extension and create HNSW index if beneficial.
+
+        After loading we CHECKPOINT for the same reason as FTS: the VSS
+        ``SET hnsw_enable_experimental_persistence`` and any HNSW index
+        creation write extension-internal WAL entries that DuckDB 1.5.x
+        cannot replay on a cold start.
+        """
         self._vss_available = False
         try:
             self.conn.execute("INSTALL vss")
@@ -876,6 +906,7 @@ class MemoryDB:
             self._vss_available = True
             log.info("VSS extension loaded")
             self._ensure_hnsw_index()
+            self._checkpoint_after_extension_op("VSS init")
         except Exception as e:
             log.info("VSS extension unavailable: %s — using brute-force vector search", e)
 
