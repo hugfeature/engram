@@ -2,25 +2,27 @@
 
 **Durable Agent Runtime — cross-session task continuity for MCP-aware coding agents**
 
-> Engram 让 Agent 在中断、重启、跨 session 后能恢复**任务执行状态与工作上下文**。
-> 不是又一个向量库 / 长期记忆库——主轴是 **runtime durability + execution continuity**。
-> 定位：Claude Code / Cursor / OpenHands / Devin 类 runtime infra 的连续性层。
+> Engram lets agents recover **task execution state and working context** after interruptions, restarts, and session boundaries.
+> Not another vector DB / long-term memory store — the primary axis is **runtime durability + execution continuity**.
+> Positioned as the continuity layer for Claude Code / Cursor / OpenHands / Devin-class runtimes.
 
 [![PyPI](https://img.shields.io/pypi/v/mcp-engram)](https://pypi.org/project/mcp-engram/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 
+[中文文档](./README_CN.md)
+
 ---
 
-## 两条铁律 / Two Laws
+## Two Laws
 
 > **Rule 1.** Event log is the only durability primitive.
 > **Rule 2.** If it cannot be replayed, it is not critical state.
 
-任何宣称"必须不丢"的数据，必须先写 `~/.engram/events/*.jsonl`（append-only, fsync），
-DuckDB 只是它的 projection layer。
+Any data that claims "must not be lost" must first be written to `~/.engram/events/*.jsonl` (append-only, fsync).
+DuckDB is merely its projection layer.
 
-## 三层架构 / Tiered Architecture
+## Tiered Architecture
 
 ```
 Tier 1 — Runtime Continuity Layer  (Source of Truth, must never be lost)
@@ -36,140 +38,170 @@ Tier 3 — Derived Retrieval Cache  (Disposable, rebuildable)
   → never participates in recovery; rebuilt on demand
 ```
 
-DB 损坏不会静默重置：进入 **readonly degraded mode**，用 `engram-setup recover` 显式重建。
+DB corruption will **not** silently reset: Engram enters **readonly degraded mode**, and you explicitly rebuild with `engram-setup recover`.
 
 ---
 
-## 为什么需要 Memory + Continuity
+## Why Memory + Continuity
 
-AI Agent 的每次会话都是一座孤岛：
+Every AI agent session is an island:
 
-- **换个 Agent？** 从头来。
-- **上下文窗口满了？** 丢掉历史，继续猜。
-- **昨天踩过的坑？** 不知道，再踩一遍。
-- **一个任务跨了三次会话？** 没人知道整体进度。
+- **Switch agents?** Start from scratch.
+- **Context window full?** Drop history, keep guessing.
+- **Yesterday's lessons?** Gone — repeat the same mistakes.
+- **Task spans three sessions?** Nobody knows the overall progress.
 
-根本原因：**Agent 同时缺少两层基础设施**——
-
-| 层 | 解决的问题 | Engram 的实现 |
+Root cause: **Agents lack two layers of infrastructure simultaneously** —
+| Layer | Problem Solved | Engram's Implementation |
 | --- | --- | --- |
-| **Memory** | 跨会话"知道"什么 | 混合检索 + 遗忘曲线 + 去重/矛盾消解 |
-| **Continuity** | 跨中断"接着做"什么 | Task 状态 + 结构化 handoff + 行为级验证 |
+| **Memory** | What to "know" across sessions | Hybrid retrieval + Ebbinghaus decay + dedup/contradiction resolution |
+| **Continuity** | What to "continue" across interruptions | Task state + structured handoff + behavioral verification |
 
-Engram 是一个本地运行的 [MCP](https://modelcontextprotocol.io/) Server，把这两层一起交付给 Claude Code / Cursor 等已有客户端。
+Engram is a locally-running [MCP](https://modelcontextprotocol.io/) Server that delivers both layers to existing clients like Claude Code and Cursor.
 
-它**不**做：
+It does **not** do:
 
-- ❌ 通用 agent runtime / workflow orchestration（那是 LangGraph、Temporal 的位置）
-- ❌ 自定义 agent loop / prompt 编排（让 MCP 客户端自己处理）
-- ❌ 追求恢复时 LLM 行为完全一致（LLM 非确定性是物理限制，做的是 **constrained continuation**——用结构化状态收窄行动空间）
+- ❌ General agent runtime / workflow orchestration (that's LangGraph, Temporal)
+- ❌ Custom agent loop / prompt orchestration (let MCP clients handle that)
+- ❌ Guarantee identical LLM behavior after recovery (LLM non-determinism is a physical constraint — we do **constrained continuation**: structured state narrows the action space)
 
-它**专门**做：
+It **specifically** does:
 
-- ✅ 在会话中断后让任务可恢复
-- ✅ 在 Agent 切换后让上下文可交接
-- ✅ 在长任务中保留工程状态（失败、进度、约束）
-- ✅ 用后续行为反向验证状态正确性（**Behavioral Handoff Verification**）
+- ✅ Make tasks recoverable after session interruption
+- ✅ Make context handoff-able after agent switch
+- ✅ Preserve engineering state across long tasks (failures, progress, constraints)
+- ✅ Reverse-verify state correctness via subsequent behavior (**Behavioral Handoff Verification**)
 
 ---
 
 ## Continuity Flow
 
-**AI Agent Continuity 的核心体验：断点恢复。**
+**The core experience of AI Agent Continuity: checkpoint recovery.**
 
 ```
-Agent A（Claude Code）                     Agent B（Cursor）
+Agent A (Claude Code)                      Agent B (Cursor)
   │                                          │
-  ├─ 创建任务，开始执行                        │
-  ├─ 记录进度 + 失败经验                       │
-  ├─ ━━━━━━━━━━━━━━━━━━━                     │
-  │   ⚡ Session Interrupted                  │
-  │   ━━━━━━━━━━━━━━━━━━━                     │
-  ├─ session_handoff(交接摘要)                 │
-  │        │                                  │
-  │        ▼                                  │
-  │   ┌─────────────────┐                     │
-  │   │   Engram        │                     │
-  │   │   Checkpoint    │                     │
-  │   │   ┌───────────┐ │                     │
-  │   │   │ 任务状态   │ │                     │
-  │   │   │ 执行进度   │ │                     │
-  │   │   │ 失败教训   │ │                     │
-  │   │   │ 下一步计划 │ │                     │
-  │   │   └───────────┘ │                     │
-  │   └────────┬────────┘                     │
-  │            │                              │
-  │            ▼                              │
-  │     Restore State ─────────────────────▶  │
-  │                                          ├─ recall_memory(关键词)
-  │                                          │    └─ handoff 自动置顶
-  │                                          │    └─ 附带历史失败上下文
-  │                                          │    └─ next_steps 执行验证
-  │                                          ├─ 接着做，不从零开始
-  │                                          └─ session_handoff(交接) ──▶ ...
+  ├─ Create task, start execution            │
+  ├─ Record progress + failure lessons       │
+  ├─ ━━━━━━━━━━━━━━━━━━━                    │
+  │   ⚡ Session Interrupted                 │
+  │   ━━━━━━━━━━━━━━━━━━━                    │
+  ├─ session_handoff(handoff summary)        │
+  │        │                                 │
+  │        ▼                                 │
+  │   ┌─────────────────┐                    │
+  │   │   Engram        │                    │
+  │   │   Checkpoint    │                    │
+  │   │   ┌───────────┐ │                    │
+  │   │   │ Task State │ │                    │
+  │   │   │ Progress   │ │                    │
+  │   │   │ Failures   │ │                    │
+  │   │   │ Next Steps │ │                    │
+  │   │   └───────────┘ │                    │
+  │   └────────┬────────┘                    │
+  │            │                             │
+  │            ▼                             │
+  │     Restore State ───────────────────▶   │
+  │                                          ├─ recall_memory(query)
+  │                                          │    └─ handoff auto-pinned
+  │                                          │    └─ historical failure context
+  │                                          │    └─ next_steps execution verify
+  │                                          ├─ Continue, not from zero
+  │                                          └─ session_handoff() ──────────▶ ...
 ```
 
-> **无论换了几个 Agent、跨了几次会话，任务状态始终在。**
+> **No matter how many agents you switch or sessions you cross, task state persists.**
 
 ---
 
-## MCP 工具一览
+## 15 MCP Tools
 
-Engram 提供 **15 个 MCP 工具**，覆盖 Cognitive Continuity 的完整生命周期：
+Engram provides **15 MCP tools** covering the full Cognitive Continuity lifecycle:
 
-Engram 提供 **15 个 MCP 工具**：
+### Memory
+
+| Tool | Purpose |
+| --- | --- |
+| `store_memory` | Store new memory (auto-dedup/merge/replace) |
+| `recall_memory` | Semantic search (hybrid: BM25 + vector + graph boost) |
+| `update_memory` | Update existing memory by ID |
+| `consolidate_memory` | Merge similar memories, reduce bloat |
+| `memory_stats` | Count, category distribution, avg strength, last maintenance |
+
+### Task
+
+| Tool | Purpose |
+| --- | --- |
+| `create_task` | Create tracked task (first-class entity) |
+| `get_task` | Get task + all associated memories + latest checkpoint |
+| `update_task` | Update status / goal / metadata |
+| `list_tasks` | List tasks, optionally filtered by status |
+| `track_progress` | Record feature/task progress snapshot |
+| `track_failure` | Record structured failure event (bug, test failure, etc.) |
+
+### Continuity
+
+| Tool | Purpose |
+| --- | --- |
+| `session_handoff` | Record structured end-of-session state |
+| `session_outcome` | Mark session success/failure (adjusts memory importance) |
+| `restore_checkpoint` | Restore constrained continuation package from checkpoint |
+| `list_checkpoints` | List checkpoint history (latest first) |
+| `report_interruption` | Report imminent interruption reason for recovery routing |
+| `evaluate_continuity` | Evaluate continuity quality between checkpoint versions |
+
+---
+
 ## Checkpoint v2 — Constrained Continuation
 
-把 `session_handoff` 升级为**版本化 cognitive checkpoint**：恢复时不强求新 Agent 复现同一个 action，而是给它一组**约束**收窄行动空间。
+Elevates `session_handoff` to **versioned cognitive checkpoints**: instead of forcing the new agent to replay identical actions, it provides a set of **constraints** that narrow the action space.
 
-**Continuation 包的字段**
+**Continuation Package Fields**
 
-| 字段 | 作用 |
+| Field | Purpose |
 | --- | --- |
-| `goal` / `completed` / `in_progress` / `blocked` / `preferred_next` | 任务状态主体 |
-| `must_not_redo` | Negative memory — 已完成或已产生副作用、不可重做的动作 |
-| `must_preserve` | 用户明令的 invariant（如"别动 main 分支"） |
-| `working_set` | 中断前的工作集（file / tool / artifact） |
-| `continuation_confidence` | 系统自评恢复可靠度（0~1） |
+| `goal` / `completed` / `in_progress` / `blocked` / `preferred_next` | Task state body |
+| `must_not_redo` | Negative memory — actions already done or with side effects, must not redo |
+| `must_preserve` | User-stated invariants (e.g. "don't touch the main branch") |
+| `working_set` | Working set at interruption (files / tools / artifacts) |
+| `continuation_confidence` | System self-assessed recovery reliability (0–1) |
 
-**Event-first 触发**（按认知事件保存，非时间周期；同 reason 60s debounce）
+**Event-first Triggers** (saved on cognitive events, not time periods; 60s debounce per reason)
 
-| Reason | 触发场景 |
+| Reason | Trigger Condition |
 | --- | --- |
-| `MANUAL_HANDOFF` | 调用 `session_handoff` |
-| `FAILURE` | 调用 `track_failure`（强触发，绕过 debounce） |
+| `MANUAL_HANDOFF` | `session_handoff` called |
+| `FAILURE` | `track_failure` called (forced, bypasses debounce) |
 | `PLAN_UPDATE` | `in_progress` Jaccard < 0.7 |
-| `WORKING_SET_SHIFT` | 工作集 Jaccard < 0.5 |
-| `AUTO_SAVE` | 5 分钟无 checkpoint 兜底 |
+| `WORKING_SET_SHIFT` | Working set Jaccard < 0.5 |
+| `AUTO_SAVE` | 5 minutes with no checkpoint (fallback) |
 
-**接口**
+**Interface**
 
 ```python
-# 一站式恢复（推荐）：get_task 自带 latest_checkpoint
+# One-stop recovery (recommended): get_task includes latest_checkpoint
 get_task(task_id=42)["latest_checkpoint"]["continuation"]
 
-# 完整恢复：带相关记忆 + 历史 failure 上下文
+# Full recovery: with related memories + historical failure context
 restore_checkpoint(task_id=42, memory_restore_mode="SELECTIVE")
-# memory_restore_mode: FULL(全量) / SELECTIVE(默认, importance≥0.5 或 failure) / NONE
+# memory_restore_mode: FULL / SELECTIVE (default, importance≥0.5 or failure) / NONE
 
-# checkpoint 历史
+# Checkpoint history
 list_checkpoints(task_id=42, limit=10)
 ```
 
-**向后兼容**：现有工具签名不变，新字段追加；老 task 无 checkpoint 时 `restore_checkpoint` 走 fallback。
+**Backward Compatible**: Existing tool signatures unchanged; new fields appended. When old tasks have no checkpoint, `restore_checkpoint` falls back gracefully.
 
 ---
 
----
-
-## 安装
+## Installation
 
 ```bash
 pip install mcp-engram
-engram-setup          # 下载嵌入模型 + 初始化 DuckDB
+engram-setup          # Download embedding model + initialize DuckDB
 ```
 
-MCP 客户端配置（Claude Code / Cursor）：
+MCP client configuration (Claude Code / Cursor):
 
 ```json
 {
@@ -182,44 +214,44 @@ MCP 客户端配置（Claude Code / Cursor）：
 }
 ```
 
-数据目录 `~/.engram/`：`memories.duckdb`（单文件 DB） + `graph.json`（语义图） + `model_cache/`（模型）。
+Data directory `~/.engram/`: `memories.duckdb` (single-file DB) + `graph.json` (semantic graph) + `model_cache/` (model).
 
-### 推荐写入 CLAUDE.md 的 Agent 指令
+### Recommended CLAUDE.md Agent Instructions
 
 ```markdown
 ## Memory Rules
-- 多步任务起点：create_task(name, goal)
-- 任务开始：recall_memory(query) — handoff 自动置顶 + 历史 failure
-- 接手任务：get_task(task_id) — 自带 latest_checkpoint
-- 阶段进展：track_progress(feature, status, task_id=X)
-- 遇到错误：track_failure(error, component, root_cause, task_id=X)
-- 任务收尾：session_handoff(summary, completed, in_progress, blocked,
+- Task start: create_task(name, goal)
+- Session begin: recall_memory(query) — handoff auto-pinned + historical failures
+- Task takeover: get_task(task_id) — includes latest_checkpoint
+- Progress update: track_progress(feature, status, task_id=X)
+- On error: track_failure(error, component, root_cause, task_id=X)
+- Session end: session_handoff(summary, completed, in_progress, blocked,
             next_steps, must_not_redo=[...], must_preserve=[...],
             working_set={...}, task_id=X)
 ```
 
-支持 macOS / Linux / WSL2，Python 3.11+，约 500MB 模型缓存。
+Supports macOS / Linux / WSL2, Python 3.11+, ~500MB model cache.
 
 ---
 
 ## Benchmark
 
-基于 [LoCoMo](https://github.com/snap-research/locomo)（Snap Research 长期对话记忆基准）评测：
+Evaluated on [LoCoMo](https://github.com/snap-research/locomo) (Snap Research long-term conversation memory benchmark):
 
-| System     | Overall F1 | LLM           | 部署方式 |
-| ---------- | ---------- | ------------- | -------- |
-| MemMachine | 0.8487     | GPT-4o-mini   | 云端     |
-| Memobase   | 0.7578     | GPT-4o-mini   | 云端     |
-| Zep        | 0.7514     | GPT-4o-mini   | 云端     |
-| Mem0       | 0.6688     | GPT-4o-mini   | 云端     |
-| **Engram** | **0.4383** | DeepSeek-V3.2 | **本地** |
+| System     | Overall F1 | LLM           | Deployment |
+| ---------- | ---------- | ------------- | ---------- |
+| MemMachine | 0.8487     | GPT-4o-mini   | Cloud      |
+| Memobase   | 0.7578     | GPT-4o-mini   | Cloud      |
+| Zep        | 0.7514     | GPT-4o-mini   | Cloud      |
+| Mem0       | 0.6688     | GPT-4o-mini   | Cloud      |
+| **Engram** | **0.4383** | DeepSeek-V3.2 | **Local**  |
 
-> 本地部署零云端依赖，四轮优化累计 **F1 +50.3%**，**Hit@5 +26.2pp**。
+> Zero cloud dependency, local deployment. Four optimization rounds yielded **F1 +50.3%**, **Hit@5 +26.2pp**.
 
 <details>
-<summary>分类得分 + 记忆机制详解</summary>
+<summary>Category scores + memory mechanism details</summary>
 
-### 分类得分
+### Category Scores
 
 | Category    |   Count |         F1 |     Hit@5 |
 | ----------- | ------: | ---------: | --------: |
@@ -229,31 +261,31 @@ MCP 客户端配置（Claude Code / Cursor）：
 | Open-Domain |      13 |     0.1324 |     61.5% |
 | **Overall** | **233** | **0.4383** | **77.7%** |
 
-### 记忆机制（关键算法摘要）
+### Memory Mechanisms (Key Algorithm Summary)
 
-- **艾宾浩斯衰减**：`strength = importance × e^(-λ × days) × (1 + recall_count × 0.2)`，`failure` 半衰期 ~11 天，`strategy` ~38 天
-- **去重**：相似度 ≥0.85 强化、0.65~0.84 检测矛盾后合并/覆盖、<0.65 新建
-- **混合检索**：`0.3 × BM25 + 0.7 × (语义相似度 × 衰减强度) + 图谱加成`，HNSW + DuckDB FTS
-- **Recall 增强**：handoff 自动置顶 + 关联 failure 上下文 + 动态 `quality_score`
-- **自动维护**：每 12h 整合（≥0.70 聚类合并）+ 剪枝（strength<0.05）+ FTS 重建
+- **Ebbinghaus Decay**: `strength = importance × e^(-λ × days) × (1 + recall_count × 0.2)`, `failure` half-life ~11 days, `strategy` ~38 days
+- **Deduplication**: similarity ≥0.85 reinforces, 0.65–0.84 detects contradiction then merges/overwrites, <0.65 creates new
+- **Hybrid Retrieval**: `0.3 × BM25 + 0.7 × (semantic similarity × decay strength) + graph boost`, HNSW + DuckDB FTS
+- **Recall Enhancement**: handoff auto-pinned + associated failure context + dynamic `quality_score`
+- **Auto Maintenance**: consolidate every 12h (≥0.70 cluster merge) + prune (strength<0.05) + FTS rebuild
 
-### 重要性参考
+### Importance Reference
 
-`0.9–1.0` 核心身份/永久事实 · `0.7–0.8` 架构决策/强偏好 · `0.5` 普通事实 · `0.2–0.3` 临时上下文
+`0.9–1.0` core identity / permanent facts · `0.7–0.8` architecture decisions / strong preferences · `0.5` regular facts · `0.2–0.3` transient context
 
-### 环境变量（高频）
+### Environment Variables (High-Frequency)
 
-| 变量 | 默认 | 说明 |
+| Variable | Default | Description |
 | --- | --- | --- |
-| `HF_ENDPOINT` | `https://hf-mirror.com` | HuggingFace 镜像 |
-| `ENGRAM_MODEL` | `all-mpnet-base-v2` | 嵌入模型 |
-| `ENGRAM_DEDUP_THRESHOLD` | `0.65` | 去重相似度下限 |
-| `ENGRAM_REINFORCE_THRESHOLD` | `0.85` | 强化相似度阈值 |
-| `ENGRAM_W_BM25` / `ENGRAM_W_VECTOR` | `0.30` / `0.70` | 检索权重 |
-| `ENGRAM_PRUNE_THRESHOLD` | `0.05` | 剪枝强度阈值 |
-| `ENGRAM_CONSOLIDATE_THRESHOLD` | `0.70` | 整合聚类阈值 |
+| `HF_ENDPOINT` | `https://hf-mirror.com` | HuggingFace mirror |
+| `ENGRAM_MODEL` | `all-mpnet-base-v2` | Embedding model |
+| `ENGRAM_DEDUP_THRESHOLD` | `0.65` | Dedup similarity lower bound |
+| `ENGRAM_REINFORCE_THRESHOLD` | `0.85` | Reinforce similarity threshold |
+| `ENGRAM_W_BM25` / `ENGRAM_W_VECTOR` | `0.30` / `0.70` | Retrieval weights |
+| `ENGRAM_PRUNE_THRESHOLD` | `0.05` | Prune strength threshold |
+| `ENGRAM_CONSOLIDATE_THRESHOLD` | `0.70` | Consolidate cluster threshold |
 
-完整变量列表见 `src/engram/config.py`。
+Full variable list in `src/engram/config.py`.
 
 </details>
 
@@ -261,42 +293,42 @@ MCP 客户端配置（Claude Code / Cursor）：
 
 ## Roadmap
 
-聚焦原则：**只做 Memory + Continuity 双层**，凡是滑向"通用 agent runtime / workflow orchestration"的需求一律延后，避免与 LangGraph / Temporal 重叠。
+Focus principle: **only build Memory + Continuity dual layers**. Anything sliding toward "general agent runtime / workflow orchestration" is deferred to avoid overlap with LangGraph / Temporal.
 
-### 已交付
+### Shipped
 
-- [x] ~~Error-aware Memory~~ — 按 component 附带历史 failure 上下文 ✅
-- [x] ~~Handoff Validation~~ — next_steps 执行状态检测 ✅
-- [x] ~~Task Context~~ — Task 一等实体，跨会话任务全景视图 ✅
-- [x] ~~Memory Quality Score~~ — 基于 importance + recall + outcome 动态评分 ✅
-- [x] ~~Session Lifecycle~~ — 自动心跳、中断检测、atexit 兜底 ✅
+- [x] ~~Error-aware Memory~~ — attach historical failure context by component ✅
+- [x] ~~Handoff Validation~~ — next_steps execution status detection ✅
+- [x] ~~Task Context~~ — Task as first-class entity, cross-session task panorama ✅
+- [x] ~~Memory Quality Score~~ — dynamic scoring based on importance + recall + outcome ✅
+- [x] ~~Session Lifecycle~~ — auto heartbeat, interruption detection, atexit fallback ✅
 
-### 已交付（Cognitive Continuation 第一层）
+### Shipped (Cognitive Continuation Layer 1)
 
-- [x] ~~**Checkpoint v2**~~ — 版本化 cognitive checkpoint，event-first 触发（6 类 reason），`restore_checkpoint` / `list_checkpoints` 上线，支持 constrained continuation（must_not_redo 作为 negative memory / must_preserve / preferred_next / working_set / continuation_confidence） ✅
+- [x] ~~**Checkpoint v2**~~ — versioned cognitive checkpoint, event-first trigger (6 reason types), `restore_checkpoint` / `list_checkpoints` live, supports constrained continuation (must_not_redo as negative memory / must_preserve / preferred_next / working_set / continuation_confidence) ✅
 
-### 已交付（Interruption Taxonomy）
+### Shipped (Interruption Taxonomy)
 
-- [x] ~~**Interruption Taxonomy**~~ — 6 类中断分类（overflow / user_away / tool_failure / crash / rate_limit / unknown），按类型路由恢复策略。新增 `report_interruption` MCP tool 供 LLM 主动上报；`cleanup_stale_sessions` 自动启发式分类；recall 的 `interrupted_sessions` hint 按中断类型给出针对性恢复建议 ✅
+- [x] ~~**Interruption Taxonomy**~~ — 6 interruption categories (overflow / user_away / tool_failure / crash / rate_limit / unknown), route recovery strategy by type. New `report_interruption` MCP tool for LLM proactive reporting; `cleanup_stale_sessions` auto heuristic classification; recall `interrupted_sessions` hint provides targeted recovery advice by interruption type ✅
 
-### 已交付（Chaos Continuity Test + Continuity Metrics）
+### Shipped (Chaos Continuity Test + Continuity Metrics)
 
-- [x] ~~**Continuity Metrics**~~ — 6 维指标引擎（`continuity.py`）：Goal Retention / Action Consistency / Failure Recall / Working Set Stability / Replanning Rate / Redundant Exploration。`restore_checkpoint` 自动附带 `continuity_score`，新增 `evaluate_continuity` MCP tool 供主动评估 ✅
-- [x] ~~**Chaos Continuity Test**~~ — 5 大中断场景自动化测试：正常 handoff（基准）/ SIGTERM / kill -9 crash / failure mid-session / working set drift，全部通过并量化恢复质量 ✅
+- [x] ~~**Continuity Metrics**~~ — 6-dimension metrics engine (`continuity.py`): Goal Retention / Action Consistency / Failure Recall / Working Set Stability / Replanning Rate / Redundant Exploration. `restore_checkpoint` auto-attaches `continuity_score`, new `evaluate_continuity` MCP tool for proactive assessment ✅
+- [x] ~~**Chaos Continuity Test**~~ — 5 major interruption scenario automated tests: Normal Handoff (baseline) / SIGTERM / kill -9 crash / Failure Mid-Session / Working Set Drift, all passing with quantified recovery quality ✅
 
-### 已交付（P1-6 Event Log Gzip Rotate）
+### Shipped (P1-6 Event Log Gzip Rotate)
 
-- [x] ~~**Event Log Gzip Rotate**~~ — 非当天的 `events-YYYYMMDD.jsonl` 在 boot 时自动 gzip 压缩为 `.jsonl.gz`，节省磁盘空间。recover / iter_events 透明读取 `.gz` 文件。压缩前验证行数一致，安全无损 ✅
+- [x] ~~**Event Log Gzip Rotate**~~ — non-today `events-YYYYMMDD.jsonl` auto-gzipped at boot to `.jsonl.gz`, saving disk space. recover / iter_events transparently read `.gz` files. Line count verified before compression, zero data loss ✅
 
-### 进行中（Cognitive Continuation 强化）
+### In Progress (Cognitive Continuation Hardening)
 
-- [ ] **Behavioral Verification 落表** — `handoff_verifications` 持久化，作为对外差异化能力
+- [ ] **Behavioral Verification persistence** — `handoff_verifications` table, as a differentiating capability
 
-### 延后 / 不做（Deferred）
+### Deferred
 
-- [ ] ~~Multi-Agent Coordination — 多 Agent 并行任务分配与同步~~ → **Deferred**：属于通用 orchestration 范畴，与项目定位冲突，让上层框架（LangGraph / AutoGen）解决。
-- [ ] ~~跨模型 next_steps 中间表示~~ → **Deferred**：主流 MCP 客户端使用同档模型，自然语言 next_steps 已足够，过度工程化收益低。
-- [ ] Coding Agent 深度集成 — IDE 原生 Task 面板（保留，依赖 Checkpoint v2 完成）
+- [ ] ~~Multi-Agent Coordination — multi-agent parallel task assignment & sync~~ → **Deferred**: falls under general orchestration, conflicts with project positioning; let upstream frameworks (LangGraph / AutoGen) handle it.
+- [ ] ~~Cross-model next_steps intermediate representation~~ → **Deferred**: mainstream MCP clients use same-tier models, natural language next_steps is sufficient; over-engineering yields low ROI.
+- [ ] Coding Agent deep integration — IDE-native Task panel (retained, depends on Checkpoint v2 completion)
 
 ---
 
@@ -304,104 +336,104 @@ MCP 客户端配置（Claude Code / Cursor）：
 
 ### v0.13.1 — P1-6 Event Log Gzip Rotate
 
-主轴：**永久保留事件日志也不爆盘**。
+Theme: **Keep event logs forever without blowing up disk.**
 
-**新增**
+**New**
 
-- ✨ **Event log gzip rotate**（`event_log.py`）：`rotate_old_files()` 方法将非当天的 `.jsonl` 文件 gzip 压缩为 `.jsonl.gz`。压缩前后行数校验，确保零数据丢失。
-- ✨ **透明读取 `.jsonl.gz`**（`event_log.py`）：`_sorted_event_files()` 同时识别 `.jsonl` 和 `.jsonl.gz`；`_iter_file()` 根据后缀自动选择 `open` 或 `gzip.open`。同日期同时存在两种格式时 `.jsonl` 优先。
-- ✨ **Boot 自动 rotate**（`maintenance.py`）：`schedule_startup_maintenance()` 在 daemon 线程中自动调用 `rotate_event_logs()`，不阻塞启动。
-- ✨ **Recover 透明兼容**：`recover()` 通过 `iter_events()` 间接受益，无需任何修改即可从 `.gz` 文件恢复。
+- ✨ **Event log gzip rotate** (`event_log.py`): `rotate_old_files()` compresses non-today `.jsonl` files to `.jsonl.gz`. Line count verified before and after compression — zero data loss.
+- ✨ **Transparent `.jsonl.gz` reading** (`event_log.py`): `_sorted_event_files()` recognizes both `.jsonl` and `.jsonl.gz`; `_iter_file()` auto-selects `open` or `gzip.open`. When both formats exist for the same date, `.jsonl` takes priority.
+- ✨ **Boot auto-rotate** (`maintenance.py`): `schedule_startup_maintenance()` calls `rotate_event_logs()` in daemon thread, non-blocking.
+- ✨ **Recover transparent compatibility**: `recover()` benefits via `iter_events()` — no changes needed to read from `.gz` files.
 
-**升级路径**
+**Upgrade**
 
 ```bash
-pip install -U mcp-engram      # 安装不变
+pip install -U mcp-engram      # install command unchanged
 ```
 
-- 完全向前兼容 v0.13.0：旧的 `.jsonl` 文件照常读取，首次启动后自动压缩历史文件
+- Fully forward-compatible with v0.13.0: old `.jsonl` files read normally; first boot auto-compresses historical files
 
-**回归**
+**Regression**
 
-- 456 tests passed（v0.13.0 的 441 + 新增 15：`test_event_log_rotate` 15）
-- 0 lint error
+- 456 tests passed (v0.13.0's 441 + 15 new: `test_event_log_rotate`)
+- 0 lint errors
 
 ### v0.13.0 — Chaos Continuity Test + Continuity Metrics
 
-主轴：**量化 Agent 跨中断恢复的认知质量**，回答 "checkpoint restore 到底好不好" 这个核心问题。
+Theme: **Quantify the cognitive quality of agent cross-interruption recovery** — answer the core question "is checkpoint restore actually good enough?"
 
-**新增**
+**New**
 
-- ✨ **6 维 Continuity Metrics 引擎**（`continuity.py`）：每次 checkpoint restore 自动计算 6 维得分 + 加权 composite 评分。维度：Goal Retention（目标保持度）/ Action Consistency（行动一致性）/ Failure Recall（失败记忆召回率）/ Working Set Stability（工作集稳定度）/ Replanning Rate（重规划率）/ Redundant Exploration（冗余探索率）。
-- ✨ **MCP tool `evaluate_continuity`**（`tools.py` / `handlers.py`）：LLM 可主动评估任意两个 checkpoint 版本之间的 continuity score。支持传入 `actions_taken_after_restore` 衡量 redundant exploration。
-- ✨ **`restore_checkpoint` 自动附带 `continuity_score`**（`handlers.py`）：restore 时自动对比 parent_version，在响应中嵌入 6 维评分。LLM 可据此判断 "这次恢复的质量够不够好，是否需要额外补偿"。
-- ✨ **Chaos Continuity Test 测试套件**（`test_chaos_continuity.py`）：5 大场景自动化验证 —— S1: Normal Handoff (baseline) / S2: SIGTERM (atexit fires) / S3: kill -9 Crash / S4: Failure Mid-Session / S5: Working Set Drift。
+- ✨ **6-dimension Continuity Metrics engine** (`continuity.py`): auto-compute 6-dimension scores + weighted composite on every checkpoint restore. Dimensions: Goal Retention / Action Consistency / Failure Recall / Working Set Stability / Replanning Rate / Redundant Exploration.
+- ✨ **MCP tool `evaluate_continuity`** (`tools.py` / `handlers.py`): LLM can proactively evaluate continuity score between any two checkpoint versions. Supports `actions_taken_after_restore` for redundant exploration measurement.
+- ✨ **`restore_checkpoint` auto-attaches `continuity_score`** (`handlers.py`): auto-compares against parent_version on restore, embeds 6-dimension scores in response. LLM can judge "is this recovery quality good enough, or do I need compensation?"
+- ✨ **Chaos Continuity Test suite** (`test_chaos_continuity.py`): 5 major scenario automated verification — S1: Normal Handoff (baseline) / S2: SIGTERM (atexit fires) / S3: kill -9 Crash / S4: Failure Mid-Session / S5: Working Set Drift.
 
-**升级路径**
+**Upgrade**
 
 ```bash
-pip install -U mcp-engram      # 安装不变
+pip install -U mcp-engram      # install command unchanged
 ```
 
-- 完全向前兼容 v0.12：`evaluate_continuity` 是新工具，不影响已有 client
-- `restore_checkpoint` 的 `continuity_score` 是可选输出，旧 client 忽略即可
+- Fully forward-compatible with v0.12: `evaluate_continuity` is a new tool, no impact on existing clients
+- `restore_checkpoint`'s `continuity_score` is optional output, old clients can ignore
 
-**回归**
+**Regression**
 
-- 441 tests passed（v0.12 的 404 + 新增 37：`test_continuity_metrics` 28 + `test_chaos_continuity` 9）
-- 0 lint error
+- 441 tests passed (v0.12's 404 + 37 new: `test_continuity_metrics` 28 + `test_chaos_continuity` 9)
+- 0 lint errors
 
 ### v0.12.0 — Interruption Taxonomy
 
-主轴：让下一个 Agent **知道上一个 Agent 是怎么中断的**，并据此选择最优恢复策略，而非千篇一律的 "session ended unexpectedly"。
+Theme: Let the next agent **know how the previous agent was interrupted**, and choose the optimal recovery strategy accordingly — instead of a generic "session ended unexpectedly".
 
-**新增**
+**New**
 
-- ✨ **6 类中断分类**（`db.py`）：`overflow` / `user_away` / `tool_failure` / `crash` / `rate_limit` / `unknown`，每类对应一套恢复策略（restore_checkpoint + memory_restore_mode + hint）。
-- ✨ **MCP tool `report_interruption`**（`tools.py` / `handlers.py`）：LLM 在检测到即将中断时（如 context window 快满、API 限流）主动调用，记录中断原因。该原因在进程退出时写入 `session_lifecycle`，下一个 Agent 可据此获得针对性恢复建议。
-- ✨ **Stale session 自动分类**（`db.py`）：`cleanup_stale_sessions` 现在通过启发式规则自动分类中断原因：session < 2min → `crash`；≥ 2 条 failure 记忆 → `tool_failure`；其他 → `user_away`。
-- ✨ **Taxonomy-aware recall hints**（`handlers.py`）：`recall_memory` 返回的 `interrupted_sessions` 不再是千篇一律的提示，而是按中断类型给出针对性恢复策略（`recovery_strategy` / `memory_restore_mode` / `hint`）。
-- ✨ **atexit 中断感知**（`shared.py`）：`_on_exit` 现在检查 LLM 是否通过 `report_interruption` 预先报告了中断原因，有则写入 session_lifecycle，无则标记为正常 `process_exit`。
+- ✨ **6 interruption categories** (`db.py`): `overflow` / `user_away` / `tool_failure` / `crash` / `rate_limit` / `unknown`, each mapped to a recovery strategy (restore_checkpoint + memory_restore_mode + hint).
+- ✨ **MCP tool `report_interruption`** (`tools.py` / `handlers.py`): LLM calls this when detecting imminent interruption (e.g. context window filling, API rate limiting), records interruption reason. The reason is written to `session_lifecycle` on process exit, so the next agent receives targeted recovery advice.
+- ✨ **Stale session auto-classification** (`db.py`): `cleanup_stale_sessions` now auto-classifies interruption reasons via heuristic rules: session < 2min → `crash`; ≥ 2 failure memories → `tool_failure`; otherwise → `user_away`.
+- ✨ **Taxonomy-aware recall hints** (`handlers.py`): `recall_memory`'s `interrupted_sessions` no longer gives generic hints — it provides targeted recovery strategies by interruption type (`recovery_strategy` / `memory_restore_mode` / `hint`).
+- ✨ **atexit interruption-aware** (`shared.py`): `_on_exit` now checks if LLM pre-reported interruption via `report_interruption`; if so, writes to session_lifecycle, otherwise marks as normal `process_exit`.
 
-**Schema 变更**
+**Schema Changes**
 
-- `session_lifecycle` 新增 `interruption_reason VARCHAR` + `interruption_context JSON` 两列
-- 向前完全兼容：旧数据的 `interruption_reason = NULL` 自动视为 `unknown`；schema 迁移通过 `ALTER TABLE ADD COLUMN IF NOT EXISTS` 实现
+- `session_lifecycle` gains `interruption_reason VARCHAR` + `interruption_context JSON` columns
+- Fully forward-compatible: old data with `interruption_reason = NULL` is treated as `unknown`; schema migration via `ALTER TABLE ADD COLUMN IF NOT EXISTS`
 
-**新增 Event 字段**
+**New Event Fields**
 
-- `session.end` 事件新增可选字段：`interruption_reason` / `interruption_context`
-- `engram recover` 的 `_replay_session_end` 已支持回放这两个字段
+- `session.end` event gains optional fields: `interruption_reason` / `interruption_context`
+- `engram recover`'s `_replay_session_end` supports replaying these fields
 
-**升级路径**
+**Upgrade**
 
 ```bash
-pip install -U mcp-engram      # 安装不变
-engram-setup doctor            # session_lifecycle 表自动加列
+pip install -U mcp-engram      # install command unchanged
+engram-setup doctor            # session_lifecycle table auto-adds columns
 ```
 
-- 完全向前兼容 v0.11：旧 session 的 `interruption_reason` 为 NULL，recall hint 回退到 `unknown` 策略
-- 新增的 `report_interruption` 工具是可选的；不调用时行为与 v0.11 完全一致
+- Fully forward-compatible with v0.11: old sessions' `interruption_reason` is NULL, recall hint falls back to `unknown` strategy
+- New `report_interruption` tool is optional; not calling it yields identical behavior to v0.11
 
-**回归**
+**Regression**
 
-- 404 tests passed（v0.11 的 387 + 新增 17：`test_interruption_taxonomy`）
-- 0 lint error
+- 404 tests passed (v0.11's 387 + 17 new: `test_interruption_taxonomy`)
+- 0 lint errors
 
 ### v0.11.0 — Operational Hardening
 
-主轴：在 v0.10 的"两条铁律"基础上，把 **运维可见性** 和 **灾难性增长防护** 补齐。零配置默认开启，向前完全兼容 v0.10。
+Theme: On top of v0.10's "Two Laws", fill in **operational visibility** and **catastrophic growth prevention**. Zero-config, enabled by default, fully forward-compatible with v0.10.
 
-**新增**
+**New**
 
-- ✨ **周期性 Snapshot + Replay 加速**（`snapshot.py`）：每写入 N 条 event（默认 1000）或每 H 小时（默认 1）异步快照 DuckDB 文件到 `~/.engram/snapshots/snapshot-seq{N}-{ts}.duckdb`。`engram-setup recover` 优先从最新 snapshot 加载并只 replay `seq > snapshot_seq` 的事件，长期运行的 engram 不再因事件累积而拖慢恢复。
-- ✨ **Backup 自动归档策略**（`maintenance.py`）：`~/.engram/backups/` 中受管文件（`memories-pre-recover-*` / `memories-pre-duckdb-upgrade-*`）超过 `ENGRAM_BACKUP_RETAIN`（默认 10）时，最旧的归档到 `backups/archive/`（**只移动不删除**，可恢复）。
-- ✨ **DuckDB 版本升级自动备份**：检测到 `duckdb_version` 跨 minor/major 变化（如 `1.5 → 1.6`、`0.9 → 0.10`）时，启动前 `cp` 当前 DB 到 `backups/memories-pre-duckdb-upgrade-<old>-to-<new>-<ts>.duckdb`，并写一条 `runtime.duckdb_upgrade` event 锚定时间。
-- ✨ **MCP tool `get_runtime_health`**：让 LLM（Claude Code / Cursor）能主动查询 engram 健康状态。返回 `advice` 数组（可读建议）+ 完整 `doctor()` 字段，degraded mode 时 LLM 可主动提示用户跑 `engram-setup recover`。
-- ✨ **`engram-setup doctor` 输出增强**：新增 `backups`（`live_count` / `retain` / `archive_count` / `live_recent`）和 `snapshots`（`count` / `latest_seq` / `latest_size_bytes`）章节；超出 retention 时打印归档提示。
-- ✨ **Recover 报告增强**：新增 `snapshot_used` / `snapshot_seq` 字段，可清楚看到本次 recover 是从哪个 snapshot 启动的。
+- ✨ **Periodic Snapshot + Replay Acceleration** (`snapshot.py`): Async snapshot DuckDB file to `~/.engram/snapshots/snapshot-seq{N}-{ts}.duckdb` every N events (default 1000) or H hours (default 1). `engram-setup recover` loads from latest snapshot and only replays `seq > snapshot_seq` events — long-running engram no longer slows down recovery due to event accumulation.
+- ✨ **Backup Auto-Archive Policy** (`maintenance.py`): When managed files in `~/.engram/backups/` (`memories-pre-recover-*` / `memories-pre-duckdb-upgrade-*`) exceed `ENGRAM_BACKUP_RETAIN` (default 10), oldest are archived to `backups/archive/` (**move, not delete** — recoverable).
+- ✨ **DuckDB Version Upgrade Auto-Backup**: Detects `duckdb_version` minor/major changes (e.g. `1.5 → 1.6`, `0.9 → 0.10`), copies current DB to `backups/memories-pre-duckdb-upgrade-<old>-to-<new>-<ts>.duckdb` before startup, and writes a `runtime.duckdb_upgrade` event to anchor the time.
+- ✨ **MCP tool `get_runtime_health`**: LLM (Claude Code / Cursor) can proactively query engram health. Returns `advice` array (readable suggestions) + full `doctor()` fields; in degraded mode, LLM can prompt user to run `engram-setup recover`.
+- ✨ **`engram-setup doctor` output enhanced**: New `backups` (`live_count` / `retain` / `archive_count` / `live_recent`) and `snapshots` (`count` / `latest_seq` / `latest_size_bytes`) sections; prints archive hint when retention exceeded.
+- ✨ **Recover report enhanced**: New `snapshot_used` / `snapshot_seq` fields — clearly see which snapshot this recovery started from.
 
-**新增 Event Kinds**（不参与 Tier 1 replay，仅供运维审计）
+**New Event Kinds** (not involved in Tier 1 replay, for ops audit only)
 
 ```
 snapshot.create            # {snapshot_path, seq, db_size_bytes}
@@ -409,97 +441,97 @@ runtime.duckdb_upgrade     # {old_version, new_version, backup_path}
 maintenance.backup_pruned  # {archived: [...], kept, dir}
 ```
 
-**新增 Env Vars**
+**New Env Vars**
 
-| 变量 | 默认 | 说明 |
+| Variable | Default | Description |
 |---|---|---|
-| `ENGRAM_BACKUP_RETAIN` | 10 | `backups/` 保留份数，超出归档到 `archive/` |
-| `ENGRAM_SNAPSHOT_INTERVAL_EVENTS` | 1000 | 每写入多少 event 触发一次 snapshot |
-| `ENGRAM_SNAPSHOT_INTERVAL_HOURS` | 1.0 | 距离上次 snapshot 最长间隔（小时） |
-| `ENGRAM_SNAPSHOT_RETAIN` | 5 | snapshot 保留份数（旧的删除） |
+| `ENGRAM_BACKUP_RETAIN` | 10 | Number of backups to retain in `backups/`; excess archived to `archive/` |
+| `ENGRAM_SNAPSHOT_INTERVAL_EVENTS` | 1000 | Trigger snapshot after this many events written |
+| `ENGRAM_SNAPSHOT_INTERVAL_HOURS` | 1.0 | Maximum hours between snapshots |
+| `ENGRAM_SNAPSHOT_RETAIN` | 5 | Number of snapshots to retain (oldest deleted) |
 
-**升级路径**
+**Upgrade**
 
 ```bash
-pip install -U mcp-engram      # 安装命令不变
-engram-setup doctor            # 看到 backups + snapshots 新章节即升级成功
+pip install -U mcp-engram      # install command unchanged
+engram-setup doctor            # see backups + snapshots new sections = upgrade successful
 ```
 
-- 完全向前兼容 v0.10：snapshot 不存在时 recover 自动退化为全量 replay
-- 无需修改 MCP client 配置；`get_runtime_health` 是新工具，老 client 不受影响
-- 后台 maintenance 线程仅在主运行时进程启动（短期工具脚本如 doctor / recover 不触发）
+- Fully forward-compatible with v0.10: if no snapshot exists, recover falls back to full replay
+- No MCP client config changes needed; `get_runtime_health` is a new tool, old clients unaffected
+- Background maintenance thread only starts in the main runtime process (short-lived tool scripts like doctor / recover don't trigger it)
 
-**回归**
+**Regression**
 
-- 381 tests passed（v0.10 的 348 + 新增 33：`test_backup_pruner` / `test_duckdb_upgrade` / `test_runtime_health_tool` / `test_snapshot`）
-- 0 lint error
+- 381 tests passed (v0.10's 348 + 33 new: `test_backup_pruner` / `test_duckdb_upgrade` / `test_runtime_health_tool` / `test_snapshot`)
+- 0 lint errors
 
-### v0.10.0 — Durable Agent Runtime（架构重构）
+### v0.10.0 — Durable Agent Runtime (Architecture Refactor)
 
-定位升级：从 *AI Memory System* 转向 **Durable Agent Runtime**。
-主轴：`runtime durability + execution continuity`，向量召回降级为辅助。
+Positioning upgrade: from *AI Memory System* to **Durable Agent Runtime**.
+Primary axis: `runtime durability + execution continuity`; vector recall demoted to auxiliary.
 
-**两条铁律**
+**Two Laws**
 
 > Event log is the only durability primitive.
 > If it cannot be replayed, it is not critical state.
 
-**新增**
+**New**
 
-- ✨ **Append-only Event Log**：`~/.engram/events/events-YYYYMMDD.jsonl`，fsync 写入，按天滚动；Tier 1（task / checkpoint / session）写入路径全程经过日志。
-- ✨ **Replay-based Recovery**：DuckDB 缺失/损坏时可从 event log 完整重建 Tier 1。
-- ✨ **CLI**：`engram-setup doctor`（健康检查）、`engram-setup recover [--since YYYYMMDD] [--promote]`（dry-run 重建）。
-- ✨ **`engram_meta` 表**：暴露 `schema_version` / `engram_version` / `duckdb_version` / `embedding_model` / `embedding_dim` / `embedding_stale` / `last_boot_at`，供 MCP 客户端读取做版本协商。
-- ✨ **Readonly Degraded Mode**：DB 不可写时进入只读模式，写操作抛 `DegradedModeError`；HTTP 返回 503 + `recover_command`，MCP 返回 `{ok: false, code: "degraded_mode", recover_command: "engram recover"}`。
-- ✨ `tasks` 表预留 `parent_task_id` / `retry_of_task_id` 列（暂不实现，避免未来破坏性迁移）。
-- ✨ `/health` 增加 `db_readonly` / `embedding_stale` / `residue_files` / `engram_meta` 字段。
+- ✨ **Append-only Event Log**: `~/.engram/events/events-YYYYMMDD.jsonl`, fsync writes, daily rotation; Tier 1 (task / checkpoint / session) write path fully goes through the log.
+- ✨ **Replay-based Recovery**: When DuckDB is missing/corrupted, Tier 1 can be fully rebuilt from event log.
+- ✨ **CLI**: `engram-setup doctor` (health check), `engram-setup recover [--since YYYYMMDD] [--promote]` (dry-run rebuild).
+- ✨ **`engram_meta` table**: Exposes `schema_version` / `engram_version` / `duckdb_version` / `embedding_model` / `embedding_dim` / `embedding_stale` / `last_boot_at` for MCP client version negotiation.
+- ✨ **Readonly Degraded Mode**: When DB is unwritable, enters read-only mode; write ops throw `DegradedModeError`; HTTP returns 503 + `recover_command`, MCP returns `{ok: false, code: "degraded_mode", recover_command: "engram recover"}`.
+- ✨ `tasks` table pre-reserved `parent_task_id` / `retry_of_task_id` columns (not implemented yet, avoiding future breaking migrations).
+- ✨ `/health` adds `db_readonly` / `embedding_stale` / `residue_files` / `engram_meta` fields.
 
-**⚠️ 行为变更（Breaking-ish）**
+**⚠️ Behavior Changes (Breaking-ish)**
 
-- **DuckDB 损坏不再静默重建空库**：原来的 `os.replace(db, db + ".corrupt")` + 自动建空库逻辑被移除。损坏时抛 `DatabaseCorruptionError`，原文件以 `<db>.corrupt.<timestamp>` 隔离到 `~/.engram/backups/`，由用户显式 `engram-setup recover` 处理。
-  - 想保留旧行为：`ENGRAM_ALLOW_RESET=1 engram-server run`
-- **Embedding 模型/维度变化不再自动 ALTER 列**：原来的"全表清零 + ALTER COLUMN"被移除，改为标记 `embedding_stale=true`，向量检索自动 fallback 到 BM25/FTS，写入路径不阻断。
-- **WAL 启动恢复路径改进**：先尝试 `FORCE CHECKPOINT` 抢救数据，失败才将 WAL 隔离为 `<db>.wal-recovery.<timestamp>`（带时间戳，永不互相覆盖）。
-- **Shutdown 自动 CHECKPOINT**：HTTP server 关闭时主动 flush WAL，避免下次启动有残留。
+- **DB corruption no longer silently rebuilds empty DB**: The old `os.replace(db, db + ".corrupt")` + auto-create-empty logic is removed. On corruption, throws `DatabaseCorruptionError`, original file isolated as `<db>.corrupt.<timestamp>` to `~/.engram/backups/`, user explicitly runs `engram-setup recover`.
+  - To keep old behavior: `ENGRAM_ALLOW_RESET=1 engram-server run`
+- **Embedding model/dimension changes no longer auto-ALTER columns**: The old "clear all + ALTER COLUMN" is removed, replaced by marking `embedding_stale=true`; vector search auto-falls back to BM25/FTS, write path unblocked.
+- **WAL startup recovery path improved**: First attempts `FORCE CHECKPOINT` to salvage data; on failure, isolates WAL as `<db>.wal-recovery.<timestamp>` (with timestamp, never overwrites).
+- **Shutdown auto-CHECKPOINT**: HTTP server proactively flushes WAL on close, avoiding residual WAL on next startup.
 
-**升级路径**
+**Upgrade**
 
 ```bash
-pip install -U mcp-engram          # 安装命令不变
-engram-setup doctor                # 升级后建议跑一次健康检查
+pip install -U mcp-engram          # install command unchanged
+engram-setup doctor                # recommended health check after upgrade
 ```
 
-- 现有 `~/.engram/memories.duckdb` 直接复用，schema 自动 `ALTER ... ADD COLUMN IF NOT EXISTS`。
-- Event log 从此刻起累积；升级前写入的数据仍依赖 DB 文件本身（无 event log 可 replay）。
-- MCP client 配置不需要改。
+- Existing `~/.engram/memories.duckdb` reused directly; schema auto-`ALTER ... ADD COLUMN IF NOT EXISTS`.
+- Event log starts accumulating from this point; pre-upgrade data still relies on the DB file itself (no event log to replay).
+- MCP client config doesn't need changes.
 
-**回归**
+**Regression**
 
-- 348 tests passed（新增 17 个：`test_event_log` / `test_recover` / `test_degraded_mode`）。
-- 0 lint error。
+- 348 tests passed (17 new: `test_event_log` / `test_recover` / `test_degraded_mode`).
+- 0 lint errors.
 
-### v0.9.x（历史）
+### v0.9.x (Historical)
 
-- Checkpoint v2 — 版本化 cognitive checkpoint，event-first 触发（6 类 reason），`restore_checkpoint` / `list_checkpoints` 上线。
-- Task 一等实体；Session Lifecycle；Handoff Validation；Memory Quality Score；Error-aware Memory。
+- Checkpoint v2 — versioned cognitive checkpoint, event-first trigger (6 reason types), `restore_checkpoint` / `list_checkpoints` live.
+- Task as first-class entity; Session Lifecycle; Handoff Validation; Memory Quality Score; Error-aware Memory.
 
 ---
 
-## 参与贡献
+## Contributing
 
-欢迎通过以下方式参与：
+Contributions welcome:
 
-1. **提交 Issue** — 报告 Bug 或提出功能建议
-2. **提交 PR** — Fork → 新建分支 → 提交 PR
+1. **Issues** — Report bugs or suggest features
+2. **Pull Requests** — Fork → new branch → submit PR
 
 ```bash
 git clone https://github.com/hugfeature/engram.git
 cd engram
 pip install -e ".[dev]"
-pytest tests/ -v       # 确保测试通过
+pytest tests/ -v       # make sure tests pass
 ```
 
-## 项目负责人
+## Maintainer
 
 - [@hugfeature](https://github.com/hugfeature)
 
@@ -509,4 +541,4 @@ pytest tests/ -v       # 确保测试通过
 
 ---
 
-> **Cognitive Continuation Layer — 我们恢复的是 agent 的 cognition，不是 machine 的 execution。**
+> **Cognitive Continuation Layer — we restore an agent's cognition, not a machine's execution.**
