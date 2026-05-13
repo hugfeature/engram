@@ -39,6 +39,15 @@ class TestHealthAndTools:
         names = [t["name"] for t in r.json()["tools"]]
         assert "recall_memory" in names
         assert "store_memory" in names
+        assert "get_runtime_health" in names
+
+    def test_runtime_health_endpoint(self, client):
+        r = client.post("/v1/runtime-health", json={})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is True
+        assert "db" in data
+        assert "event_log" in data
 
 
 class TestStore:
