@@ -239,6 +239,10 @@ Data directory `~/.engram/`: `memories.duckdb` (single-file DB) + `graph.json` (
 
 Supports macOS / Linux / WSL2, Python 3.11+, ~500MB model cache.
 
+If your MCP host has strict startup timeouts, Engram boots in a fast path by
+default (no eager embedding-model dimension probe). To force eager dimension
+detection during boot, set `ENGRAM_EAGER_DIM_DETECT=1`.
+
 ---
 
 ## Benchmark
