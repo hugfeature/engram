@@ -53,6 +53,7 @@ TOOL_REST_MAP: dict[str, str] = {
     "list_tasks": "/v1/tasks/list",
     "restore_checkpoint": "/v1/checkpoints/restore",
     "list_checkpoints": "/v1/checkpoints/list",
+    "get_runtime_health": "/v1/runtime-health",
     "report_interruption": "/v1/report-interruption",
     "evaluate_continuity": "/v1/continuity",
 }

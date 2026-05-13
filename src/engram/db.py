@@ -166,15 +166,20 @@ def _dim() -> int:
     if cached_dim is not None:
         return cached_dim
 
-    # 3) No existing data — detect from model
-    try:
-        dim = get_dimensions()
-        os.makedirs(ENGRAM_DIR, exist_ok=True)
-        with open(cache, "w") as f:
-            f.write(f"{MODEL_NAME}:{dim}")
-        return dim
-    except Exception:
-        return _DEFAULT_DIM
+    # 3) No existing data — prefer fast startup over eager model probing.
+    # Loading sentence-transformers here can block MCP boot and trigger
+    # proxy startup timeouts. Use default dim unless explicitly opted into
+    # eager detection.
+    if os.environ.get("ENGRAM_EAGER_DIM_DETECT", "0") == "1":
+        try:
+            dim = get_dimensions()
+            os.makedirs(ENGRAM_DIR, exist_ok=True)
+            with open(cache, "w") as f:
+                f.write(f"{MODEL_NAME}:{dim}")
+            return dim
+        except Exception:
+            return _DEFAULT_DIM
+    return _DEFAULT_DIM
 
 
 def _read_db_dimension(db_path: str) -> int | None:
