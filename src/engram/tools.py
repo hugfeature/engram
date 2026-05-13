@@ -44,7 +44,9 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="store_memory",
-        description="Store a new memory. Automatically deduplicates against existing memories.",
+        description="Store a new memory (WRITE with side effects). Automatically deduplicates against existing memories "
+                    "and may reinforce/merge/replace an existing memory instead of creating a new row. "
+                    "importance should be in [0.0, 1.0] (recommended 0.4-0.8; invalid values are clamped).",
         inputSchema={
             "type": "object",
             "properties": {
@@ -99,7 +101,9 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="consolidate_memory",
-        description="Scan all memories and auto-merge similar ones. Reduces bloat and keeps knowledge clean.",
+        description="Scan all memories and auto-merge similar ones (WRITE with side effects). "
+                    "Reduces bloat but can rewrite existing memory content/importance after merge. "
+                    "Do not call during sensitive audits that require byte-for-byte historical wording stability.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -113,7 +117,9 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="session_handoff",
-        description="Record structured end-of-session state for cross-session continuity. Creates a searchable handoff snapshot.",
+        description="Record structured end-of-session state for cross-session continuity (WRITE with side effects). "
+                    "Creates a searchable handoff snapshot and may trigger checkpointing. "
+                    "Call near session end or before agent switch; avoid calling repeatedly during active implementation loops.",
         inputSchema={
             "type": "object",
             "properties": {
