@@ -13,6 +13,7 @@ from mcp.types import TextContent
 from .pruner import start_scheduler
 from .tools import TOOL_SCHEMAS
 from .shared import get_db, get_graph, dispatch_tool,trigger_interrupt_checkpoint
+from .snapshot import start_checkpoint_scheduler, stop_checkpoint_scheduler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +40,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 def main():
     global _scheduler
     _scheduler = start_scheduler(get_db(), get_graph())
+    start_checkpoint_scheduler()
     log.info("Engram MCP server starting (stdio mode)")
 
     async def _run():
@@ -50,6 +52,7 @@ def main():
     finally:
         log.info("server.py finally block reached — calling trigger_interrupt_checkpoint")
         trigger_interrupt_checkpoint()
+        stop_checkpoint_scheduler()
         if _scheduler:
             _scheduler.shutdown(wait=False)
             log.info("Scheduler shut down")

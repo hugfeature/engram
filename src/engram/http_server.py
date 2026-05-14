@@ -20,6 +20,7 @@ from .shared import (
     get_db, get_graph, dispatch_tool, dispatch_rest,
     TOOL_REST_MAP,trigger_interrupt_checkpoint,
 )
+from .snapshot import start_checkpoint_scheduler, stop_checkpoint_scheduler
 from . import __version__
 
 logging.basicConfig(
@@ -74,6 +75,7 @@ async def lifespan(app: FastAPI):
     try:
         if shared._db is not None and shared._graph is not None:
             scheduler = start_scheduler(shared._db, shared._graph)
+            start_checkpoint_scheduler()
     except Exception as e:
         log.warning("Scheduler init failed: %s", e)
     log.info("Engram server started (REST + MCP)")
@@ -84,6 +86,7 @@ async def lifespan(app: FastAPI):
         trigger_interrupt_checkpoint()
     except Exception as e:
         log.debug("Interrupt checkpoint on shutdown failed: %s", e)
+    stop_checkpoint_scheduler()
     if scheduler:
         try:
             scheduler.shutdown(wait=False)

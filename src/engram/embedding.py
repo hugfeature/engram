@@ -54,7 +54,11 @@ def try_recover() -> bool:
 
 
 def _load_model_in_thread(result: dict, cache_dir: str):
-    """Load model inside a thread so we can apply a timeout."""
+    """Load model inside a thread so we can apply a timeout.
+    
+    DEPRECATED: This function is no longer used due to ARM SIGBUS crash.
+    Model loading is now done sequentially in _get_model().
+    """
     try:
         from sentence_transformers import SentenceTransformer
         try:
@@ -78,25 +82,20 @@ def _get_model() -> SentenceTransformer | None:
                 cache_dir = os.path.join(os.path.expanduser("~"), ".engram", "model_cache")
                 os.makedirs(cache_dir, exist_ok=True)
 
-                result: dict = {}
-                loader = threading.Thread(
-                    target=_load_model_in_thread, args=(result, cache_dir), daemon=True
-                )
-                loader.start()
-                loader.join(timeout=MODEL_LOAD_TIMEOUT)
-
-                if loader.is_alive():
-                    log.error(
-                        "Model loading timed out after %ds — entering degraded mode",
-                        MODEL_LOAD_TIMEOUT,
-                    )
-                    _degraded = True
-                    # Don't return immediately — the daemon thread may still finish.
-                    # If it completes later, try_recover() can restore normal mode.
-                    return None
-
-                if "error" in result:
-                    log.error("Model loading failed: %s — entering degraded mode", result["error"])
+                # FIX: Disable background thread loading to prevent ARM SIGBUS crash
+                # Python 3.13 + ARM architecture has C extension concurrency issues
+                # when loading embedding model and DuckDB VSS simultaneously
+                try:
+                    from sentence_transformers import SentenceTransformer
+                    try:
+                        m = SentenceTransformer(MODEL_NAME, cache_folder=cache_dir, local_files_only=True)
+                    except Exception:
+                        m = SentenceTransformer(MODEL_NAME, cache_folder=cache_dir)
+                    m.encode("warmup", normalize_embeddings=True)
+                    _model = m
+                    log.info("Embedding model loaded successfully (sequential mode)")
+                except Exception as e:
+                    log.error("Model loading failed: %s — entering degraded mode", e)
                     _degraded = True
                     return None
 

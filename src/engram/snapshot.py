@@ -349,3 +349,59 @@ def _try_emit_event(kind: str, payload: dict) -> None:
         get_event_log().append(kind, payload)
     except Exception as exc:
         log.debug("event emit %s skipped: %s", kind, exc)
+
+
+# ---------------------------------------------------------------------------
+# Periodic interrupt checkpoint scheduler
+# ---------------------------------------------------------------------------
+
+_checkpoint_scheduler = None
+_checkpoint_scheduler_lock = threading.Lock()
+
+
+def _run_interrupt_checkpoint() -> None:
+    """Call trigger_interrupt_checkpoint() safely for scheduler."""
+    try:
+        from .shared import trigger_interrupt_checkpoint
+        result = trigger_interrupt_checkpoint()
+        if result:
+            log.info("Periodic interrupt checkpoint completed")
+    except Exception as exc:
+        log.warning("Periodic interrupt checkpoint failed: %s", exc)
+
+
+def start_checkpoint_scheduler() -> None:
+    """Start a 2-minute interrupt checkpoint cycle using APScheduler.
+
+    This creates a periodic checkpoint independent of exit signals,
+    ensuring continuity state is persisted even during long-running sessions.
+    """
+    global _checkpoint_scheduler
+    with _checkpoint_scheduler_lock:
+        if _checkpoint_scheduler is not None:
+            return
+        try:
+            from apscheduler.schedulers.background import BackgroundScheduler
+
+            scheduler = BackgroundScheduler()
+            scheduler.add_job(
+                _run_interrupt_checkpoint,
+                "interval",
+                minutes=2,
+                id="interrupt_checkpoint",
+            )
+            scheduler.start()
+            _checkpoint_scheduler = scheduler
+            log.info("Interrupt checkpoint scheduler started: every 2 minutes")
+        except ImportError:
+            log.warning("APScheduler not installed, periodic checkpoint disabled")
+
+
+def stop_checkpoint_scheduler() -> None:
+    """Stop the periodic checkpoint scheduler."""
+    global _checkpoint_scheduler
+    with _checkpoint_scheduler_lock:
+        if _checkpoint_scheduler is not None:
+            _checkpoint_scheduler.shutdown()
+            _checkpoint_scheduler = None
+            log.info("Interrupt checkpoint scheduler stopped")
