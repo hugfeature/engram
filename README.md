@@ -1,13 +1,13 @@
 # Engram
 
-**Cross-session task continuity and memory for MCP-aware AI coding agents**
+**Runtime continuity and interruption recovery for AI coding agents**
 
 [![PyPI](https://img.shields.io/pypi/v/mcp-engram)](https://pypi.org/project/mcp-engram/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Tests](https://img.shields.io/badge/tests-456%20passed-brightgreen)](https://github.com/hugfeature/engram)
 
-> Engram gives Claude Code, Cursor, and OpenHands a **persistent memory** and **checkpoint-based recovery** so agents continue tasks after interruptions instead of starting from scratch.
+> Engram gives Claude Code, Cursor, and OpenHands **resumable execution** — recover agent working state after context collapse, interruption, or session termination. Agents continue from where they stopped, not from zero.
 
 [中文文档](./README_CN.md) · [PyPI](https://pypi.org/project/mcp-engram/) · [Glama](https://glama.ai/mcp/servers/hugfeature/engram)
 
@@ -17,12 +17,13 @@
 
 Every AI agent session is an island:
 
-| Situation                       | Without Engram                       | With Engram                                |
-| ------------------------------- | ------------------------------------ | ------------------------------------------ |
-| Context window full             | Agent loses history, starts guessing | Checkpoint restored, constraints preserved |
-| Switch agents (Claude → Cursor) | Start from scratch                   | Structured handoff with task state         |
-| Same bug hits twice             | No memory of previous fix            | Failure record surfaces automatically      |
-| 3-session task                  | No one knows overall progress        | Task state + continuity metrics available  |
+| Situation                       | Without Engram                       | With Engram                                       |
+| ------------------------------- | ------------------------------------ | ------------------------------------------------- |
+| Context window full             | Agent loses history, starts guessing | Checkpoint restored, constraints preserved        |
+| Process killed / server restart | All working state lost               | Auto-checkpoint on SIGTERM, resume on next recall |
+| Switch agents (Claude → Cursor) | Start from scratch                   | Structured handoff with task state                |
+| Same bug hits twice             | No memory of previous fix            | Failure record surfaces automatically             |
+| 3-session task                  | No one knows overall progress        | Task state + continuity metrics available         |
 
 ---
 
@@ -47,6 +48,61 @@ Add to your Claude Code / Cursor config:
 ```
 
 That's it. Engram runs fully locally — no cloud, no API keys, no telemetry.
+
+---
+
+## Interruption Recovery
+
+When a session ends unexpectedly — context overflow, process kill, IDE crash — Engram automatically captures a structured working state on shutdown:
+
+```
+SIGTERM / context collapse
+        ↓
+Engram auto-checkpoint
+  goal · completed · in_progress · blocked
+  modified_files (git diff) · last_tool_called · last_failure
+        ↓
+Agent restarts → recall_memory()
+        ↓
+interrupt_recovery injected into response
+  → "Call restore_checkpoint(task_id=X) to resume"
+```
+
+No manual intervention. The next agent session picks up the hint automatically on first `recall_memory` call.
+
+**Generate a CLAUDE.md snippet from current state:**
+
+```bash
+engram-prompt
+```
+
+Output (paste into your project's `CLAUDE.md`):
+
+```markdown
+## Engram Runtime State
+
+**Active task:** 10 — Fix the auth bug in login.py
+**Checkpoint:** v3 (confidence: 0.71)
+
+**Already completed (do not redo):**
+
+- Reproduced the bug in test_auth.py
+
+**In progress:**
+
+- Tracing the JWT validation path
+
+**Files modified in last session:**
+
+- `src/auth/validator.py`
+- `tests/test_auth.py`
+
+## Engram Session Rules
+
+- Session start: recall_memory(query) — interrupt state auto-pinned
+- Resume task: restore_checkpoint(task_id=10)
+- Context filling up: report_interruption(reason="overflow") then session_handoff(...)
+```
 
 ---
 
@@ -102,18 +158,18 @@ Agent A (Claude Code)                  Agent B (Cursor)
   │                                        │
   ├─ create_task(name, goal)               │
   ├─ track_progress / track_failure        │
-  ├─ ⚡ Interrupted                        │
-  ├─ session_handoff(summary, ...)         │
+  ├─ ⚡ Interrupted (SIGTERM / overflow)   │
+  ├─ [auto] interrupt checkpoint saved     │
   │        │                               │
   │   ┌────▼────────────────┐              │
   │   │  Engram Checkpoint  │              │
   │   │  goal               │              │
   │   │  completed          │              │
   │   │  must_not_redo  ────┼──────────▶   │
-  │   │  must_preserve      │             ├─ restore_checkpoint(task_id)
-  │   │  working_set        │             ├─ recall_memory → handoff pinned
-  │   └─────────────────────┘             ├─ continue, not from zero
-  │                                       └─ session_handoff → next agent...
+  │   │  must_preserve      │             ├─ recall_memory() → interrupt_recovery pinned
+  │   │  modified_files     │             ├─ restore_checkpoint(task_id)
+  │   │  working_set        │             ├─ continue, not from zero
+  │   └─────────────────────┘             └─ session_handoff → next agent...
 ```
 
 **Continuation package fields**: `goal` · `completed` · `in_progress` · `blocked` · `preferred_next` · `must_not_redo` (negative memory) · `must_preserve` (invariants) · `working_set` · `continuation_confidence`
@@ -122,17 +178,17 @@ Agent A (Claude Code)                  Agent B (Cursor)
 
 ## Recommended CLAUDE.md Instructions
 
-Paste this into your project's `CLAUDE.md` so the agent uses Engram automatically:
+Run `engram-prompt` to auto-generate this from your current state, or paste manually:
 
 ```markdown
-## Engram Memory Rules
+## Engram Session Rules
 
 - Task start: create_task(name, goal) → save the task_id
-- Session begin: recall_memory(query) — latest handoff auto-pinned + failure history
+- Session begin: recall_memory(query) — latest handoff + interrupt state auto-pinned
 - Task takeover: restore_checkpoint(task_id, memory_restore_mode="SELECTIVE")
 - Progress update: track_progress(feature, status, task_id=<id>)
 - On error: track_failure(error, component, root_cause, task_id=<id>)
-- Before interruption: report_interruption(reason="overflow") if context window filling
+- Context filling up: report_interruption(reason="overflow") then session_handoff(...)
 - Session end: session_handoff(summary, completed, in_progress, blocked, next_steps, task_id=<id>)
 ```
 
@@ -228,9 +284,9 @@ Full variable list: `src/engram/config.py`
 
 ## What Engram Is Not
 
-- ❌ General agent runtime or workflow orchestration (that's LangGraph, Temporal)
-- ❌ Custom agent loop or prompt orchestration (handled by the MCP client)
 - ❌ Guaranteed identical LLM behavior after recovery (LLM non-determinism is a physical constraint)
+- ❌ Custom agent loop or prompt orchestration (handled by the MCP client)
+- ❌ Multi-agent coordination or shared team memory (single-user, local-first)
 
 ---
 
@@ -259,4 +315,4 @@ Issues and PRs welcome.
 
 ---
 
-> _Engram restores an agent's cognition, not a machine's execution state._
+> _Engram restores an agent's working state, not just its memories._

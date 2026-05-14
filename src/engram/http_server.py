@@ -18,7 +18,7 @@ from .tools import TOOL_SCHEMAS
 from . import shared
 from .shared import (
     get_db, get_graph, dispatch_tool, dispatch_rest,
-    TOOL_REST_MAP,
+    TOOL_REST_MAP,trigger_interrupt_checkpoint,
 )
 from . import __version__
 
@@ -79,6 +79,10 @@ async def lifespan(app: FastAPI):
     log.info("Engram server started (REST + MCP)")
     async with session_mgr.run():
         yield
+    try:
+        trigger_interrupt_checkpoint()
+    except Exception as e:
+        log.debug("Interrupt checkpoint on shutdown failed: %s", e)
     if scheduler:
         try:
             scheduler.shutdown(wait=False)

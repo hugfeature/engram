@@ -858,6 +858,25 @@ class MemoryDB:
                 self.conn.execute(ddl)
             except Exception as e:
                 log.debug("CREATE INDEX on checkpoints skipped: %s", e)
+        # DuckDB sequences can drift from actual max(id) after WAL replay.
+        # Realign each sequence to the table's MAX(id) to prevent PK conflicts.
+        for tbl, seq in [
+            ("memories", "memory_id_seq"),
+            ("session_memory_log", "session_log_id_seq"),
+            ("session_outcome_log", "session_outcome_id_seq"),
+            ("tasks", "task_id_seq"),
+            ("checkpoints", "checkpoint_id_seq"),
+        ]:
+            try:
+                max_id = self.conn.execute(
+                    f"SELECT COALESCE(MAX(id), 0) FROM {tbl}"
+                ).fetchone()[0]
+                if max_id > 0:
+                    self.conn.execute(
+                        f"SELECT setval('{seq}', {max_id})"
+                    )
+            except Exception as e:
+                log.debug("Sequence sync for %s skipped: %s", tbl, e)
         self._init_vss()
         self._init_meta()
         self._backfill_null_embeddings()
@@ -1612,6 +1631,29 @@ class MemoryDB:
                 [user_id],
             )
         return [self._row_to_task(r) for r in rows]
+
+    def get_latest_interrupt_checkpoint(self, user_id: str = "default") -> dict | None:
+        """Return the most recent auto-interrupt checkpoint across all tasks.
+
+        Looks for AUTO_SAVE checkpoints triggered by process_exit — these are
+        the ones written by trigger_interrupt_checkpoint() on SIGTERM.
+        Returns a raw dict (same shape as checkpoint._row_to_checkpoint) or None.
+        """
+        from .checkpoint import _row_to_checkpoint
+        row = self._fetchone_dict(
+            """
+            SELECT * FROM checkpoints
+            WHERE user_id = ?
+              AND checkpoint_reason = 'AUTO_SAVE'
+              AND triggered_by_event = 'process_exit'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            [user_id],
+        )
+        if not row:
+            return None
+        return _row_to_checkpoint(row)
 
     def get_task_memories(self, task_id: int, user_id: str = "default") -> list[MemoryRow]:
         """Get all memories associated with a task via metadata.task_id."""

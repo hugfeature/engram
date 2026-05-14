@@ -12,7 +12,7 @@ from mcp.types import TextContent
 
 from .pruner import start_scheduler
 from .tools import TOOL_SCHEMAS
-from .shared import get_db, get_graph, dispatch_tool
+from .shared import get_db, get_graph, dispatch_tool,trigger_interrupt_checkpoint
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +48,7 @@ def main():
     try:
         asyncio.run(_run())
     finally:
+        trigger_interrupt_checkpoint()
         if _scheduler:
             _scheduler.shutdown(wait=False)
             log.info("Scheduler shut down")
