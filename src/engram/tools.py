@@ -560,3 +560,52 @@ TOOL_SCHEMAS: list[Tool] = [
         },
     ),
 ]
+
+# --- Tool Definition Quality enrichment (Glama scoring helpers) ---
+# Add concise, structured usage and behavior notes to every tool description.
+_TDQ_NOTES: dict[str, dict[str, str]] = {
+    "recall_memory": {
+        "when": "Call at session/task start or before a major decision.",
+        "side_effects": "Read-only.",
+    },
+    "store_memory": {
+        "when": "Call when a new durable fact/lesson should survive sessions.",
+        "side_effects": "Writes memory; may dedup as reinforce/merge/replace.",
+    },
+    "update_memory": {
+        "when": "Call only when a specific memory_id must be corrected.",
+        "side_effects": "Writes memory content/importance.",
+    },
+    "consolidate_memory": {
+        "when": "Call during maintenance windows to reduce memory bloat.",
+        "side_effects": "Writes/rewrites memory rows via merges.",
+    },
+    "session_handoff": {
+        "when": "Call near session end or before agent handoff.",
+        "side_effects": "Writes handoff and may trigger checkpoint creation.",
+    },
+    "memory_stats": {"when": "Call for diagnostics and monitoring.", "side_effects": "Read-only."},
+    "track_failure": {"when": "Call immediately after a failure is understood.", "side_effects": "Writes failure memory and checkpoint context."},
+    "track_progress": {"when": "Call after meaningful progress/status change.", "side_effects": "Writes progress memory and checkpoint context."},
+    "session_outcome": {"when": "Call once per session after success/failure is known.", "side_effects": "Writes outcome signals that affect memory quality weighting."},
+    "create_task": {"when": "Call at the beginning of a multi-step objective.", "side_effects": "Writes a new task record."},
+    "update_task": {"when": "Call when task status/goal/metadata changes.", "side_effects": "Writes task fields."},
+    "get_task": {"when": "Call when taking over an existing task.", "side_effects": "Read-only."},
+    "list_tasks": {"when": "Call to discover active/planning/blocked tasks.", "side_effects": "Read-only."},
+    "restore_checkpoint": {"when": "Call on takeover after interruption.", "side_effects": "Read-only restore payload; does not mutate task state."},
+    "list_checkpoints": {"when": "Call for timeline/debugging of checkpoint versions.", "side_effects": "Read-only."},
+    "get_runtime_health": {"when": "Call when backend appears degraded or before risky operations.", "side_effects": "Read-only."},
+    "report_interruption": {"when": "Call before exit when interruption reason is known.", "side_effects": "Writes interruption taxonomy for next-session recovery."},
+    "evaluate_continuity": {"when": "Call after recovery to score continuity quality.", "side_effects": "Read-only scoring output."},
+}
+
+for _tool in TOOL_SCHEMAS:
+    _notes = _TDQ_NOTES.get(_tool.name)
+    if not _notes:
+        continue
+    _suffix = (
+        f" Usage: {_notes['when']} "
+        f"Behavior: {_notes['side_effects']}"
+    )
+    if _suffix not in _tool.description:
+        _tool.description = f"{_tool.description} {_suffix}"
