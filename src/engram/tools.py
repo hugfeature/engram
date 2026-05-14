@@ -7,35 +7,47 @@ from mcp.types import Tool
 TOOL_SCHEMAS: list[Tool] = [
     Tool(
         name="recall_memory",
-        description="Search memories by semantic similarity. Call at the start of every task. "
-                    "Use memory_type to filter by type (e.g. 'handoff' to find session handoffs).",
+        description=(
+            "Retrieve the most relevant memories for a query using hybrid search "
+            "(40% BM25 keyword + 60% vector similarity weighted by decay strength), "
+            "extended by semantic-graph BFS expansion to depth 2. "
+            "Call at the start of every task or whenever prior context may be relevant. "
+            "Do NOT call for purely ephemeral one-shot questions with no historical context. "
+            "Use memory_type to narrow results: 'handoff' for session continuity, "
+            "'failure' for bug/error history, 'progress' for feature state. "
+            "Each recall increments recall_count of returned memories, slowing their decay "
+            "(reinforcement side effect). No data is written or deleted."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Keywords or sentence to search for",
+                    "description": "Natural-language search string; use key concepts of the current task. More specific queries return more precise results.",
                 },
                 "user_id": {
                     "type": "string",
-                    "description": "User identifier",
+                    "description": "Memory partition key. Must match the value used in store_memory.",
                     "default": "default",
                 },
                 "top_k": {
                     "type": "integer",
-                    "description": "Number of results to return",
+                    "description": "Number of memories to return (1–20, default 5). Increase for broad context; keep low for focused lookups.",
                     "default": 5,
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "Optional session identifier for tracking which memories were used",
+                    "description": "Optional session identifier. When provided, recalled memories are tracked for session_outcome reinforcement.",
                 },
                 "memory_type": {
                     "type": "string",
                     "enum": ["all", "handoff", "failure", "progress"],
-                    "description": "Filter results by memory type. 'handoff' returns session handoffs, "
-                                   "'failure' returns failure records, 'progress' returns progress snapshots. "
-                                   "Default 'all' returns everything with the latest handoff auto-pinned to top.",
+                    "description": (
+                        "'all' (default): everything, with the latest handoff auto-pinned to top. "
+                        "'handoff': session continuity snapshots only. "
+                        "'failure': structured bug/error records only. "
+                        "'progress': feature/task progress snapshots only."
+                    ),
                     "default": "all",
                 },
             },
@@ -44,34 +56,46 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="store_memory",
-        description="Store a new memory (WRITE with side effects). Automatically deduplicates against existing memories "
-                    "and may reinforce/merge/replace an existing memory instead of creating a new row. "
-                    "importance should be in [0.0, 1.0] (recommended 0.4-0.8; invalid values are clamped).",
+        description=(
+            "Store a new memory with automatic deduplication (WRITE — has side effects). "
+            "Similarity thresholds determine outcome: "
+            "≥0.85 → REINFORCE existing memory (increments recall_count, no new row); "
+            "0.65–0.84 → MERGE compatible memories or REPLACE contradictions; "
+            "<0.65 → NEW record created. "
+            "Call whenever the agent learns something that should persist across sessions: "
+            "user preferences, architecture decisions, validated strategies, recurring failures. "
+            "importance controls decay rate and retrieval ranking: "
+            "0.9–1.0 = permanent facts; 0.7–0.8 = strong preferences; "
+            "0.5 = ordinary project facts; 0.2–0.3 = temporary context. "
+            "category controls half-life: strategy (~38d), fact (~24d), assumption (~19d), failure (~11d). "
+            "Side effects: writes to DuckDB; may modify an existing record on MERGE/REPLACE; "
+            "triggers graph edge recalculation."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "content": {
                     "type": "string",
-                    "description": "The memory content (one sentence preferred)",
+                    "description": "Memory text (one sentence preferred). Vague content degrades retrieval quality.",
                 },
                 "importance": {
                     "type": "number",
-                    "description": "0.0-1.0, how important this memory is",
+                    "description": "Float in [0.0, 1.0]. Invalid values are clamped. Recommended 0.4–0.8 for most memories.",
                 },
                 "category": {
                     "type": "string",
                     "enum": ["fact", "assumption", "failure", "strategy"],
-                    "description": "Memory category (controls decay rate)",
+                    "description": "Controls decay rate. strategy: λ=0.10 (~38d half-life). fact: λ=0.16 (~24d). assumption: λ=0.20 (~19d). failure: λ=0.35 (~11d).",
                     "default": "fact",
                 },
                 "user_id": {
                     "type": "string",
-                    "description": "User identifier",
+                    "description": "Memory partition key.",
                     "default": "default",
                 },
                 "metadata": {
                     "type": "object",
-                    "description": "Optional structured metadata (e.g. failure attribution, feature state)",
+                    "description": "Optional JSON-serialisable dict for extra structured fields (e.g. failure attribution, feature state).",
                 },
             },
             "required": ["content", "importance"],
@@ -79,21 +103,30 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="update_memory",
-        description="Update an existing memory by ID with new content.",
+        description=(
+            "Update the content and/or importance of an existing memory by ID (WRITE — has side effects). "
+            "Use when you already know the memory_id (returned by store_memory or recall_memory) "
+            "and want to correct or extend a specific record without triggering full deduplication. "
+            "For content that contradicts an existing memory when you don't have the ID, "
+            "use store_memory instead — contradiction detection handles replacement automatically. "
+            "Passing an invalid or non-existent memory_id returns an error; no record is created. "
+            "Side effects: overwrites content; recalculates embedding vector and graph edges. "
+            "Does NOT reset recall_count or strength."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "memory_id": {
                     "type": "integer",
-                    "description": "ID of the memory to update",
+                    "description": "ID of the memory to update. Must be a valid existing ID.",
                 },
                 "new_content": {
                     "type": "string",
-                    "description": "New content for the memory",
+                    "description": "Replacement text. Triggers embedding and graph edge recalculation.",
                 },
                 "importance": {
                     "type": "number",
-                    "description": "New importance (0.0-1.0), optional",
+                    "description": "New importance in [0.0, 1.0]. If omitted, existing importance is preserved.",
                 },
             },
             "required": ["memory_id", "new_content"],
@@ -101,15 +134,24 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="consolidate_memory",
-        description="Scan all memories and auto-merge similar ones (WRITE with side effects). "
-                    "Reduces bloat but can rewrite existing memory content/importance after merge. "
-                    "Do not call during sensitive audits that require byte-for-byte historical wording stability.",
+        description=(
+            "Manually trigger a full memory consolidation cycle (WRITE — has side effects). "
+            "Clusters similar memories (cosine ≥0.70), merges redundant records, rebuilds graph edges, "
+            "and prunes memories with strength <0.05 (unless graph-protected by strong neighbours). "
+            "Runs automatically every 12 hours in the background. "
+            "Call manually only for immediate clean-up: after large batch store_memory calls, "
+            "or before querying memory_stats for accurate counts. "
+            "Do NOT call during sensitive audits requiring byte-for-byte historical wording stability. "
+            "Side effects: DELETES memories with strength <0.05 that are not graph-protected; "
+            "MODIFIES content of merged memories; recalculates all embeddings and graph edges. "
+            "This operation is irreversible."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "user_id": {
                     "type": "string",
-                    "description": "User identifier",
+                    "description": "Memory partition key to consolidate.",
                     "default": "default",
                 },
             },
@@ -117,44 +159,51 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="session_handoff",
-        description="Record structured end-of-session state for cross-session continuity (WRITE with side effects). "
-                    "Creates a searchable handoff snapshot and may trigger checkpointing. "
-                    "Call near session end or before agent switch; avoid calling repeatedly during active implementation loops.",
+        description=(
+            "Record a structured end-of-session summary for cross-session continuity (WRITE — has side effects). "
+            "Creates a searchable handoff snapshot and may trigger checkpointing. "
+            "Call once near session end or before an agent switch whenever multi-session continuity matters. "
+            "Avoid calling repeatedly during active implementation loops. "
+            "Do NOT call for short one-off interactions. "
+            "Stored as a high-importance 'strategy' memory (λ=0.10, ~38d half-life) "
+            "so it survives long gaps between sessions. "
+            "Side effects: writes one or more memory records; triggers deduplication against prior handoff summaries."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "summary": {
                     "type": "string",
-                    "description": "One-paragraph summary of the session's work",
+                    "description": "One-paragraph summary of the session's work. Required.",
                 },
                 "completed": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List of completed items",
+                    "description": "Task/subtask strings finished in this session.",
                 },
                 "in_progress": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List of in-progress items",
+                    "description": "Items currently being worked on.",
                 },
                 "blocked": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List of blocked items with reasons",
+                    "description": "Blocked items with reason for each block.",
                 },
                 "next_steps": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Recommended next actions",
+                    "description": "Recommended actions for the next session.",
                 },
                 "user_id": {
                     "type": "string",
-                    "description": "User identifier",
+                    "description": "Memory partition key.",
                     "default": "default",
                 },
                 "task_id": {
                     "type": "integer",
-                    "description": "Optional task ID to associate this handoff with a tracked task",
+                    "description": "Optional task ID to associate this handoff with a tracked task.",
                 },
             },
             "required": ["summary"],
@@ -162,13 +211,20 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="memory_stats",
-        description="Get memory system statistics: total count, category distribution, average strength, last maintenance time.",
+        description=(
+            "Return aggregate statistics for a user's memory partition (read-only, no side effects). "
+            "Includes total record count, per-category breakdown, average strength, last maintenance time, "
+            "failure trends by component and severity, and active feature progress snapshots. "
+            "Use to get an overview of memory health, diagnose which components have the most failures, "
+            "or surface all in-progress features before planning the next session. "
+            "For accurate counts, call consolidate_memory first if a large batch was recently stored."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "user_id": {
                     "type": "string",
-                    "description": "User identifier",
+                    "description": "Memory partition key.",
                     "default": "default",
                 },
             },
@@ -176,46 +232,53 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="track_failure",
-        description="Record a structured failure event (bug, test failure, deployment issue). "
-                    "Enforces consistent schema for pattern analysis across sessions.",
+        description=(
+            "Record a structured failure event — bug, test failure, or deployment incident (WRITE — has side effects). "
+            "Enforces consistent schema so failure patterns can be queried by component or severity across sessions. "
+            "Call whenever a non-trivial error is encountered during coding or deployment. "
+            "Do NOT use for expected/handled exceptions that require no follow-up. "
+            "severity maps to importance: critical→0.9, major→0.7, minor→0.5. "
+            "Stored under category 'failure' (λ=0.35, ~11d half-life) so stale fixes expire naturally. "
+            "Side effects: writes one memory record; increments failure counters in memory_stats."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "error": {
                     "type": "string",
-                    "description": "The error message or failure description",
+                    "description": "Human-readable description of the error or failure.",
                 },
                 "component": {
                     "type": "string",
-                    "description": "Component/module where the failure occurred (e.g. 'auth', 'payment', 'ci-pipeline')",
+                    "description": "Logical component or module name (e.g. 'auth', 'payment', 'ci-pipeline'). Used for aggregated failure stats.",
                 },
                 "root_cause": {
                     "type": "string",
-                    "description": "Root cause analysis (why it failed)",
+                    "description": "Diagnosed underlying cause (why it failed).",
                 },
                 "severity": {
                     "type": "string",
                     "enum": ["critical", "major", "minor"],
-                    "description": "Impact severity",
+                    "description": "Impact severity. Maps to importance: critical→0.9, major→0.7, minor→0.5.",
                     "default": "major",
                 },
                 "fix": {
                     "type": "string",
-                    "description": "How it was fixed, or proposed fix",
+                    "description": "Fix applied or recommended fix.",
                 },
                 "related_test_ids": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "IDs or names of related test cases",
+                    "description": "IDs or names of test cases that cover this failure.",
                 },
                 "user_id": {
                     "type": "string",
-                    "description": "User identifier",
+                    "description": "Memory partition key.",
                     "default": "default",
                 },
                 "task_id": {
                     "type": "integer",
-                    "description": "Optional task ID to associate this failure with a tracked task",
+                    "description": "Optional task ID to associate this failure with a tracked task.",
                 },
             },
             "required": ["error", "component"],
@@ -223,46 +286,55 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="track_progress",
-        description="Record a feature or task progress snapshot. "
-                    "Creates a searchable record for cross-session continuity.",
+        description=(
+            "Snapshot the current status of a feature or task (WRITE — has side effects). "
+            "Creates a searchable record so progress survives context resets and can be queried in future sessions. "
+            "Call at meaningful milestones: start, significant progress, blocker encountered, completion. "
+            "Repeated calls for the same feature name overwrite the previous snapshot via deduplication "
+            "— only the latest state is kept. "
+            "Use a stable slug for 'feature' across calls (e.g. 'login-flow-refactor'). "
+            "status maps to importance: blocked→0.9, in_progress→0.8, planning→0.7, done→0.5. "
+            "Stored under 'strategy' (λ=0.10, ~38d half-life). Completed features decay without manual cleanup. "
+            "Side effects: writes or updates one memory record; aggregated in memory_stats under engineering.features."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "feature": {
                     "type": "string",
-                    "description": "Feature or task name (e.g. 'login-flow-refactor', 'engram-v0.4')",
+                    "description": "Stable slug identifying the feature across sessions (e.g. 'login-flow-refactor', 'engram-v0.4'). Used for deduplication.",
                 },
                 "status": {
                     "type": "string",
                     "enum": ["planning", "in_progress", "blocked", "review", "done"],
-                    "description": "Current status",
+                    "description": "Current status. Maps to importance: blocked→0.9, in_progress→0.8, planning→0.7, review→0.6, done→0.5.",
                 },
                 "completion": {
                     "type": "number",
-                    "description": "Completion percentage (0-100)",
+                    "description": "Completion percentage (0–100).",
                     "default": 0,
                 },
                 "blockers": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Current blockers preventing progress",
+                    "description": "Blocking issues or dependencies preventing progress.",
                 },
                 "quality_score": {
                     "type": "number",
-                    "description": "Quality assessment 0.0-1.0 (test pass rate, coverage, etc.)",
+                    "description": "Subjective quality assessment 0.0–1.0 (e.g. test coverage, code review outcome).",
                 },
                 "notes": {
                     "type": "string",
-                    "description": "Free-form progress notes",
+                    "description": "Free-form progress notes.",
                 },
                 "user_id": {
                     "type": "string",
-                    "description": "User identifier",
+                    "description": "Memory partition key.",
                     "default": "default",
                 },
                 "task_id": {
                     "type": "integer",
-                    "description": "Optional task ID to associate this progress snapshot with a tracked task",
+                    "description": "Optional task ID to associate this progress snapshot with a tracked task.",
                 },
             },
             "required": ["feature", "status"],
@@ -270,26 +342,33 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="session_outcome",
-        description="Mark a session as successful or failed. Adjusts importance of memories recalled in the session based on outcome.",
+        description=(
+            "Mark a session as successful or failed and adjust memory importance accordingly (WRITE — has side effects). "
+            "When outcome is 'success', importance of memories recalled in the session is reinforced. "
+            "When outcome is 'failure', notes are stored as a failure lesson and recalled memories are down-weighted. "
+            "session_id must match the value passed to recall_memory during the session. "
+            "Call once at the end of a session when a clear success/failure determination can be made. "
+            "Side effects: modifies importance of recalled memories; may store a failure lesson memory."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "session_id": {
                     "type": "string",
-                    "description": "The session identifier (must match session_id used in recall_memory)",
+                    "description": "Session identifier — must match the session_id used in recall_memory calls during this session.",
                 },
                 "outcome": {
                     "type": "string",
                     "enum": ["success", "failure"],
-                    "description": "Whether the session succeeded or failed",
+                    "description": "'success': reinforces recalled memory importance. 'failure': down-weights recalled memories and stores notes as a failure lesson.",
                 },
                 "notes": {
                     "type": "string",
-                    "description": "Optional notes about the outcome (used as failure lesson when outcome is failure)",
+                    "description": "Optional outcome notes. When outcome is 'failure', stored as a failure lesson memory.",
                 },
                 "user_id": {
                     "type": "string",
-                    "description": "User identifier",
+                    "description": "Memory partition key.",
                     "default": "default",
                 },
             },
@@ -298,34 +377,41 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="create_task",
-        description="Create a new tracked task. Tasks are first-class entities that group handoffs, "
-                    "progress snapshots, and failure records for cross-session continuity.",
+        description=(
+            "Create a new tracked task (WRITE — has side effects). "
+            "Tasks are first-class entities that group handoffs, progress snapshots, and failure records "
+            "for structured cross-session continuity. "
+            "Use when starting a multi-session effort that benefits from checkpoint/restore support. "
+            "Returns a task_id that can be passed to session_handoff, track_failure, track_progress, "
+            "restore_checkpoint, and evaluate_continuity. "
+            "Side effects: creates a task record; does not create any memory records."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Task name (e.g. 'login-flow-refactor', 'engram-v0.8')",
+                    "description": "Stable task slug (e.g. 'login-flow-refactor', 'engram-v0.8'). Used for identification across sessions.",
                 },
                 "goal": {
                     "type": "string",
-                    "description": "Task goal / objective description",
+                    "description": "Task goal or objective description.",
                     "default": "",
                 },
                 "status": {
                     "type": "string",
                     "enum": ["planning", "in_progress", "blocked", "review", "done", "cancelled"],
-                    "description": "Initial task status",
+                    "description": "Initial task status.",
                     "default": "planning",
                 },
                 "user_id": {
                     "type": "string",
-                    "description": "User identifier",
+                    "description": "Memory partition key.",
                     "default": "default",
                 },
                 "metadata": {
                     "type": "object",
-                    "description": "Optional structured metadata",
+                    "description": "Optional JSON-serialisable structured metadata.",
                 },
             },
             "required": ["name"],
@@ -333,26 +419,33 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="update_task",
-        description="Update an existing task's status, goal, or metadata.",
+        description=(
+            "Update an existing task's status, goal, or metadata (WRITE — has side effects). "
+            "Use when task status changes (e.g. planning→in_progress, in_progress→blocked) "
+            "or when the goal needs correction. "
+            "Passing an invalid task_id returns an error; no record is created. "
+            "metadata update replaces the existing metadata entirely — include all fields you want to preserve. "
+            "Side effects: modifies the task record only; does not affect associated memory records."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "task_id": {
                     "type": "integer",
-                    "description": "ID of the task to update",
+                    "description": "ID of the task to update. Must be a valid existing task ID.",
                 },
                 "status": {
                     "type": "string",
                     "enum": ["planning", "in_progress", "blocked", "review", "done", "cancelled"],
-                    "description": "New task status",
+                    "description": "New task status.",
                 },
                 "goal": {
                     "type": "string",
-                    "description": "Updated goal description",
+                    "description": "Updated goal description.",
                 },
                 "metadata": {
                     "type": "object",
-                    "description": "Updated metadata (replaces existing)",
+                    "description": "Updated metadata. Replaces existing metadata entirely.",
                 },
             },
             "required": ["task_id"],
@@ -360,18 +453,24 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="get_task",
-        description="Get a task by ID with all associated memories (handoffs, failures, progress snapshots). "
-                    "Use this when a new Agent takes over to understand the full task context.",
+        description=(
+            "Retrieve a task by ID with all associated memories: handoffs, failures, and progress snapshots "
+            "(read-only, no side effects). "
+            "Use this when a new agent takes over a task to understand full context before acting. "
+            "Prefer restore_checkpoint when resuming an interrupted task — it returns a structured "
+            "continuation package with negative memory (must_not_redo) and invariants (must_preserve). "
+            "get_task is better for inspection and auditing without the filtering that restore_checkpoint applies."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "task_id": {
                     "type": "integer",
-                    "description": "ID of the task to retrieve",
+                    "description": "ID of the task to retrieve.",
                 },
                 "user_id": {
                     "type": "string",
-                    "description": "User identifier",
+                    "description": "Memory partition key.",
                     "default": "default",
                 },
             },
@@ -380,54 +479,61 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="list_tasks",
-        description="List all tasks for a user, optionally filtered by status. "
-                    "Use this to see all tracked tasks and their current states.",
+        description=(
+            "List all tasks for a user, optionally filtered by status (read-only, no side effects). "
+            "Use to get an overview of all tracked tasks and their current states before planning. "
+            "Filter by status to surface only actionable tasks (e.g. status='blocked' or 'in_progress'). "
+            "Does not return associated memories — use get_task or restore_checkpoint for full context."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "user_id": {
                     "type": "string",
-                    "description": "User identifier",
+                    "description": "Memory partition key.",
                     "default": "default",
                 },
                 "status": {
                     "type": "string",
                     "enum": ["planning", "in_progress", "blocked", "review", "done", "cancelled"],
-                    "description": "Optional filter by task status",
+                    "description": "Optional filter. Omit to return all tasks regardless of status.",
                 },
             },
         },
     ),
     Tool(
         name="restore_checkpoint",
-        description="Restore a constrained continuation package from a task checkpoint. "
-                    "Use this when a new Agent takes over an interrupted task. Returns goal, "
-                    "completed/in_progress/blocked items, must_not_redo (negative memory), "
-                    "must_preserve (invariants), preferred_next, working_set, and "
-                    "continuation_confidence. Memory recall is controlled by memory_restore_mode "
-                    "to mitigate context pollution.",
+        description=(
+            "Restore a structured continuation package from a task checkpoint (read-only, no side effects). "
+            "Use when a new agent takes over an interrupted task. "
+            "Returns: goal, completed/in_progress/blocked items, must_not_redo (negative memory of failed approaches), "
+            "must_preserve (invariants that must not be broken), preferred_next, working_set, and continuation_confidence. "
+            "memory_restore_mode controls context pollution risk: "
+            "SELECTIVE (default): only high-importance or failure memories (cap 10) — recommended for most cases. "
+            "FULL: all task memories (cap 20) — use when full context is needed. "
+            "NONE: continuation package only, no memories — use when context window is near limit. "
+            "Prefer this over get_task when resuming interrupted work."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "task_id": {
                     "type": "integer",
-                    "description": "ID of the task to restore",
+                    "description": "ID of the task to restore.",
                 },
                 "version": {
                     "type": "integer",
-                    "description": "Specific checkpoint version. Omit for the latest.",
+                    "description": "Specific checkpoint version to restore. Omit for the latest.",
                 },
                 "memory_restore_mode": {
                     "type": "string",
                     "enum": ["FULL", "SELECTIVE", "NONE"],
-                    "description": "FULL: all task memories (cap 20). "
-                                   "SELECTIVE (default): importance>=0.5 OR failure (cap 10). "
-                                   "NONE: no related memories, just the continuation package.",
+                    "description": "FULL: all task memories (cap 20). SELECTIVE (default): importance≥0.5 OR failure memories (cap 10). NONE: no memories, continuation package only.",
                     "default": "SELECTIVE",
                 },
                 "user_id": {
                     "type": "string",
-                    "description": "User identifier",
+                    "description": "Memory partition key.",
                     "default": "default",
                 },
             },
@@ -436,24 +542,28 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="list_checkpoints",
-        description="List checkpoint history for a task (latest first). "
-                    "Returns checkpoint metadata only (no full state) for debugging "
-                    "and visualization. Use restore_checkpoint to load a specific version.",
+        description=(
+            "List checkpoint history for a task, latest first (read-only, no side effects). "
+            "Returns checkpoint metadata only (version, timestamp, summary) — not the full state. "
+            "Use to inspect checkpoint history before deciding which version to restore, "
+            "or to debug continuity issues between agent handoffs. "
+            "Use restore_checkpoint to load a specific version's full continuation package."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "task_id": {
                     "type": "integer",
-                    "description": "ID of the task",
+                    "description": "ID of the task whose checkpoints to list.",
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Max checkpoints to return (1-100)",
+                    "description": "Max checkpoints to return (1–100, default 10).",
                     "default": 10,
                 },
                 "user_id": {
                     "type": "string",
-                    "description": "User identifier",
+                    "description": "Memory partition key.",
                     "default": "default",
                 },
             },
@@ -462,15 +572,15 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="get_runtime_health",
-        description="Read-only runtime health report for the engram backend. "
-                    "Returns DB status (readonly / embedding_stale), event log "
-                    "summary (kinds + max seq), backups inventory, residue "
-                    "files (corruption indicators), and engram_meta. Call this "
-                    "when memory tools start returning 'degraded_mode' errors, "
-                    "or proactively at session start to detect operator-action "
-                    "needed (e.g. residue files present → suggest "
-                    "`engram-setup recover`). Always safe to call; never "
-                    "modifies state.",
+        description=(
+            "Return a read-only runtime health report for the engram backend (no side effects). "
+            "Reports: DB status (readonly flag, embedding_stale flag), event log summary, "
+            "backup inventory, residue files (corruption indicators), and engram_meta. "
+            "Call proactively at session start to detect issues requiring operator action "
+            "(e.g. residue files present → run 'engram-setup recover'). "
+            "Call reactively when memory tools return 'degraded_mode' errors. "
+            "Always safe to call; never modifies state."
+        ),
         inputSchema={
             "type": "object",
             "properties": {},
@@ -479,42 +589,43 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="report_interruption",
-        description="Report an imminent interruption reason so the session taxonomy is "
-                    "recorded for the next Agent. Call this BEFORE the session ends when "
-                    "you detect: context window overflow, rate limiting, or repeated tool "
-                    "failures. The reason is stored and flushed to session_lifecycle on "
-                    "process exit, enabling the next Agent to receive a targeted recovery "
-                    "strategy instead of a generic 'session ended unexpectedly' hint.",
+        description=(
+            "Record an imminent interruption reason before session end (WRITE — has side effects). "
+            "Call BEFORE the session ends when you detect: context window overflow, rate limiting, "
+            "or repeated tool failures. "
+            "The reason is stored and flushed to session_lifecycle on process exit, "
+            "enabling the next agent to receive a targeted recovery strategy "
+            "instead of a generic 'session ended unexpectedly' hint. "
+            "Do NOT call for normal planned session ends — use session_handoff instead. "
+            "If session_id is provided, the session is immediately closed with the given reason. "
+            "Side effects: writes interruption record; triggers session lifecycle flush on exit."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "reason": {
                     "type": "string",
-                    "enum": ["overflow", "user_away", "tool_failure",
-                             "crash", "rate_limit", "unknown"],
-                    "description": "Why the session is being interrupted. "
-                                   "'overflow': context window full. "
-                                   "'rate_limit': API throttling. "
-                                   "'tool_failure': consecutive tool errors. "
-                                   "'user_away': user closed/inactive. "
-                                   "'crash': unexpected process death. "
-                                   "'unknown': cannot determine.",
+                    "enum": ["overflow", "user_away", "tool_failure", "crash", "rate_limit", "unknown"],
+                    "description": (
+                        "'overflow': context window full (include token_count in context). "
+                        "'rate_limit': API throttling (include error message in context). "
+                        "'tool_failure': consecutive tool errors. "
+                        "'user_away': user closed session or went inactive. "
+                        "'crash': unexpected process death. "
+                        "'unknown': cannot determine cause."
+                    ),
                 },
                 "context": {
                     "type": "object",
-                    "description": "Optional structured context (e.g. "
-                                   "{'token_count': 195000, 'max_tokens': 200000} "
-                                   "for overflow, or {'error': '429 Too Many Requests'} "
-                                   "for rate_limit).",
+                    "description": "Optional structured context. Examples: {'token_count': 195000, 'max_tokens': 200000} for overflow; {'error': '429 Too Many Requests'} for rate_limit.",
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "Session identifier. If provided, the session "
-                                   "is immediately closed with the given reason.",
+                    "description": "Session identifier. If provided, immediately closes the session with the given reason.",
                 },
                 "user_id": {
                     "type": "string",
-                    "description": "User identifier",
+                    "description": "Memory partition key.",
                     "default": "default",
                 },
             },
@@ -523,18 +634,23 @@ TOOL_SCHEMAS: list[Tool] = [
     ),
     Tool(
         name="evaluate_continuity",
-        description="Evaluate how well cognitive state survived across checkpoint versions. "
-                    "Returns 6 continuity metrics: Goal Retention, Action Consistency, "
-                    "Failure Recall, Working Set Stability, Replanning Rate, Redundant "
-                    "Exploration, plus a weighted composite score. Call after restoring a "
-                    "checkpoint to quantify recovery quality, or to compare any two "
-                    "checkpoint versions of the same task.",
+        description=(
+            "Evaluate how well cognitive state survived across checkpoint versions (read-only, no side effects). "
+            "Returns 6 metrics: Goal Retention, Action Consistency, Failure Recall, "
+            "Working Set Stability, Replanning Rate, Redundant Exploration, "
+            "plus a weighted composite score. "
+            "Call after restore_checkpoint to quantify recovery quality. "
+            "Call with before_version and after_version to compare any two checkpoint versions. "
+            "Pass actions_taken_after_restore to score Redundant Exploration "
+            "(detects whether the new agent repeated already-failed approaches). "
+            "Useful for diagnosing poor handoffs and tuning memory_restore_mode."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "task_id": {
                     "type": "integer",
-                    "description": "ID of the task to evaluate",
+                    "description": "ID of the task to evaluate.",
                 },
                 "before_version": {
                     "type": "integer",
@@ -547,12 +663,11 @@ TOOL_SCHEMAS: list[Tool] = [
                 "actions_taken_after_restore": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Actions the new Agent performed after restoring "
-                                   "(for redundant_exploration scoring). Optional.",
+                    "description": "Actions the new agent performed after restoring. Used for Redundant Exploration scoring.",
                 },
                 "user_id": {
                     "type": "string",
-                    "description": "User identifier",
+                    "description": "Memory partition key.",
                     "default": "default",
                 },
             },
@@ -560,52 +675,3 @@ TOOL_SCHEMAS: list[Tool] = [
         },
     ),
 ]
-
-# --- Tool Definition Quality enrichment (Glama scoring helpers) ---
-# Add concise, structured usage and behavior notes to every tool description.
-_TDQ_NOTES: dict[str, dict[str, str]] = {
-    "recall_memory": {
-        "when": "Call at session/task start or before a major decision.",
-        "side_effects": "Read-only.",
-    },
-    "store_memory": {
-        "when": "Call when a new durable fact/lesson should survive sessions.",
-        "side_effects": "Writes memory; may dedup as reinforce/merge/replace.",
-    },
-    "update_memory": {
-        "when": "Call only when a specific memory_id must be corrected.",
-        "side_effects": "Writes memory content/importance.",
-    },
-    "consolidate_memory": {
-        "when": "Call during maintenance windows to reduce memory bloat.",
-        "side_effects": "Writes/rewrites memory rows via merges.",
-    },
-    "session_handoff": {
-        "when": "Call near session end or before agent handoff.",
-        "side_effects": "Writes handoff and may trigger checkpoint creation.",
-    },
-    "memory_stats": {"when": "Call for diagnostics and monitoring.", "side_effects": "Read-only."},
-    "track_failure": {"when": "Call immediately after a failure is understood.", "side_effects": "Writes failure memory and checkpoint context."},
-    "track_progress": {"when": "Call after meaningful progress/status change.", "side_effects": "Writes progress memory and checkpoint context."},
-    "session_outcome": {"when": "Call once per session after success/failure is known.", "side_effects": "Writes outcome signals that affect memory quality weighting."},
-    "create_task": {"when": "Call at the beginning of a multi-step objective.", "side_effects": "Writes a new task record."},
-    "update_task": {"when": "Call when task status/goal/metadata changes.", "side_effects": "Writes task fields."},
-    "get_task": {"when": "Call when taking over an existing task.", "side_effects": "Read-only."},
-    "list_tasks": {"when": "Call to discover active/planning/blocked tasks.", "side_effects": "Read-only."},
-    "restore_checkpoint": {"when": "Call on takeover after interruption.", "side_effects": "Read-only restore payload; does not mutate task state."},
-    "list_checkpoints": {"when": "Call for timeline/debugging of checkpoint versions.", "side_effects": "Read-only."},
-    "get_runtime_health": {"when": "Call when backend appears degraded or before risky operations.", "side_effects": "Read-only."},
-    "report_interruption": {"when": "Call before exit when interruption reason is known.", "side_effects": "Writes interruption taxonomy for next-session recovery."},
-    "evaluate_continuity": {"when": "Call after recovery to score continuity quality.", "side_effects": "Read-only scoring output."},
-}
-
-for _tool in TOOL_SCHEMAS:
-    _notes = _TDQ_NOTES.get(_tool.name)
-    if not _notes:
-        continue
-    _suffix = (
-        f" Usage: {_notes['when']} "
-        f"Behavior: {_notes['side_effects']}"
-    )
-    if _suffix not in _tool.description:
-        _tool.description = f"{_tool.description} {_suffix}"
