@@ -114,9 +114,9 @@ Agent A (Claude Code)                      Agent B (Cursor)
 
 ---
 
-## 15 MCP Tools
+## 18 MCP Tools
 
-Engram provides **15 MCP tools** covering the full Cognitive Continuity lifecycle:
+Engram provides **18 MCP tools** covering the full Cognitive Continuity lifecycle:
 
 ### Memory
 
@@ -127,6 +127,7 @@ Engram provides **15 MCP tools** covering the full Cognitive Continuity lifecycl
 | `update_memory` | Update existing memory by ID |
 | `consolidate_memory` | Merge similar memories, reduce bloat |
 | `memory_stats` | Count, category distribution, avg strength, last maintenance |
+| `get_runtime_health` | Read-only runtime health report (DB mode, event-log summary, backups, residue) |
 
 ### Task
 
@@ -149,6 +150,12 @@ Engram provides **15 MCP tools** covering the full Cognitive Continuity lifecycl
 | `list_checkpoints` | List checkpoint history (latest first) |
 | `report_interruption` | Report imminent interruption reason for recovery routing |
 | `evaluate_continuity` | Evaluate continuity quality between checkpoint versions |
+
+**Interruption Playbook (recommended default flow)**
+
+1. **Before interruption**: call `report_interruption(reason, context)` when you detect overflow / rate_limit / repeated tool failures.
+2. **On takeover**: call `restore_checkpoint(task_id, memory_restore_mode="SELECTIVE")` to get constrained continuation + targeted memories.
+3. **After resuming work**: call `evaluate_continuity(task_id, before_version, after_version)` to quantify recovery quality.
 
 ---
 
@@ -232,6 +239,10 @@ Data directory `~/.engram/`: `memories.duckdb` (single-file DB) + `graph.json` (
 
 Supports macOS / Linux / WSL2, Python 3.11+, ~500MB model cache.
 
+If your MCP host has strict startup timeouts, Engram boots in a fast path by
+default (no eager embedding-model dimension probe). To force eager dimension
+detection during boot, set `ENGRAM_EAGER_DIM_DETECT=1`.
+
 ---
 
 ## Benchmark
@@ -247,6 +258,8 @@ Evaluated on [LoCoMo](https://github.com/snap-research/locomo) (Snap Research lo
 | **Engram** | **0.4383** | DeepSeek-V3.2 | **Local**  |
 
 > Zero cloud dependency, local deployment. Four optimization rounds yielded **F1 +50.3%**, **Hit@5 +26.2pp**.
+
+For runtime durability, also track **continuity metrics** (`evaluate_continuity`): Goal Retention, Action Consistency, Failure Recall, Working Set Stability, Replanning Rate, Redundant Exploration, and a weighted composite score.
 
 <details>
 <summary>Category scores + memory mechanism details</summary>
