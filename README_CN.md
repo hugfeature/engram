@@ -1,13 +1,14 @@
 # Engram
 
-**为 MCP 编码 Agent 提供跨会话任务连续性与持久记忆**
+**AI 编码 Agent 的运行时连续性与中断恢复**
 
 [![PyPI](https://img.shields.io/pypi/v/mcp-engram)](https://pypi.org/project/mcp-engram/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Tests](https://img.shields.io/badge/tests-456%20passed-brightgreen)](https://github.com/hugfeature/engram)
 
-> Engram 让 Claude Code、Cursor、OpenHands 拥有**持久记忆**和**断点恢复**能力，Agent 中断后可以接着做，而不是从零开始。
+> Engram 让 Claude Code、Cursor、OpenHands 拥有**可恢复执行**能力 ——
+> 上下文坍塌、中断、会话终止后，恢复 Agent 的工作状态，接着做，不从零开始。
 
 [English](./README.md) · [PyPI](https://pypi.org/project/mcp-engram/) · [Glama](https://glama.ai/mcp/servers/hugfeature/engram)
 
@@ -17,12 +18,13 @@
 
 AI Agent 的每次会话都是一座孤岛：
 
-| 场景                          | 没有 Engram      | 有 Engram                          |
-| ----------------------------- | ---------------- | ---------------------------------- |
-| 上下文窗口满了                | 丢失历史，继续猜 | Checkpoint 恢复，约束完整保留      |
-| 切换 Agent（Claude → Cursor） | 从头开始         | 结构化交接，任务状态完整           |
-| 同一个 Bug 踩两遍             | 没有失败记录     | failure 记忆自动浮现               |
-| 任务跨了三次会话              | 没人知道整体进度 | 任务状态 + continuity 指标随时可查 |
+| 场景                          | 没有 Engram                        | 有 Engram                                    |
+| ----------------------------- | ---------------------------------- | -------------------------------------------- |
+| 上下文窗口满了                | 丢失历史，继续猜                   | Checkpoint 恢复，约束完整保留                |
+| 进程被杀 / 服务重启           | 所有工作状态丢失                   | SIGTERM 自动存档，下次 recall 即可恢复       |
+| 切换 Agent（Claude → Cursor） | 从头开始                           | 结构化交接，任务状态完整                     |
+| 同一个 Bug 踩两遍             | 没有失败记录                       | failure 记忆自动浮现                         |
+| 任务跨了三次会话              | 没人知道整体进度                   | 任务状态 + continuity 指标随时可查           |
 
 ---
 
@@ -47,6 +49,61 @@ engram-setup          # 下载嵌入模型 + 初始化 DuckDB（约 500MB，一�
 ```
 
 完全本地运行，无需云端、无需 API Key、无遥测。
+
+---
+
+## 中断恢复
+
+当会话意外终止——上下文溢出、进程被杀、IDE 崩溃——Engram 会在关闭时自动捕获结构化工作状态：
+
+```
+SIGTERM / 上下文坍塌
+        ↓
+Engram 自动存档
+  goal · completed · in_progress · blocked
+  modified_files (git diff) · last_tool_called · last_failure
+        ↓
+Agent 重启 → recall_memory()
+        ↓
+interrupt_recovery 注入到响应中
+  → "调用 restore_checkpoint(task_id=X) 恢复"
+```
+
+无需手动干预。下次 Agent 会话首次调用 `recall_memory` 即自动获得恢复提示。
+
+**根据当前状态生成 CLAUDE.md 片段：**
+
+```bash
+engram-prompt
+```
+
+输出（粘贴到项目的 `CLAUDE.md`）：
+
+```markdown
+## Engram Runtime State
+
+**Active task:** 10 — 修复 login.py 的认证 Bug
+**Checkpoint:** v3 (confidence: 0.71)
+
+**已完成（不要重做）：**
+
+- 在 test_auth.py 中复现了 Bug
+
+**进行中：**
+
+- 追踪 JWT 校验路径
+
+**上次会话修改的文件：**
+
+- `src/auth/validator.py`
+- `tests/test_auth.py`
+
+## Engram Session Rules
+
+- 会话开始：recall_memory(query) — 中断状态自动置顶
+- 恢复任务：restore_checkpoint(task_id=10)
+- 上下文快满：report_interruption(reason="overflow") 然后 session_handoff(...)
+```
 
 ---
 
@@ -102,16 +159,16 @@ Agent A（Claude Code）                  Agent B（Cursor）
   │                                        │
   ├─ create_task(name, goal)               │
   ├─ track_progress / track_failure        │
-  ├─ ⚡ 中断                               │
-  ├─ session_handoff(summary, ...)         │
+  ├─ ⚡ 中断（SIGTERM / 上下文溢出）      │
+  ├─ [自动] 中断 checkpoint 已保存        │
   │        │                               │
   │   ┌────▼────────────────┐              │
   │   │  Engram Checkpoint  │              │
   │   │  goal               │              │
   │   │  completed          │              │
   │   │  must_not_redo  ────┼──────────▶   │
-  │   │  must_preserve      │             ├─ restore_checkpoint(task_id)
-  │   │  working_set        │             ├─ recall_memory → handoff 置顶
+  │   │  modified_files     │             ├─ recall_memory() → interrupt_recovery 置顶
+  │   │  working_set        │             ├─ restore_checkpoint(task_id)
   │   └─────────────────────┘             ├─ 接着做，不从零开始
   │                                       └─ session_handoff → 下一个 Agent...
 ```
@@ -122,18 +179,18 @@ Agent A（Claude Code）                  Agent B（Cursor）
 
 ## 推荐写入 CLAUDE.md 的 Agent 指令
 
-粘贴到项目的 `CLAUDE.md`，Agent 会自动使用 Engram：
+运行 `engram-prompt` 自动根据当前状态生成，或手动粘贴：
 
 ```markdown
 ## Engram 使用规则
 
 - 多步任务起点：create_task(name, goal) → 保存 task_id
-- 任务开始：recall_memory(query) — 最新 handoff 自动置顶 + 历史 failure
+- 任务开始：recall_memory(query) — 最新 handoff + 中断状态自动置顶
 - 接手任务：restore_checkpoint(task_id, memory_restore_mode="SELECTIVE")
 - 阶段进展：track_progress(feature, status, task_id=<id>)
 - 遇到错误：track_failure(error, component, root_cause, task_id=<id>)
-- 快中断前：report_interruption(reason="overflow")（上下文窗口快满时）
-- 任务收尾：session_handoff(summary, completed, in_progress, blocked, next_steps, task_id=<id>)
+- 上下文快满：report_interruption(reason="overflow") 然后 session_handoff(...)
+- 任务收尾：session_handoff(summary, completed, in_progress, blocked, task_id=<id>)
 ```
 
 ---
@@ -228,9 +285,9 @@ Engram 还通过 `evaluate_continuity` 追踪 **运行时连续性指标**：目
 
 ## Engram 不做什么
 
-- ❌ 通用 agent runtime / workflow orchestration（那是 LangGraph、Temporal 的位置）
-- ❌ 自定义 agent loop / prompt 编排（由 MCP 客户端负责）
 - ❌ 保证恢复后 LLM 行为完全一致（LLM 非确定性是物理限制）
+- ❌ 自定义 agent loop / prompt 编排（由 MCP 客户端负责）
+- ❌ 多 Agent 协调或共享团队记忆（单用户、本地优先）
 
 ---
 
@@ -259,4 +316,4 @@ pytest tests/ -v
 
 ---
 
-> _Engram 恢复的是 Agent 的认知，不是机器的执行状态。_
+> _Engram 恢复的是 Agent 的工作状态，而不仅是记忆。_

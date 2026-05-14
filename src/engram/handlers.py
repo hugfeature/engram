@@ -251,6 +251,41 @@ def handle_recall(db: MemoryDB, graph: MemoryGraph, query: str,
         result["interrupted_sessions"] = [
             _build_recovery_hint(s) for s in interrupted_sessions
         ]
+
+    # Auto-inject latest interrupt checkpoint so the agent sees it on first
+    # recall without needing to call restore_checkpoint manually.
+    # Wrapped in try/except — never breaks core recall.
+    try:
+        interrupt_ckpt = db.get_latest_interrupt_checkpoint(user_id)
+        if interrupt_ckpt:
+            ws = interrupt_ckpt["state"].get("working_set") or {}
+            interrupt_meta = ws.get("_interrupt", {})
+            result["interrupt_recovery"] = {
+                "task_id": interrupt_ckpt["task_id"],
+                "checkpoint_version": interrupt_ckpt["version"],
+                "goal": interrupt_ckpt["state"].get("goal", ""),
+                "modified_files": ws.get("files", []),
+                "last_tool_called": interrupt_meta.get("last_tool_called", ""),
+                "last_success_action": interrupt_meta.get("last_success_action", ""),
+                "last_failure": interrupt_meta.get("last_failure", ""),
+                "interrupt_reason": interrupt_meta.get("interrupt_reason", "process_exit"),
+                "hint": (
+                    f"Previous session was interrupted. "
+                    f"Call restore_checkpoint(task_id={interrupt_ckpt['task_id']}) to resume."
+                ),
+            }
+    except Exception as exc:
+        log.debug("Interrupt checkpoint auto-inject failed (non-fatal): %s", exc)
+
+    # Context pressure warning: if agent is mid-task and has interrupt state,
+    # remind it to save proactively before context fills up.
+    if result.get("interrupt_recovery") or result.get("interrupted_sessions"):
+        result["context_pressure_hint"] = (
+            "⚠️ Interrupted state detected. If context window is filling up, "
+            "call report_interruption(reason='overflow') then "
+            "session_handoff(..., task_id=X) before context is lost."
+        )
+
     return result
 
 
