@@ -1064,6 +1064,13 @@ class MemoryDB:
             log.warning("HNSW index creation failed (non-fatal): %s", e)
 
     def _float_cast(self) -> str:
+        """Generate SQL type cast for embedding array with safety validation.
+        
+        Validates dimension to prevent SQL injection via malformed type names.
+        """
+        # Security: validate dimension is a legitimate integer
+        if not isinstance(self._dim, int) or self._dim <= 0 or self._dim > 10000:
+            raise ValueError(f"Invalid embedding dimension: {self._dim}. Must be integer in range [1, 10000]")
         return f"FLOAT[{self._dim}]"
 
     def _validate_embedding(self, embedding: list[float]) -> None:

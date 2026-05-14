@@ -80,6 +80,7 @@ async def lifespan(app: FastAPI):
     async with session_mgr.run():
         yield
     try:
+        log.info("http_server shutdown — calling trigger_interrupt_checkpoint")
         trigger_interrupt_checkpoint()
     except Exception as e:
         log.debug("Interrupt checkpoint on shutdown failed: %s", e)

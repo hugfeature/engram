@@ -58,13 +58,21 @@ class ProjectContext:
 
 
 def _git(args: list[str], cwd: str) -> str | None:
+    import shutil
+    
+    # Security: Use absolute path to prevent PATH hijacking
+    git_path = shutil.which("git")
+    if not git_path:
+        return None
+    
     try:
         out = subprocess.run(
-            ["git", *args],
+            [git_path, *args],
             cwd=cwd,
             capture_output=True,
             text=True,
             timeout=1.5,
+            shell=False,  # Explicitly disable shell
         )
         if out.returncode != 0:
             return None

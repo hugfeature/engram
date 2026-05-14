@@ -48,6 +48,7 @@ def main():
     try:
         asyncio.run(_run())
     finally:
+        log.info("server.py finally block reached — calling trigger_interrupt_checkpoint")
         trigger_interrupt_checkpoint()
         if _scheduler:
             _scheduler.shutdown(wait=False)

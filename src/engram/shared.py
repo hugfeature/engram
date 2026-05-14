@@ -87,10 +87,17 @@ def _get_git_modified_files() -> list[str]:
     Purely code-driven — no LLM involvement.
     Returns an empty list if git is unavailable or repo not found.
     """
+    import shutil
+    
+    # Security: Use absolute path to prevent PATH hijacking
+    git_path = shutil.which("git")
+    if not git_path:
+        return []
+    
     files: list[str] = []
     for cmd in (
-        ["git", "diff", "--name-only", "HEAD"],
-        ["git", "diff", "--cached", "--name-only"],
+        [git_path, "diff", "--name-only", "HEAD"],
+        [git_path, "diff", "--cached", "--name-only"],
     ):
         try:
             result = subprocess.run(
@@ -98,6 +105,7 @@ def _get_git_modified_files() -> list[str]:
                 capture_output=True,
                 text=True,
                 timeout=3,
+                shell=False,  # Explicitly disable shell
             )
             files.extend(line for line in result.stdout.strip().splitlines() if line)
         except Exception:
@@ -170,6 +178,26 @@ def _summarise_recent_events(events: list[dict]) -> dict:
     }
 
 
+def _infer_goal_from_events(events: list[dict]) -> str:
+    """Infer what this session was working on from the event stream.
+
+    Used as a fallback when no explicit task exists but we still want
+    to save an interrupt checkpoint.  Purely deterministic — no LLM.
+    """
+    # 1. Most recent task.create event carries the best goal description.
+    for ev in reversed(events):
+        if ev.get("kind") == "task.create":
+            payload = ev.get("payload", {})
+            return payload.get("goal", "") or payload.get("name", "")
+    # 2. Fall back to the most recent memory.store content (first 80 chars).
+    for ev in reversed(events):
+        if ev.get("kind") == "memory.store":
+            content = ev.get("payload", {}).get("content", "")
+            if content:
+                return content[:80]
+    return "Session interrupted without explicit task"
+
+
 def trigger_interrupt_checkpoint() -> bool:
     """Build and persist a structured interrupt checkpoint.
 
@@ -212,11 +240,28 @@ def trigger_interrupt_checkpoint() -> bool:
         active_tasks = db.list_tasks(status="in_progress")
         if not active_tasks:
             active_tasks = db.list_tasks(status="planning")
-        if not active_tasks:
-            log.debug("Interrupt checkpoint skipped: no in-progress or planning tasks")
-            return False
 
-        task = active_tasks[0]
+        if not active_tasks:
+            # Fallback: infer a task from recent events so we don't lose
+            # the interrupt checkpoint when no explicit task was created.
+            recent_events = _get_recent_events(limit=30)
+            if not recent_events:
+                log.debug("Interrupt checkpoint skipped: no tasks and no events")
+                return False
+
+            inferred_goal = _infer_goal_from_events(recent_events)
+            task_id = db.create_task(
+                name=f"auto-session-{(_current_session_id or 'unknown')[:8]}",
+                goal=inferred_goal,
+                status="in_progress",
+            )
+            task = db.get_task(task_id)
+            log.info(
+                "No active task found; auto-created session task %d for interrupt checkpoint",
+                task_id,
+            )
+        else:
+            task = active_tasks[0]
 
         from .checkpoint import (
             create_checkpoint,

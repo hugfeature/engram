@@ -220,7 +220,7 @@ class EventLog:
         path = self._current_file_path()
         # O_APPEND guarantees atomic positioning under POSIX; fsync guarantees
         # durability across power loss.
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             os.write(fd, (line + "\n").encode("utf-8"))
             os.fsync(fd)
