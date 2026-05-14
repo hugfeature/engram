@@ -41,11 +41,21 @@ def _degraded_error(exc: DegradedModeError) -> dict:
     }
 
 
+import re
+
+
 def _validate_user_id(user_id: str) -> str:
+    """Validate and sanitize user_id to prevent injection attacks.
+    
+    Only allows alphanumeric characters, underscores, and hyphens.
+    Maximum length: 100 characters.
+    """
     if not user_id or not isinstance(user_id, str):
         return "default"
-    user_id = user_id.strip()[:100]
-    return user_id or "default"
+    
+    # Only allow letters, numbers, underscores, and hyphens
+    cleaned = re.sub(r'[^a-zA-Z0-9_-]', '', user_id.strip()[:100])
+    return cleaned or "default"
 
 
 def _safe_embed(content: str) -> list[float] | None:
