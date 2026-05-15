@@ -6,6 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Tests](https://img.shields.io/badge/tests-456%20passed-brightgreen)](https://github.com/hugfeature/engram)
+[![engram MCP server](https://glama.ai/mcp/servers/hugfeature/engram/badges/card.svg)](https://glama.ai/mcp/servers/hugfeature/engram)
 
 > Engram gives Claude Code, Cursor, and OpenHands **resumable execution** — recover agent working state after context collapse, interruption, or session termination. Agents continue from where they stopped, not from zero.
 
