@@ -98,10 +98,6 @@ def _get_model() -> SentenceTransformer | None:
                     log.error("Model loading failed: %s — entering degraded mode", e)
                     _degraded = True
                     return None
-
-                _model = result.get("model")
-                if _model is None:
-                    _degraded = True
     return _model
 
 

@@ -24,8 +24,10 @@ def _cmd_setup() -> int:
     data_dir = os.path.join(os.path.expanduser("~"), ".engram")
     os.makedirs(data_dir, exist_ok=True)
 
-    print("\n[1/3] Downloading embedding model (all-mpnet-base-v2)...")
-    print("      Using HF mirror: hf-mirror.com")
+    model_name = os.environ.get("ENGRAM_MODEL", "all-mpnet-base-v2")
+    hf_endpoint = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
+    print(f"\n[1/3] Downloading embedding model ({model_name})...")
+    print(f"      Using HF endpoint: {hf_endpoint}")
     os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
     try:
