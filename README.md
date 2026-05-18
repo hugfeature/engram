@@ -28,6 +28,18 @@ Every AI agent session is an island:
 
 ---
 
+## Why Engram
+
+Most memory systems focus on conversation recall.
+
+Engram focuses on runtime continuity:
+
+- **What the agent was doing** — task state, working set, modified files
+- **Where execution stopped** — checkpoint with goal, progress, blockers
+- **How to resume safely** — negative memory (must_not_redo) + invariants (must_preserve)
+
+---
+
 ## Quick Start
 
 ```bash
