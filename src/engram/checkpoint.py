@@ -284,6 +284,7 @@ def should_create_auto_checkpoint(
 _SEMANTIC_FIELDS = (
     "goal", "completed", "in_progress", "blocked",
     "preferred_next", "must_not_redo", "must_preserve", "working_set",
+    "active_constraints", "blocked_reasons",
 )
 
 
@@ -419,6 +420,7 @@ def create_checkpoint(
                 checkpoint_reason, triggered_by_event,
                 goal, completed, in_progress, blocked, preferred_next,
                 must_not_redo, must_preserve, working_set,
+                active_constraints, blocked_reasons,
                 state_diff, source_session_id, source_memory_id,
                 continuation_confidence, confidence_breakdown,
                 failure_signature, user_id
@@ -427,6 +429,7 @@ def create_checkpoint(
                 ?, ?,
                 ?, ?::JSON, ?::JSON, ?::JSON, ?::JSON,
                 ?::JSON, ?::JSON, ?::JSON,
+                ?::JSON, ?::JSON,
                 ?::JSON, ?, ?,
                 ?, ?::JSON,
                 ?, ?
@@ -444,6 +447,8 @@ def create_checkpoint(
                 _json.dumps(state["must_not_redo"], ensure_ascii=False),
                 _json.dumps(_as_list(state.get("must_preserve")), ensure_ascii=False),
                 _json.dumps(_as_dict(state.get("working_set")), ensure_ascii=False),
+                _json.dumps(_as_list(state.get("active_constraints")), ensure_ascii=False),
+                _json.dumps(_as_list(state.get("blocked_reasons")), ensure_ascii=False),
                 _json.dumps(state_diff, ensure_ascii=False),
                 source_session_id, source_memory_id,
                 confidence,
@@ -470,10 +475,20 @@ def create_checkpoint(
     # Tier 1 — checkpoints are the cognitive backbone of continuity, MUST
     # be in the event log so a destroyed DuckDB can be replayed back.
     # We log the full state payload (no embeddings) so replay is total.
+    # Include execution_id for lineage tracing.
+    execution_id = None
+    try:
+        task_row = db.get_task(task_id)
+        if task_row:
+            execution_id = task_row.execution_id
+    except Exception:
+        pass
+
     try:
         db._emit_event("checkpoint.write", {
             "checkpoint_id": checkpoint_id,
             "task_id": task_id,
+            "execution_id": execution_id,
             "version": new_version,
             "parent_version": parent_version,
             "kind": kind,
@@ -489,6 +504,8 @@ def create_checkpoint(
                 "must_not_redo": state["must_not_redo"],
                 "must_preserve": _as_list(state.get("must_preserve")),
                 "working_set": _as_dict(state.get("working_set")),
+                "active_constraints": _as_list(state.get("active_constraints")),
+                "blocked_reasons": _as_list(state.get("blocked_reasons")),
             },
             "state_diff": state_diff,
             "source_session_id": source_session_id,
@@ -595,6 +612,8 @@ def _row_to_checkpoint(row: dict) -> dict:
             "must_not_redo": _as_list(row.get("must_not_redo")),
             "must_preserve": _as_list(row.get("must_preserve")),
             "working_set": _as_dict(row.get("working_set")),
+            "active_constraints": _as_list(row.get("active_constraints")),
+            "blocked_reasons": _as_list(row.get("blocked_reasons")),
         },
         "state_diff": _as_dict(row.get("state_diff")),
         "source_session_id": row.get("source_session_id"),
@@ -606,10 +625,11 @@ def _row_to_checkpoint(row: dict) -> dict:
     }
 
 
-def build_continuation(checkpoint: dict) -> dict:
+def build_continuation(checkpoint: dict, db=None) -> dict:
     """把 get_checkpoint 的结果转成 constrained continuation 包。
 
     会基于 created_at 重算 recency 并校准 continuation_confidence。
+    如果提供 db，会从 execution lineage 推导 execution_position 和 open_subtasks。
     """
     state = checkpoint["state"]
     breakdown = dict(checkpoint.get("confidence_breakdown") or {})
@@ -624,7 +644,7 @@ def build_continuation(checkpoint: dict) -> dict:
         3,
     )
 
-    return {
+    result = {
         "goal": state["goal"],
         "completed": state["completed"],
         "in_progress": state["in_progress"],
@@ -633,6 +653,56 @@ def build_continuation(checkpoint: dict) -> dict:
         "must_not_redo": state["must_not_redo"],
         "must_preserve": state["must_preserve"],
         "working_set": state["working_set"],
+        "active_constraints": state.get("active_constraints") or [],
+        "blocked_reasons": state.get("blocked_reasons") or [],
         "continuation_confidence": confidence,
         "confidence_breakdown": breakdown,
+    }
+
+    # Derive execution_position and open_subtasks from lineage (if available)
+    if db is not None:
+        result["execution_position"] = _derive_execution_position(
+            db, checkpoint["task_id"]
+        )
+
+    return result
+
+
+def _derive_execution_position(db, task_id: int) -> dict:
+    """Derive execution position from the task's lineage.
+
+    Returns a dict describing where this task sits in the execution:
+    - execution_id, attempt number, retry depth
+    - open_subtasks (incomplete children)
+    - total attempts in the execution so far
+    """
+    task = db.get_task(task_id)
+    if not task or not task.execution_id:
+        return {"in_execution": False}
+
+    execution = db.get_execution(task.execution_id)
+    all_tasks = db.get_execution_tasks(task.execution_id)
+
+    # Find open (non-terminal) subtasks under this task
+    open_subtasks = [
+        {"task_id": t.id, "name": t.name, "status": t.status}
+        for t in all_tasks
+        if t.parent_task_id == task_id
+        and t.status not in ("done", "cancelled")
+    ]
+
+    # Count total attempts (retry chain length)
+    retry_chain = db.get_retry_chain(task_id)
+
+    return {
+        "in_execution": True,
+        "execution_id": task.execution_id,
+        "execution_status": execution.get("status") if execution else None,
+        "root_goal": execution.get("root_goal") if execution else None,
+        "attempt": task.attempt,
+        "total_attempts_in_execution": len(all_tasks),
+        "retry_depth": len(retry_chain),
+        "open_subtasks": open_subtasks,
+        "is_retry": task.retry_of_task_id is not None,
+        "is_subtask": task.parent_task_id is not None,
     }

@@ -228,6 +228,11 @@ class TestToolRegistration:
             "report_interruption",
             # v0.13 — Continuity Metrics
             "evaluate_continuity",
+            # v0.16 — Execution Lineage
+            "start_execution", "retry_task", "spawn_subtask",
+            "trace_execution", "end_execution",
+            # v0.17 — Runtime Reliability Signals
+            "detect_drift", "score_recovery", "recommend_recovery",
         }
 
     def test_handlers_registered(self):

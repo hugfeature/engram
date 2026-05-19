@@ -432,37 +432,57 @@ VALID_INTERRUPTION_REASONS = {
 }
 
 # Recovery strategy per interruption reason — consumed by handlers.
+# v0.17: enriched with severity / recoverability / data_loss_risk for
+# Interruption Intelligence signals.
 RECOVERY_STRATEGIES: dict[str, dict] = {
     INTERRUPTION_OVERFLOW: {
         "action": "restore_checkpoint",
         "memory_restore_mode": "SELECTIVE",
         "hint": "Context window was full. Restore checkpoint and compress context before continuing.",
+        "severity": "medium",
+        "recoverability": "high",
+        "data_loss_risk": "none",
     },
     INTERRUPTION_USER_AWAY: {
         "action": "show_summary",
         "memory_restore_mode": "NONE",
         "hint": "User was away. Show a brief handoff summary to re-orient.",
+        "severity": "low",
+        "recoverability": "high",
+        "data_loss_risk": "none",
     },
     INTERRUPTION_TOOL_FAILURE: {
         "action": "restore_checkpoint",
         "memory_restore_mode": "SELECTIVE",
         "hint": "Tools failed repeatedly. Restore checkpoint, review failure records, and consider alternative approaches.",
         "include_failures": True,
+        "severity": "high",
+        "recoverability": "medium",
+        "data_loss_risk": "partial",
     },
     INTERRUPTION_CRASH: {
         "action": "restore_checkpoint",
         "memory_restore_mode": "FULL",
         "hint": "Process crashed unexpectedly. Full checkpoint restore recommended; verify data integrity.",
+        "severity": "critical",
+        "recoverability": "medium",
+        "data_loss_risk": "partial",
     },
     INTERRUPTION_RATE_LIMIT: {
         "action": "restore_checkpoint",
         "memory_restore_mode": "SELECTIVE",
         "hint": "API rate limit hit. Restore checkpoint; consider switching models or waiting before retrying.",
+        "severity": "low",
+        "recoverability": "high",
+        "data_loss_risk": "none",
     },
     INTERRUPTION_UNKNOWN: {
         "action": "show_summary",
         "memory_restore_mode": "NONE",
         "hint": "Previous session ended unexpectedly. Consider recalling its context.",
+        "severity": "medium",
+        "recoverability": "low",
+        "data_loss_risk": "partial",
     },
 }
 
@@ -489,6 +509,24 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at TIMESTAMP NOT NULL DEFAULT now(),
     updated_at TIMESTAMP NOT NULL DEFAULT now(),
     metadata JSON DEFAULT '{}'::JSON
+);
+"""
+
+# Execution Lineage — v0.16 Durable Runtime Continuity
+#
+# An execution represents a continuous runtime intent (from user initiation
+# to final completion/abandonment). Tasks are attempts within an execution.
+# execution_id is the lineage anchor; task_id is the attempt identifier.
+EXECUTION_SESSION_SQL = """
+CREATE TABLE IF NOT EXISTS execution_sessions (
+    execution_id VARCHAR PRIMARY KEY,
+    root_goal TEXT NOT NULL,
+    origin_checkpoint VARCHAR,
+    status VARCHAR NOT NULL DEFAULT 'active',
+    user_id VARCHAR NOT NULL DEFAULT 'default',
+    last_active_at TIMESTAMP DEFAULT now(),
+    continuity_score DOUBLE,
+    created_at TIMESTAMP NOT NULL DEFAULT now()
 );
 """
 
@@ -547,6 +585,12 @@ class TaskRow:
     created_at: datetime
     updated_at: datetime
     metadata: dict | None = field(default=None)
+    execution_id: str | None = field(default=None)
+    previous_task_id: int | None = field(default=None)
+    checkpoint_id: str | None = field(default=None)
+    attempt: int = field(default=1)
+    parent_task_id: int | None = field(default=None)
+    retry_of_task_id: int | None = field(default=None)
 
 @dataclass
 class MemoryRow:
@@ -630,14 +674,35 @@ class MemoryDB:
                 "Residue files detected near %s — may indicate prior corruption: %s",
                 db_path, self._residue_files,
             )
-        self.conn = _connect_with_retry(db_path)
+        try:
+            self.conn = _connect_with_retry(db_path)
+        except DatabaseLockedError as lock_err:
+            # v0.16: graceful fallback — another engram holds the lock.
+            # Open read-only instead of crashing. Writes will fail with
+            # DegradedModeError, which MCP clients can surface clearly.
+            log.warning(
+                "DuckDB locked by another process — entering readonly mode. "
+                "Reads will work; writes will return degraded_mode errors. "
+                "Stop the other engram process to regain write access."
+            )
+            try:
+                self.conn = duckdb.connect(db_path, read_only=True)
+            except Exception:
+                # If even read-only fails, create an in-memory fallback
+                self.conn = duckdb.connect(":memory:")
+            self._readonly = True
+            self._readonly_reason = (
+                f"DuckDB locked by another process ({lock_err.original}). "
+                "Stop the other engram process or run `engram-server stop`."
+            )
         self._dim = dim or _dim()
         # Populated by _init_meta(): the duckdb_version recorded by the
         # previous boot, BEFORE this boot overwrote it. Maintenance hook
         # uses this to decide whether to make a pre-upgrade backup.
         self.previous_duckdb_version: str | None = None
         self.current_duckdb_version: str | None = None
-        self._init_schema()
+        if not self._readonly:
+            self._init_schema()
         # Best-effort: kick off async maintenance (backup pruning + duckdb
         # upgrade detection). Never blocks boot, never raises.
         self._schedule_maintenance()
@@ -708,6 +773,34 @@ class MemoryDB:
                 self._readonly_reason or "MemoryDB is in readonly degraded mode",
                 self._db_path,
             )
+
+    def _execute_with_retry(self, sql: str, params=None, max_retries: int = 3):
+        """Execute a write SQL with retry + exponential backoff on lock conflicts.
+
+        DuckDB may transiently fail writes if WAL checkpointing or another
+        operation holds an internal lock. This retries up to max_retries
+        times with exponential backoff (0.1s, 0.3s, 0.9s).
+        """
+        import time as _t
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                return self.conn.execute(sql, params or [])
+            except (duckdb.IOException, duckdb.InternalException) as exc:
+                if _is_lock_conflict(exc):
+                    last_err = exc
+                    delay = 0.1 * (3 ** attempt)
+                    log.warning(
+                        "Write retry %d/%d — lock conflict, backing off %.1fs",
+                        attempt + 1, max_retries, delay,
+                    )
+                    _t.sleep(delay)
+                else:
+                    raise
+        raise DegradedModeError(
+            f"Write failed after {max_retries} retries due to lock conflict: {last_err}",
+            self._db_path,
+        )
 
     def enter_degraded_mode(self, reason: str) -> None:
         """Force the DB into readonly degraded mode (e.g. on partial schema)."""
@@ -828,18 +921,32 @@ class MemoryDB:
         self.conn.execute(TASK_SQL)
         self.conn.execute(CHECKPOINT_SQL)
         self.conn.execute(ENGRAM_META_SQL)
-        # tasks 表加列：缓存最新 checkpoint + 为未来 execution graph 留位
-        # (parent_task_id / retry_of_task_id 暂不实现读写, 仅留位避免破坏性迁移)
+        self.conn.execute(EXECUTION_SESSION_SQL)
+        # tasks 表加列：缓存最新 checkpoint + execution lineage
         for ddl in (
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS latest_checkpoint_version INTEGER DEFAULT 0",
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS checkpoint_count INTEGER DEFAULT 0",
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS parent_task_id INTEGER",
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS retry_of_task_id INTEGER",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS execution_id VARCHAR",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS previous_task_id INTEGER",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS checkpoint_id VARCHAR",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS attempt INTEGER DEFAULT 1",
         ):
             try:
                 self.conn.execute(ddl)
             except Exception as e:
                 log.debug("ALTER tasks (extra cols) skipped: %s", e)
+        # execution_sessions 索引
+        for ddl in (
+            "CREATE INDEX IF NOT EXISTS idx_exec_sessions_status ON execution_sessions(status)",
+            "CREATE INDEX IF NOT EXISTS idx_exec_sessions_user ON execution_sessions(user_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_execution ON tasks(execution_id)",
+        ):
+            try:
+                self.conn.execute(ddl)
+            except Exception as e:
+                log.debug("CREATE INDEX on execution/tasks skipped: %s", e)
         # session_lifecycle 表加列：v0.12 Interruption Taxonomy
         for ddl in (
             "ALTER TABLE session_lifecycle ADD COLUMN IF NOT EXISTS interruption_reason VARCHAR",
@@ -849,6 +956,15 @@ class MemoryDB:
                 self.conn.execute(ddl)
             except Exception as exc:
                 log.debug("ALTER session_lifecycle (taxonomy cols) skipped: %s", exc)
+        # checkpoints 表加列：v0.16 Semantic Completeness
+        for ddl in (
+            "ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS active_constraints JSON DEFAULT '[]'::JSON",
+            "ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS blocked_reasons JSON DEFAULT '[]'::JSON",
+        ):
+            try:
+                self.conn.execute(ddl)
+            except Exception as e:
+                log.debug("ALTER checkpoints (semantic cols) skipped: %s", e)
         # checkpoints 表索引（task 内按 version 倒序查找最高频）
         for ddl in (
             "CREATE INDEX IF NOT EXISTS idx_checkpoints_task_version ON checkpoints(task_id, version DESC)",
@@ -1551,7 +1667,144 @@ class MemoryDB:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             metadata=_parse_metadata(row.get("metadata")),
+            execution_id=row.get("execution_id"),
+            previous_task_id=row.get("previous_task_id"),
+            checkpoint_id=row.get("checkpoint_id"),
+            attempt=row.get("attempt", 1),
+            parent_task_id=row.get("parent_task_id"),
+            retry_of_task_id=row.get("retry_of_task_id"),
         )
+
+    # ================================================================
+    # Execution Lineage — v0.16
+    # ================================================================
+
+    def create_execution(self, execution_id: str, root_goal: str,
+                         user_id: str = "default",
+                         origin_checkpoint: str | None = None) -> str:
+        """Create a new execution session (a continuous runtime intent)."""
+        self._assert_writable()
+        self.conn.execute(
+            """
+            INSERT INTO execution_sessions
+                (execution_id, root_goal, origin_checkpoint, status, user_id)
+            VALUES (?, ?, ?, 'active', ?)
+            """,
+            [execution_id, root_goal, origin_checkpoint, user_id],
+        )
+        self._emit_event("execution.start", {
+            "execution_id": execution_id,
+            "root_goal": root_goal,
+            "origin_checkpoint": origin_checkpoint,
+            "user_id": user_id,
+        })
+        return execution_id
+
+    def end_execution(self, execution_id: str, status: str = "completed",
+                      continuity_score: float | None = None) -> bool:
+        """Mark an execution as completed or abandoned."""
+        self._assert_writable()
+        sets = ["status = ?", "last_active_at = now()"]
+        params: list = [status]
+        if continuity_score is not None:
+            sets.append("continuity_score = ?")
+            params.append(continuity_score)
+        params.append(execution_id)
+        row = self.conn.execute(
+            f"UPDATE execution_sessions SET {', '.join(sets)} WHERE execution_id = ? RETURNING execution_id",
+            params,
+        ).fetchone()
+        if row:
+            self._emit_event("execution.end", {
+                "execution_id": execution_id,
+                "status": status,
+                "continuity_score": continuity_score,
+            })
+        return row is not None
+
+    def get_execution(self, execution_id: str) -> dict | None:
+        """Get an execution session by ID."""
+        row = self._fetchone_dict(
+            "SELECT * FROM execution_sessions WHERE execution_id = ?",
+            [execution_id],
+        )
+        return row
+
+    def get_active_executions(self, user_id: str = "default") -> list[dict]:
+        """List all active executions for a user."""
+        return self._fetchall_dicts(
+            """
+            SELECT * FROM execution_sessions
+            WHERE user_id = ? AND status = 'active'
+            ORDER BY last_active_at DESC
+            """,
+            [user_id],
+        )
+
+    def create_task_in_execution(self, name: str, goal: str,
+                                 execution_id: str,
+                                 user_id: str = "default",
+                                 previous_task_id: int | None = None,
+                                 parent_task_id: int | None = None,
+                                 retry_of_task_id: int | None = None,
+                                 checkpoint_id: str | None = None,
+                                 attempt: int = 1,
+                                 metadata: dict | None = None) -> int:
+        """Create a task within an execution lineage."""
+        self._assert_writable()
+        meta_json = json.dumps(metadata or {}, ensure_ascii=False)
+        result = self.conn.execute(
+            """
+            INSERT INTO tasks (name, goal, status, user_id, metadata,
+                               execution_id, previous_task_id, parent_task_id,
+                               retry_of_task_id, checkpoint_id, attempt)
+            VALUES (?, ?, 'in_progress', ?, ?::JSON, ?, ?, ?, ?, ?, ?)
+            RETURNING id
+            """,
+            [name, goal, user_id, meta_json,
+             execution_id, previous_task_id, parent_task_id,
+             retry_of_task_id, checkpoint_id, attempt],
+        ).fetchone()
+        task_id = result[0]
+        # Update execution last_active_at
+        self.conn.execute(
+            "UPDATE execution_sessions SET last_active_at = now() WHERE execution_id = ?",
+            [execution_id],
+        )
+        return task_id
+
+    def get_execution_tasks(self, execution_id: str) -> list[TaskRow]:
+        """Get all tasks in an execution, ordered by creation time."""
+        rows = self._fetchall_dicts(
+            """
+            SELECT id, name, goal, status, user_id, created_at, updated_at,
+                   metadata, execution_id, previous_task_id, checkpoint_id,
+                   attempt, parent_task_id, retry_of_task_id
+            FROM tasks WHERE execution_id = ?
+            ORDER BY created_at ASC
+            """,
+            [execution_id],
+        )
+        return [self._row_to_task(r) for r in rows]
+
+    def get_retry_chain(self, task_id: int) -> list[TaskRow]:
+        """Walk the retry chain backwards from a task."""
+        chain = []
+        current_id = task_id
+        seen = set()
+        while current_id and current_id not in seen:
+            seen.add(current_id)
+            task = self.get_task(current_id)
+            if not task:
+                break
+            chain.append(task)
+            current_id = task.retry_of_task_id
+        chain.reverse()
+        return chain
+
+    # ================================================================
+    # Task CRUD (original + extended)
+    # ================================================================
 
     def create_task(self, name: str, goal: str = "", status: str = "planning",
                     user_id: str = "default", metadata: dict | None = None) -> int:
@@ -1580,7 +1833,9 @@ class MemoryDB:
     def get_task(self, task_id: int) -> TaskRow | None:
         row = self._fetchone_dict(
             """
-            SELECT id, name, goal, status, user_id, created_at, updated_at, metadata
+            SELECT id, name, goal, status, user_id, created_at, updated_at,
+                   metadata, execution_id, previous_task_id, checkpoint_id,
+                   attempt, parent_task_id, retry_of_task_id
             FROM tasks WHERE id = ?
             """,
             [task_id],
@@ -1622,7 +1877,9 @@ class MemoryDB:
         if status:
             rows = self._fetchall_dicts(
                 """
-                SELECT id, name, goal, status, user_id, created_at, updated_at, metadata
+                SELECT id, name, goal, status, user_id, created_at, updated_at,
+                       metadata, execution_id, previous_task_id, checkpoint_id,
+                       attempt, parent_task_id, retry_of_task_id
                 FROM tasks WHERE user_id = ? AND status = ?
                 ORDER BY updated_at DESC
                 """,
@@ -1631,7 +1888,9 @@ class MemoryDB:
         else:
             rows = self._fetchall_dicts(
                 """
-                SELECT id, name, goal, status, user_id, created_at, updated_at, metadata
+                SELECT id, name, goal, status, user_id, created_at, updated_at,
+                       metadata, execution_id, previous_task_id, checkpoint_id,
+                       attempt, parent_task_id, retry_of_task_id
                 FROM tasks WHERE user_id = ?
                 ORDER BY updated_at DESC
                 """,

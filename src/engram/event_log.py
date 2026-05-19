@@ -46,7 +46,11 @@ SEQ_FILE_NAME = ".seq"
 TIER1_KINDS = frozenset({
     "task.create",
     "task.update",
+    "task.retry",
+    "task.spawn",
     "checkpoint.write",
+    "execution.start",
+    "execution.end",
     "session.start",
     "session.end",
     "session.outcome",

@@ -11,3 +11,4 @@ build/
 benchmark/data/
 benchmark/results/
 .aone_copilot/
+.drift-state.json
