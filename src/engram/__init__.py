@@ -8,4 +8,4 @@ Two laws:
     2. If it cannot be replayed, it is not critical state.
 """
 
-__version__ = "0.15.2"
+__version__ = "0.16.0"

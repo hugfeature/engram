@@ -674,4 +674,298 @@ TOOL_SCHEMAS: list[Tool] = [
             "required": ["task_id"],
         },
     ),
+    # ================================================================
+    # Execution Lineage — v0.16 Durable Runtime Continuity
+    # ================================================================
+    Tool(
+        name="start_execution",
+        description=(
+            "Start a new execution lineage — a continuous runtime intent that persists "
+            "across interruptions, retries, and session boundaries (WRITE — has side effects). "
+            "An execution is the durable entity; tasks within it are individual attempts. "
+            "Call when beginning a non-trivial multi-step task that may survive interruptions. "
+            "Returns execution_id (UUID) and the first task_id (attempt #1). "
+            "If resuming from a previous checkpoint, pass origin_checkpoint to establish lineage."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "goal": {
+                    "type": "string",
+                    "description": "The high-level goal of this execution. Should be stable across retries.",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "Memory partition key.",
+                    "default": "default",
+                },
+                "origin_checkpoint": {
+                    "type": "string",
+                    "description": "Checkpoint ID this execution spawns from. Establishes resume lineage.",
+                },
+            },
+            "required": ["goal"],
+        },
+    ),
+    Tool(
+        name="retry_task",
+        description=(
+            "Retry a failed/interrupted task within the same execution lineage "
+            "(WRITE — has side effects). Creates a new task as the next attempt, "
+            "preserving the retry chain for lineage tracing. "
+            "The original task is marked cancelled. The new task inherits the same "
+            "execution_id and goal. Call when an agent resumes after interruption "
+            "or when a task fails and needs re-execution."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "integer",
+                    "description": "ID of the task to retry (the failed/interrupted one).",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why this retry is needed (e.g. 'context_overflow', 'tool_failure', 'user_correction').",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "Memory partition key.",
+                    "default": "default",
+                },
+            },
+            "required": ["task_id"],
+        },
+    ),
+    Tool(
+        name="spawn_subtask",
+        description=(
+            "Spawn a subtask within an existing execution lineage "
+            "(WRITE — has side effects). Creates a child task under the parent, "
+            "sharing the same execution_id. Use when decomposing a complex task "
+            "into smaller units that should be tracked as part of the same execution."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "parent_task_id": {
+                    "type": "integer",
+                    "description": "ID of the parent task.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Short name for the subtask.",
+                },
+                "goal": {
+                    "type": "string",
+                    "description": "Goal of the subtask. Defaults to name if omitted.",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "Memory partition key.",
+                    "default": "default",
+                },
+                "checkpoint_id": {
+                    "type": "string",
+                    "description": "Optional checkpoint ID this subtask spawns from.",
+                },
+            },
+            "required": ["parent_task_id", "name"],
+        },
+    ),
+    Tool(
+        name="trace_execution",
+        description=(
+            "Trace the full execution lineage — all attempts, retries, and spawned subtasks "
+            "(read-only, no side effects). Returns the execution metadata, all task nodes "
+            "with their relationships (retry_of, parent, previous), and identifies the "
+            "current active task. Use to understand where execution is, what's been tried, "
+            "and what the retry history looks like."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "UUID of the execution to trace.",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "Memory partition key.",
+                    "default": "default",
+                },
+            },
+            "required": ["execution_id"],
+        },
+    ),
+    Tool(
+        name="end_execution",
+        description=(
+            "Mark an execution as completed, abandoned, or paused "
+            "(WRITE — has side effects). Call when the execution's root goal is "
+            "achieved, permanently given up, or deliberately suspended for later."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "UUID of the execution to end.",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["completed", "abandoned", "paused"],
+                    "description": "'completed': goal achieved. 'abandoned': permanently given up. 'paused': suspended for later.",
+                    "default": "completed",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "Memory partition key.",
+                    "default": "default",
+                },
+            },
+            "required": ["execution_id"],
+        },
+    ),
+    # ---- v0.17: Runtime Reliability Signal tools ----
+    Tool(
+        name="detect_drift",
+        description=(
+            "Detect execution drift after a checkpoint restore or retry "
+            "(READ — no side effects). Compares your current state against the "
+            "checkpoint baseline to identify goal drift, tool drift, planning drift, "
+            "and constraint drift. Call after restoring a checkpoint and performing "
+            "some actions to check whether execution is still on track. "
+            "Returns a composite drift score (0.0=on track, 1.0=fully diverged) "
+            "and per-dimension signals."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "integer",
+                    "description": "The task to check drift for.",
+                },
+                "current_goal": {
+                    "type": "string",
+                    "description": "Your current stated goal (what you are working on right now).",
+                },
+                "tools_used": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of tool names you have used since the last checkpoint restore.",
+                },
+                "actions_taken": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of actions performed since restore (used for constraint violation detection).",
+                },
+                "in_progress": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Items you are currently working on.",
+                },
+                "violated_constraints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Any active_constraints you know you have violated.",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "Memory partition key.",
+                    "default": "default",
+                },
+            },
+            "required": ["task_id", "current_goal"],
+        },
+    ),
+    Tool(
+        name="score_recovery",
+        description=(
+            "Score the semantic continuity of a recovery "
+            "(READ — no side effects). Call after restoring a checkpoint to measure "
+            "how well you have re-oriented. Returns goal_alignment, constraint_retention, "
+            "task_position_alignment, tool_behavior_stability, retry_degradation, "
+            "and an overall recovery_confidence score."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "integer",
+                    "description": "The task whose recovery to score.",
+                },
+                "goal": {
+                    "type": "string",
+                    "description": "Your current stated goal after restore.",
+                },
+                "completed": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Items you recognize as already completed.",
+                },
+                "in_progress": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Items you are currently working on.",
+                },
+                "must_not_redo": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Items you acknowledge you must NOT redo.",
+                },
+                "active_constraints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Constraints you are aware of and will respect.",
+                },
+                "tools_used": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tools you have used since restore.",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "Memory partition key.",
+                    "default": "default",
+                },
+            },
+            "required": ["task_id", "goal"],
+        },
+    ),
+    Tool(
+        name="recommend_recovery",
+        description=(
+            "Get a lightweight recovery recommendation for a task "
+            "(READ — no side effects). Returns a recommended action "
+            "(restore_checkpoint / start_fresh / abandon / show_summary) "
+            "based on interruption reason, retry depth, and checkpoint freshness. "
+            "This is NOT a policy engine — just heuristics."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "integer",
+                    "description": "The task to get recovery recommendation for.",
+                },
+                "interruption_reason": {
+                    "type": "string",
+                    "enum": ["overflow", "user_away", "tool_failure", "crash", "rate_limit", "unknown"],
+                    "description": "Why the execution was interrupted.",
+                },
+                "retry_count": {
+                    "type": "integer",
+                    "description": "How many times this has already been retried.",
+                    "default": 0,
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "Memory partition key.",
+                    "default": "default",
+                },
+            },
+            "required": ["task_id"],
+        },
+    ),
 ]

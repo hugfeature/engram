@@ -74,7 +74,11 @@ class RecoverReport:
 _REPLAYABLE = {
     "task.create",
     "task.update",
+    "task.retry",
+    "task.spawn",
     "checkpoint.write",
+    "execution.start",
+    "execution.end",
     "session.start",
     "session.end",
     "session.outcome",
@@ -443,10 +447,79 @@ def _replay_memory_delete(db: MemoryDB, p: dict) -> None:
     db.conn.execute("DELETE FROM memories WHERE id = ?", [p["memory_id"]])
 
 
+# ---- Execution Lineage replay handlers (v0.16) ----
+
+def _replay_execution_start(db: MemoryDB, p: dict) -> None:
+    db.conn.execute(
+        """INSERT INTO execution_sessions
+               (execution_id, root_goal, origin_checkpoint, status, user_id)
+           VALUES (?, ?, ?, 'active', ?)
+           ON CONFLICT (execution_id) DO NOTHING""",
+        [
+            p["execution_id"],
+            p.get("root_goal", ""),
+            p.get("origin_checkpoint"),
+            p.get("user_id", "default"),
+        ],
+    )
+
+
+def _replay_execution_end(db: MemoryDB, p: dict) -> None:
+    sets = ["status = ?", "last_active_at = now()"]
+    params: list = [p.get("status", "completed")]
+    if p.get("continuity_score") is not None:
+        sets.append("continuity_score = ?")
+        params.append(p["continuity_score"])
+    params.append(p["execution_id"])
+    db.conn.execute(
+        f"UPDATE execution_sessions SET {', '.join(sets)} WHERE execution_id = ?",
+        params,
+    )
+
+
+def _replay_task_retry(db: MemoryDB, p: dict) -> None:
+    task_id = p["task_id"]
+    execution_id = p.get("execution_id")
+    retry_of = p.get("retry_of_task_id")
+    attempt = p.get("attempt", 1)
+    user_id = p.get("user_id", "default")
+    # Update existing task row with lineage fields (task was already created via task.create)
+    db.conn.execute(
+        """UPDATE tasks
+           SET execution_id = ?, retry_of_task_id = ?, previous_task_id = ?, attempt = ?
+           WHERE id = ?""",
+        [execution_id, retry_of, retry_of, attempt, task_id],
+    )
+    # Mark the retried task as cancelled
+    if retry_of:
+        db.conn.execute(
+            "UPDATE tasks SET status = 'cancelled' WHERE id = ? AND status NOT IN ('done', 'cancelled')",
+            [retry_of],
+        )
+
+
+def _replay_task_spawn(db: MemoryDB, p: dict) -> None:
+    task_id = p["task_id"]
+    execution_id = p.get("execution_id")
+    parent_task_id = p.get("parent_task_id")
+    checkpoint_id = p.get("checkpoint_id")
+    # Update existing task row with lineage fields
+    db.conn.execute(
+        """UPDATE tasks
+           SET execution_id = ?, parent_task_id = ?, checkpoint_id = ?
+           WHERE id = ?""",
+        [execution_id, parent_task_id, checkpoint_id, task_id],
+    )
+
+
 _REPLAY_HANDLERS = {
     "task.create": _replay_task_create,
     "task.update": _replay_task_update,
+    "task.retry": _replay_task_retry,
+    "task.spawn": _replay_task_spawn,
     "checkpoint.write": _replay_checkpoint_write,
+    "execution.start": _replay_execution_start,
+    "execution.end": _replay_execution_end,
     "session.start": _replay_session_start,
     "session.end": _replay_session_end,
     "session.outcome": _replay_session_outcome,

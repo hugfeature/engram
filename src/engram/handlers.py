@@ -897,7 +897,7 @@ def handle_get_task(db: MemoryDB, graph: MemoryGraph, task_id: int,
                 "checkpoint_reason": latest["reason"],
                 "created_at": latest["created_at"].isoformat() if latest.get("created_at") else None,
                 "failure_signature": latest.get("failure_signature"),
-                "continuation": checkpoint.build_continuation(latest),
+                "continuation": checkpoint.build_continuation(latest, db=db),
             }
     except Exception as exc:
         log.debug("get_task latest_checkpoint injection failed (non-fatal): %s", exc)
@@ -986,7 +986,7 @@ def handle_restore_checkpoint(db: MemoryDB, graph: MemoryGraph,
             },
         }
 
-    continuation = checkpoint.build_continuation(ckpt_row)
+    continuation = checkpoint.build_continuation(ckpt_row, db=db)
 
     result = {
         "task_id": tid,
@@ -1166,7 +1166,7 @@ def handle_report_interruption(db: MemoryDB, graph: MemoryGraph,
     If session_id is provided, the session is also updated immediately so the
     taxonomy is visible even if atexit doesn't fire.
     """
-    from .db import VALID_INTERRUPTION_REASONS, INTERRUPTION_UNKNOWN
+    from .db import VALID_INTERRUPTION_REASONS, INTERRUPTION_UNKNOWN, RECOVERY_STRATEGIES
     from .shared import set_interruption_report
 
     user_id = _validate_user_id(user_id)
@@ -1187,10 +1187,20 @@ def handle_report_interruption(db: MemoryDB, graph: MemoryGraph,
         except Exception as exc:
             log.warning("Immediate session close failed (will retry on exit): %s", exc)
 
+    # v0.17: Interruption Intelligence — enrich with severity/recoverability
+    strategy = RECOVERY_STRATEGIES.get(reason, RECOVERY_STRATEGIES[INTERRUPTION_UNKNOWN])
+
     return {
         "ok": True,
         "reason": reason,
         "result": f"Interruption reported: {reason}. Session will be classified on exit.",
+        "intelligence": {
+            "severity": strategy.get("severity", "medium"),
+            "recoverability": strategy.get("recoverability", "low"),
+            "data_loss_risk": strategy.get("data_loss_risk", "partial"),
+            "recommended_action": strategy["action"],
+            "memory_restore_mode": strategy.get("memory_restore_mode", "NONE"),
+        },
     }
 
 
@@ -1252,6 +1262,453 @@ def handle_evaluate_continuity(db: MemoryDB, graph: MemoryGraph,
     }
 
 
+# ============================================================
+# Execution Lineage — v0.16 Durable Runtime Continuity
+# ============================================================
+
+import uuid as _uuid
+
+
+def handle_start_execution(db: MemoryDB, graph: MemoryGraph,
+                           goal: str, user_id: str = "default",
+                           origin_checkpoint: str | None = None) -> dict:
+    """Start a new execution lineage — a continuous runtime intent."""
+    if not goal or not goal.strip():
+        return _error("goal must be non-empty")
+    user_id = _validate_user_id(user_id)
+    execution_id = str(_uuid.uuid4())
+    try:
+        db.create_execution(
+            execution_id=execution_id,
+            root_goal=goal.strip(),
+            user_id=user_id,
+            origin_checkpoint=origin_checkpoint,
+        )
+    except DegradedModeError as exc:
+        return _degraded_error(exc)
+    # Create the first task (attempt #1) within this execution
+    task_id = db.create_task_in_execution(
+        name=goal.strip()[:100],
+        goal=goal.strip(),
+        execution_id=execution_id,
+        user_id=user_id,
+        checkpoint_id=origin_checkpoint,
+        attempt=1,
+    )
+    db._emit_event("task.create", {
+        "task_id": task_id,
+        "name": goal.strip()[:100],
+        "goal": goal.strip(),
+        "execution_id": execution_id,
+        "user_id": user_id,
+        "checkpoint_id": origin_checkpoint,
+        "attempt": 1,
+    })
+    return {
+        "ok": True,
+        "execution_id": execution_id,
+        "task_id": task_id,
+        "attempt": 1,
+        "message": f"Execution started. task_id={task_id} is attempt #1.",
+    }
+
+
+def handle_retry_task(db: MemoryDB, graph: MemoryGraph,
+                      task_id: int, reason: str = "",
+                      user_id: str = "default") -> dict:
+    """Retry a failed task within the same execution lineage."""
+    tid = _validate_task_id(task_id)
+    if tid is None:
+        return _error("task_id must be a valid integer")
+    user_id = _validate_user_id(user_id)
+    original = db.get_task(tid)
+    if not original:
+        return _error(f"Task {tid} not found")
+    if original.user_id != user_id:
+        return _error(f"Task {tid} not found for user '{user_id}'")
+    if not original.execution_id:
+        return _error(f"Task {tid} is not part of an execution lineage")
+
+    # Determine attempt number from retry chain
+    chain = db.get_retry_chain(tid)
+    new_attempt = len(chain) + 1
+
+    try:
+        new_task_id = db.create_task_in_execution(
+            name=original.name,
+            goal=original.goal,
+            execution_id=original.execution_id,
+            user_id=user_id,
+            previous_task_id=tid,
+            retry_of_task_id=tid,
+            attempt=new_attempt,
+        )
+    except DegradedModeError as exc:
+        return _degraded_error(exc)
+
+    # Mark original task as failed if not already
+    if original.status not in ("done", "cancelled"):
+        db.update_task(tid, status="cancelled")
+
+    db._emit_event("task.retry", {
+        "task_id": new_task_id,
+        "retry_of_task_id": tid,
+        "execution_id": original.execution_id,
+        "attempt": new_attempt,
+        "reason": reason,
+        "user_id": user_id,
+    })
+
+    return {
+        "ok": True,
+        "execution_id": original.execution_id,
+        "new_task_id": new_task_id,
+        "retry_of_task_id": tid,
+        "attempt": new_attempt,
+        "message": f"Retry created. task_id={new_task_id} is attempt #{new_attempt} of execution {original.execution_id}.",
+    }
+
+
+def handle_spawn_subtask(db: MemoryDB, graph: MemoryGraph,
+                         parent_task_id: int, name: str, goal: str = "",
+                         user_id: str = "default",
+                         checkpoint_id: str | None = None) -> dict:
+    """Spawn a subtask within the same execution lineage."""
+    ptid = _validate_task_id(parent_task_id)
+    if ptid is None:
+        return _error("parent_task_id must be a valid integer")
+    if not name or not name.strip():
+        return _error("name must be non-empty")
+    user_id = _validate_user_id(user_id)
+    parent = db.get_task(ptid)
+    if not parent:
+        return _error(f"Parent task {ptid} not found")
+    if parent.user_id != user_id:
+        return _error(f"Parent task {ptid} not found for user '{user_id}'")
+    if not parent.execution_id:
+        return _error(f"Parent task {ptid} is not part of an execution lineage")
+
+    try:
+        new_task_id = db.create_task_in_execution(
+            name=name.strip(),
+            goal=goal or name.strip(),
+            execution_id=parent.execution_id,
+            user_id=user_id,
+            parent_task_id=ptid,
+            checkpoint_id=checkpoint_id,
+            attempt=1,
+        )
+    except DegradedModeError as exc:
+        return _degraded_error(exc)
+
+    db._emit_event("task.spawn", {
+        "task_id": new_task_id,
+        "parent_task_id": ptid,
+        "execution_id": parent.execution_id,
+        "name": name.strip(),
+        "goal": goal or name.strip(),
+        "checkpoint_id": checkpoint_id,
+        "user_id": user_id,
+    })
+
+    return {
+        "ok": True,
+        "execution_id": parent.execution_id,
+        "new_task_id": new_task_id,
+        "parent_task_id": ptid,
+        "message": f"Subtask spawned (id={new_task_id}) under parent task {ptid}.",
+    }
+
+
+def handle_trace_execution(db: MemoryDB, graph: MemoryGraph,
+                           execution_id: str, user_id: str = "default") -> dict:
+    """Trace the full execution lineage — all attempts, retries, spawns."""
+    if not execution_id or not execution_id.strip():
+        return _error("execution_id must be non-empty")
+    user_id = _validate_user_id(user_id)
+    execution = db.get_execution(execution_id)
+    if not execution:
+        return _error(f"Execution {execution_id} not found")
+    if execution.get("user_id") != user_id:
+        return _error(f"Execution {execution_id} not found for user '{user_id}'")
+
+    tasks = db.get_execution_tasks(execution_id)
+
+    # Build lineage structure
+    task_nodes = []
+    for t in tasks:
+        node = {
+            "task_id": t.id,
+            "name": t.name,
+            "goal": t.goal,
+            "status": t.status,
+            "attempt": t.attempt,
+            "parent_task_id": t.parent_task_id,
+            "previous_task_id": t.previous_task_id,
+            "retry_of_task_id": t.retry_of_task_id,
+            "checkpoint_id": t.checkpoint_id,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+        }
+        task_nodes.append(node)
+
+    # Identify current active task
+    active_tasks = [t for t in tasks if t.status in ("planning", "in_progress", "blocked")]
+    current_task = active_tasks[-1] if active_tasks else (tasks[-1] if tasks else None)
+
+    return {
+        "ok": True,
+        "execution": {
+            "execution_id": execution_id,
+            "root_goal": execution.get("root_goal"),
+            "status": execution.get("status"),
+            "origin_checkpoint": execution.get("origin_checkpoint"),
+            "continuity_score": execution.get("continuity_score"),
+            "created_at": execution["created_at"].isoformat() if execution.get("created_at") else None,
+            "last_active_at": execution["last_active_at"].isoformat() if execution.get("last_active_at") else None,
+        },
+        "tasks": task_nodes,
+        "total_attempts": len(task_nodes),
+        "current_task_id": current_task.id if current_task else None,
+    }
+
+
+def handle_end_execution(db: MemoryDB, graph: MemoryGraph,
+                         execution_id: str, status: str = "completed",
+                         user_id: str = "default") -> dict:
+    """Mark an execution as completed or abandoned."""
+    if not execution_id or not execution_id.strip():
+        return _error("execution_id must be non-empty")
+    valid_statuses = ("completed", "abandoned", "paused")
+    if status not in valid_statuses:
+        return _error(f"status must be one of {valid_statuses}")
+    user_id = _validate_user_id(user_id)
+    execution = db.get_execution(execution_id)
+    if not execution:
+        return _error(f"Execution {execution_id} not found")
+    if execution.get("user_id") != user_id:
+        return _error(f"Execution {execution_id} not found for user '{user_id}'")
+
+    try:
+        db.end_execution(execution_id, status=status)
+    except DegradedModeError as exc:
+        return _degraded_error(exc)
+
+    return {
+        "ok": True,
+        "execution_id": execution_id,
+        "status": status,
+        "message": f"Execution {execution_id} marked as {status}.",
+    }
+
+
+# ---- v0.17: Runtime Reliability Signal handlers ----
+
+
+def handle_detect_drift(db: MemoryDB, graph: MemoryGraph,
+                        task_id: int,
+                        current_goal: str = "",
+                        tools_used: list[str] | None = None,
+                        actions_taken: list[str] | None = None,
+                        in_progress: list[str] | None = None,
+                        violated_constraints: list[str] | None = None,
+                        user_id: str = "default") -> dict:
+    """Detect execution drift after a checkpoint restore or retry.
+
+    Compares the Agent's current reported state against the checkpoint baseline
+    to identify goal drift, tool drift, planning drift, and constraint drift.
+    """
+    from .drift import detect_drift
+
+    user_id = _validate_user_id(user_id)
+    task_id = int(task_id)
+
+    current_state = {
+        "goal": current_goal,
+        "tools_used": tools_used or [],
+        "actions_taken": actions_taken or [],
+        "in_progress": in_progress or [],
+        "violated_constraints": violated_constraints or [],
+    }
+
+    try:
+        signal = detect_drift(db, task_id, current_state, user_id=user_id)
+    except Exception as exc:
+        return _error(f"Drift detection failed: {exc}")
+
+    result = signal.to_dict()
+    # Classify drift severity
+    if signal.composite >= 0.7:
+        result["severity"] = "critical"
+        result["recommendation"] = "Execution has drifted significantly. Consider abandoning this retry and restoring from checkpoint."
+    elif signal.composite >= 0.4:
+        result["severity"] = "high"
+        result["recommendation"] = "Notable drift detected. Re-read checkpoint constraints and re-align with original goal."
+    elif signal.composite >= 0.2:
+        result["severity"] = "medium"
+        result["recommendation"] = "Minor drift detected. Stay aware of original constraints."
+    else:
+        result["severity"] = "low"
+        result["recommendation"] = "Execution is on track."
+
+    return {"ok": True, "task_id": task_id, "drift": result}
+
+
+def handle_score_recovery(db: MemoryDB, graph: MemoryGraph,
+                          task_id: int,
+                          goal: str = "",
+                          completed: list[str] | None = None,
+                          in_progress: list[str] | None = None,
+                          must_not_redo: list[str] | None = None,
+                          active_constraints: list[str] | None = None,
+                          tools_used: list[str] | None = None,
+                          user_id: str = "default") -> dict:
+    """Score the semantic continuity of a recovery.
+
+    Called after a checkpoint restore to measure how well the Agent has
+    re-oriented. Returns goal_alignment, constraint_retention,
+    task_position_alignment, tool_behavior_stability, retry_degradation,
+    and recovery_confidence.
+    """
+    from .reliability import score_recovery
+
+    user_id = _validate_user_id(user_id)
+    task_id = int(task_id)
+
+    post_restore_state = {
+        "goal": goal,
+        "completed": completed or [],
+        "in_progress": in_progress or [],
+        "must_not_redo": must_not_redo or [],
+        "active_constraints": active_constraints or [],
+        "tools_used": tools_used or [],
+    }
+
+    try:
+        score = score_recovery(db, task_id, post_restore_state, user_id=user_id)
+    except Exception as exc:
+        return _error(f"Recovery scoring failed: {exc}")
+
+    result = score.to_dict()
+
+    # Classify confidence level
+    if score.recovery_confidence >= 0.8:
+        result["confidence_level"] = "high"
+        result["recommendation"] = "Recovery looks solid. Continue execution."
+    elif score.recovery_confidence >= 0.5:
+        result["confidence_level"] = "medium"
+        result["recommendation"] = "Some continuity gaps. Re-read checkpoint state carefully."
+    else:
+        result["confidence_level"] = "low"
+        result["recommendation"] = "Poor continuity. Consider full checkpoint restore or starting fresh."
+
+    return {"ok": True, "task_id": task_id, "score": result}
+
+
+def handle_recommend_recovery(db: MemoryDB, graph: MemoryGraph,
+                              task_id: int,
+                              interruption_reason: str | None = None,
+                              retry_count: int = 0,
+                              user_id: str = "default") -> dict:
+    """Lightweight recovery heuristics — recommend a recovery action.
+
+    NOT a policy engine. Just hardcoded heuristics based on:
+    - interruption reason
+    - retry depth
+    - checkpoint freshness
+    - execution state
+    """
+    from .db import (
+        RECOVERY_STRATEGIES, INTERRUPTION_UNKNOWN,
+        VALID_INTERRUPTION_REASONS,
+    )
+    from . import checkpoint as _ckpt
+
+    user_id = _validate_user_id(user_id)
+    task_id = int(task_id)
+
+    # Get context
+    task = db.get_task(task_id)
+    if task is None:
+        return _error(f"Task {task_id} not found")
+
+    ckpt = _ckpt.get_checkpoint(db, task_id, user_id=user_id)
+    retry_chain = db.get_retry_chain(task_id)
+    retry_depth = len(retry_chain)
+
+    # Heuristic 1: Too many retries → abandon
+    if retry_depth >= 3:
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "action": "abandon",
+            "reason": f"Retry depth {retry_depth} exceeds threshold. Retrying further is unlikely to succeed.",
+            "confidence": 0.8,
+        }
+
+    # Heuristic 2: No checkpoint → can only start fresh
+    if ckpt is None:
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "action": "start_fresh",
+            "reason": "No checkpoint available. Must start execution from scratch.",
+            "confidence": 0.6,
+        }
+
+    # Heuristic 3: Interruption-specific strategy
+    reason = interruption_reason or INTERRUPTION_UNKNOWN
+    if reason not in VALID_INTERRUPTION_REASONS:
+        reason = INTERRUPTION_UNKNOWN
+
+    strategy = RECOVERY_STRATEGIES.get(reason, RECOVERY_STRATEGIES[INTERRUPTION_UNKNOWN])
+
+    # Heuristic 4: Checkpoint too old (> 2 hours) → start fresh
+    ckpt_age_seconds = 0
+    if ckpt.get("created_at"):
+        from datetime import datetime, timezone
+        try:
+            created = ckpt["created_at"]
+            if isinstance(created, str):
+                created = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            ckpt_age_seconds = (now - created).total_seconds()
+        except Exception:
+            pass
+
+    if ckpt_age_seconds > 7200:  # > 2 hours old
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "action": "start_fresh",
+            "reason": f"Checkpoint is {ckpt_age_seconds/3600:.1f}h old. State may be too stale for reliable restore.",
+            "confidence": 0.5,
+            "alternative": strategy["action"],
+        }
+
+    # Heuristic 5: Repeated tool failure → try different approach
+    if reason == "tool_failure" and retry_count > 1:
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "action": "restore_checkpoint",
+            "reason": "Repeated tool failures. Restore checkpoint and try alternative tools/approach.",
+            "confidence": 0.7,
+            "hint": "Consider using different tools or breaking the task into smaller steps.",
+        }
+
+    # Default: follow interruption-specific strategy
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "action": strategy["action"],
+        "reason": strategy["hint"],
+        "confidence": 0.7,
+        "memory_restore_mode": strategy.get("memory_restore_mode", "NONE"),
+        "severity": strategy.get("severity", "medium"),
+        "recoverability": strategy.get("recoverability", "low"),
+    }
+
+
 TOOL_HANDLERS = {
     "recall_memory": handle_recall,
     "store_memory": handle_store,
@@ -1271,6 +1728,14 @@ TOOL_HANDLERS = {
     "get_runtime_health": handle_get_runtime_health,
     "report_interruption": handle_report_interruption,
     "evaluate_continuity": handle_evaluate_continuity,
+    "start_execution": handle_start_execution,
+    "retry_task": handle_retry_task,
+    "spawn_subtask": handle_spawn_subtask,
+    "trace_execution": handle_trace_execution,
+    "end_execution": handle_end_execution,
+    "detect_drift": handle_detect_drift,
+    "score_recovery": handle_score_recovery,
+    "recommend_recovery": handle_recommend_recovery,
 }
 
 ARG_MAPPING = {
@@ -1308,4 +1773,26 @@ ARG_MAPPING = {
                             "after_version": "after_version",
                             "actions_taken_after_restore": "actions_taken_after_restore",
                             "user_id": "user_id"},
+    "start_execution": {"goal": "goal", "user_id": "user_id",
+                        "origin_checkpoint": "origin_checkpoint"},
+    "retry_task": {"task_id": "task_id", "reason": "reason", "user_id": "user_id"},
+    "spawn_subtask": {"parent_task_id": "parent_task_id", "name": "name",
+                      "goal": "goal", "user_id": "user_id",
+                      "checkpoint_id": "checkpoint_id"},
+    "trace_execution": {"execution_id": "execution_id", "user_id": "user_id"},
+    "end_execution": {"execution_id": "execution_id", "status": "status",
+                      "user_id": "user_id"},
+    "detect_drift": {"task_id": "task_id", "current_goal": "current_goal",
+                     "tools_used": "tools_used", "actions_taken": "actions_taken",
+                     "in_progress": "in_progress",
+                     "violated_constraints": "violated_constraints",
+                     "user_id": "user_id"},
+    "score_recovery": {"task_id": "task_id", "goal": "goal",
+                       "completed": "completed", "in_progress": "in_progress",
+                       "must_not_redo": "must_not_redo",
+                       "active_constraints": "active_constraints",
+                       "tools_used": "tools_used", "user_id": "user_id"},
+    "recommend_recovery": {"task_id": "task_id",
+                           "interruption_reason": "interruption_reason",
+                           "retry_count": "retry_count", "user_id": "user_id"},
 }
