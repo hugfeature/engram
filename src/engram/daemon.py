@@ -115,9 +115,84 @@ def cmd_run(host: str, port: int) -> None:
     # operators see them before serving any traffic.
     _warn_on_residue()
 
+    # Start auto-reload watcher — restarts this process when package is updated.
+    _start_reload_watcher()
+
     from engram.http_server import main as serve_main
     sys.argv = ["engram-server", "--host", host, "--port", str(port)]
     serve_main()
+
+
+# ---- Auto-reload on package update ----
+
+_RELOAD_CHECK_INTERVAL = 5  # seconds between version checks
+
+
+def _get_package_fingerprint() -> str:
+    """Get a fingerprint that changes when the package is reinstalled.
+
+    For editable installs: uses mtime of the source directory.
+    For regular installs: uses the installed package version + dist-info mtime.
+    Falls back to version string from importlib.metadata.
+    """
+    import importlib.metadata
+
+    try:
+        dist = importlib.metadata.distribution("mcp-engram")
+        version = dist.metadata["Version"]
+
+        # For editable installs, check source file mtimes
+        dist_files = dist.files
+        if dist_files:
+            # Use the direct_url.json or top_level.txt mtime as proxy
+            import engram
+            source_init = getattr(engram, "__file__", None)
+            if source_init and os.path.exists(source_init):
+                source_dir = os.path.dirname(source_init)
+                # Hash of mtimes of all .py files in package
+                mtimes = []
+                for root, _dirs, files in os.walk(source_dir):
+                    for fname in sorted(files):
+                        if fname.endswith(".py"):
+                            fpath = os.path.join(root, fname)
+                            try:
+                                mtimes.append(os.path.getmtime(fpath))
+                            except OSError:
+                                pass
+                return f"{version}:{max(mtimes) if mtimes else 0}"
+
+        return version
+    except Exception:
+        return "unknown"
+
+
+def _start_reload_watcher() -> None:
+    """Start a daemon thread that watches for package updates and restarts."""
+    import threading
+
+    initial_fingerprint = _get_package_fingerprint()
+
+    def _watch():
+        while True:
+            time.sleep(_RELOAD_CHECK_INTERVAL)
+            try:
+                current = _get_package_fingerprint()
+                if current != initial_fingerprint:
+                    sys.stderr.write(
+                        f"\n[engram] Package updated ({initial_fingerprint} → {current}). "
+                        f"Auto-restarting server...\n"
+                    )
+                    sys.stderr.flush()
+                    # exec replaces the current process with a fresh one
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+            except SystemExit:
+                return
+            except Exception as exc:
+                # Never crash the watcher — just log and continue
+                sys.stderr.write(f"[engram] reload watcher error: {exc}\n")
+
+    thread = threading.Thread(target=_watch, name="engram-reload-watcher", daemon=True)
+    thread.start()
 
 
 def _warn_on_residue() -> None:
