@@ -286,18 +286,30 @@ def handle_recall(db: MemoryDB, graph: MemoryGraph, query: str,
         if interrupt_ckpt:
             ws = interrupt_ckpt["state"].get("working_set") or {}
             interrupt_meta = ws.get("_interrupt", {})
+            ckpt_state = interrupt_ckpt["state"]
+            task_id = interrupt_ckpt["task_id"]
+
+            # Build structured recovery context so agent knows exactly where to resume
+            completed = ckpt_state.get("completed", []) or []
+            in_progress = ckpt_state.get("in_progress", []) or []
+            must_not_redo = ckpt_state.get("must_not_redo", []) or []
+
             result["interrupt_recovery"] = {
-                "task_id": interrupt_ckpt["task_id"],
+                "task_id": task_id,
                 "checkpoint_version": interrupt_ckpt["version"],
-                "goal": interrupt_ckpt["state"].get("goal", ""),
+                "goal": ckpt_state.get("goal", ""),
+                "completed": completed[:5],
+                "in_progress": in_progress[:5],
+                "must_not_redo_count": len(must_not_redo),
                 "modified_files": ws.get("files", []),
                 "last_tool_called": interrupt_meta.get("last_tool_called", ""),
-                "last_success_action": interrupt_meta.get("last_success_action", ""),
                 "last_failure": interrupt_meta.get("last_failure", ""),
                 "interrupt_reason": interrupt_meta.get("interrupt_reason", "process_exit"),
-                "hint": (
-                    f"Previous session was interrupted. "
-                    f"Call restore_checkpoint(task_id={interrupt_ckpt['task_id']}) to resume."
+                "action_required": (
+                    f"⚠️ INTERRUPTED SESSION — DO NOT start fresh. "
+                    f"You MUST call restore_checkpoint(task_id={task_id}) IMMEDIATELY "
+                    f"to load full execution state (constraints, must_not_redo, blocked items). "
+                    f"Starting without restore risks redoing completed work and violating constraints."
                 ),
             }
     except Exception as exc:
@@ -1049,6 +1061,15 @@ def handle_restore_checkpoint(db: MemoryDB, graph: MemoryGraph,
     except Exception as exc:
         log.debug("Continuity score computation failed (non-fatal): %s", exc)
 
+    # Emit event for stats tracking
+    try:
+        db._emit_event("checkpoint.restore", {
+            "task_id": tid,
+            "version": ckpt_row["version"],
+        })
+    except Exception:
+        pass
+
     return result
 
 
@@ -1268,6 +1289,15 @@ def handle_evaluate_continuity(db: MemoryDB, graph: MemoryGraph,
     )
     if score is None:
         return _error("Need at least 2 checkpoints to evaluate continuity")
+
+    # Emit event for stats tracking
+    try:
+        db._emit_event("continuity.evaluated", {
+            "task_id": tid,
+            "composite": score.composite,
+        })
+    except Exception:
+        pass
 
     return {
         "ok": True,
@@ -1565,6 +1595,16 @@ def handle_detect_drift(db: MemoryDB, graph: MemoryGraph,
     else:
         result["severity"] = "low"
         result["recommendation"] = "Execution is on track."
+
+    # Emit event for stats tracking
+    try:
+        db._emit_event("drift.detected", {
+            "task_id": task_id,
+            "composite": signal.composite,
+            "violations": signal.violations[:5] if signal.violations else [],
+        })
+    except Exception:
+        pass
 
     return {"ok": True, "task_id": task_id, "drift": result}
 

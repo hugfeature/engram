@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.19.0] — 2026-05-20
+
+### Drift Nudge + Stats + Adaptive Checkpoint
+
+Turn drift detection from passive observation into active correction, add runtime analytics, and make checkpoint frequency self-tuning.
+
+### Added
+
+- **Drift Nudge** — auto-injects a high-priority warning memory when drift exceeds threshold
+  - Warning surfaces in next `recall_memory()`, nudging the agent back on track
+  - Configurable: `ENGRAM_DRIFT_NUDGE` (on/off), `ENGRAM_DRIFT_NUDGE_THRESHOLD` (default 0.7)
+- **Stats module** (`engram stats` / `engram report`) — runtime usage analytics from Event Journal
+  - Sessions, checkpoints, drift, continuity, must-not-redo saves, memory activity
+  - `engram-setup stats --days 7` for terminal table, `--json` for raw output
+  - `engram-setup report --period weekly` for markdown report
+- **Adaptive Checkpoint interval** — auto_save frequency adjusts based on restore rates
+  - Low restore rate (< 10%) → double the interval (capped at 600s)
+  - Prevents checkpoint noise when auto_save is never consumed
+  - Configurable: `ENGRAM_ADAPTIVE_CHECKPOINT`, `ENGRAM_ADAPTIVE_LOW_RESTORE_RATE`, `ENGRAM_ADAPTIVE_MAX_INTERVAL`
+- **Enhanced interrupt_recovery** — `recall_memory()` now returns structured recovery context
+  - `completed`, `in_progress`, `must_not_redo_count` fields added to interrupt_recovery
+  - `action_required` replaces `hint` with stronger resume instruction
+- **New event types** for stats tracking: `checkpoint.restore`, `drift.detected`, `drift.nudge`, `continuity.evaluated`, `continuity.redundant_exploration`
+
+### Changed
+
+- `engram-prompt` CLAUDE.md snippet now includes mandatory `restore_checkpoint` call before any work
+- Event log `RUNTIME_KINDS` expanded with 5 new event kinds
+
+---
+
 ## [0.18.0] — 2026-05-20
 
 ### Durable Runtime Storage Architecture

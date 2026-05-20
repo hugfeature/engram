@@ -54,3 +54,14 @@ CONSOLIDATE_THRESHOLD = _float("ENGRAM_CONSOLIDATE_THRESHOLD", 0.70)
 
 # --- DB (db.py) ---
 DEDUP_SEARCH_THRESHOLD = _float("ENGRAM_DEDUP_SEARCH_THRESHOLD", 0.60)
+
+# --- Drift Nudge (drift.py) ---
+DRIFT_NUDGE_THRESHOLD = _float("ENGRAM_DRIFT_NUDGE_THRESHOLD", 0.7)
+DRIFT_NUDGE_ENABLED = os.environ.get("ENGRAM_DRIFT_NUDGE", "1") != "0"
+
+# --- Adaptive Checkpoint (checkpoint.py) ---
+ADAPTIVE_CHECKPOINT_ENABLED = os.environ.get("ENGRAM_ADAPTIVE_CHECKPOINT", "1") != "0"
+# If auto_save restore rate < this threshold over last 7 days, double the interval
+ADAPTIVE_LOW_RESTORE_RATE = _float("ENGRAM_ADAPTIVE_LOW_RESTORE_RATE", 0.10)
+# Maximum auto_save interval (seconds) after adaptive expansion
+ADAPTIVE_MAX_INTERVAL_SECONDS = _int("ENGRAM_ADAPTIVE_MAX_INTERVAL", 600, lo=300, hi=3600)

@@ -257,6 +257,60 @@ def _get_last_checkpoint_ts(db, task_id: int, user_id: str):
     return row[0] if row else None
 
 
+def _adaptive_auto_save_interval(db, user_id: str = "default") -> float:
+    """Compute adaptive AUTO_SAVE interval based on historical restore rates.
+
+    If auto_save checkpoints are rarely restored (< threshold), expand the
+    interval to reduce noise. If they're frequently restored, keep it tight.
+    """
+    from .config import (
+        ADAPTIVE_CHECKPOINT_ENABLED,
+        ADAPTIVE_LOW_RESTORE_RATE,
+        ADAPTIVE_MAX_INTERVAL_SECONDS,
+    )
+
+    if not ADAPTIVE_CHECKPOINT_ENABLED:
+        return AUTO_SAVE_FALLBACK_SECONDS
+
+    # Query recent checkpoint restore stats from event log
+    try:
+        event_log = db._get_event_log()
+        if event_log is None:
+            return AUTO_SAVE_FALLBACK_SECONDS
+
+        # Count auto_save checkpoints and their restores in recent events
+        # Use a lightweight scan of the last ~500 events (bounded cost)
+        from datetime import datetime, timezone, timedelta
+        since = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y%m%d")
+
+        auto_save_count = 0
+        restore_count = 0
+
+        for event in event_log.iter_events(since_date=since):
+            kind = event.get("kind", "")
+            payload = event.get("payload", {})
+            if kind == "checkpoint.write":
+                reason = payload.get("checkpoint_reason", "")
+                if reason == REASON_AUTO_SAVE:
+                    auto_save_count += 1
+            elif kind == "checkpoint.restore":
+                restore_count += 1
+
+        if auto_save_count < 5:
+            # Not enough data to adapt — use default
+            return AUTO_SAVE_FALLBACK_SECONDS
+
+        restore_rate = restore_count / auto_save_count
+        if restore_rate < ADAPTIVE_LOW_RESTORE_RATE:
+            # Low restore rate — expand interval (double, capped)
+            return min(AUTO_SAVE_FALLBACK_SECONDS * 2, ADAPTIVE_MAX_INTERVAL_SECONDS)
+        else:
+            return AUTO_SAVE_FALLBACK_SECONDS
+
+    except Exception:
+        return AUTO_SAVE_FALLBACK_SECONDS
+
+
 def should_create_auto_checkpoint(
     db,
     task_id: int,
@@ -291,7 +345,8 @@ def should_create_auto_checkpoint(
     if last_ts is None:
         return True, REASON_AUTO_SAVE
     age = (_now_utc() - _to_utc(last_ts)).total_seconds()
-    if age > AUTO_SAVE_FALLBACK_SECONDS and not _is_debounced(
+    interval = _adaptive_auto_save_interval(db, user_id)
+    if age > interval and not _is_debounced(
         db, task_id, REASON_AUTO_SAVE, user_id
     ):
         return True, REASON_AUTO_SAVE

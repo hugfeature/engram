@@ -72,6 +72,11 @@ RUNTIME_KINDS = frozenset({
     "snapshot.create",          # payload: {snapshot_path, seq, db_size_bytes}
     "runtime.duckdb_upgrade",   # payload: {old_version, new_version, backup_path}
     "maintenance.backup_pruned",  # payload: {archived: [...], kept: int, dir}
+    "checkpoint.restore",       # payload: {task_id, version}
+    "drift.detected",           # payload: {task_id, composite, violations}
+    "drift.nudge",              # payload: {task_id, composite, constraint_drift, ...}
+    "continuity.evaluated",     # payload: {task_id, composite}
+    "continuity.redundant_exploration",  # payload: {task_id, action}
 })
 
 VALID_KINDS = TIER1_KINDS | TIER2_KINDS | RUNTIME_KINDS
