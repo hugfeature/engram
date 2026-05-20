@@ -147,15 +147,22 @@ def take_snapshot(
     snapshot_dir: str = SNAPSHOT_DIR,
     *,
     checkpoint_first: bool = True,
+    shared_conn=None,
 ) -> SnapshotInfo | None:
     """Copy the live DB file to a new snapshot.
 
     Returns the new SnapshotInfo, or None if the source DB doesn't exist
     or copy failed. Never raises into the caller.
 
-    ``checkpoint_first``: when True (default), open the DB read-write and
-    issue ``CHECKPOINT`` to flush WAL into the main file BEFORE copying.
-    Without this the snapshot might miss the most recent committed writes.
+    ``checkpoint_first``: when True (default), flush WAL into the main
+    file BEFORE copying so the snapshot includes all committed writes.
+
+    ``shared_conn``: an existing DuckDB connection to reuse for the
+    CHECKPOINT command. When provided, avoids opening a second write
+    connection which would cause a segfault (DuckDB does not support
+    multiple concurrent write connections within the same process).
+    If None and checkpoint_first is True, we skip the explicit checkpoint
+    rather than risk a crash — the server already checkpoints periodically.
     """
     if not os.path.exists(db_path):
         log.debug("snapshot skipped: db_path missing %s", db_path)
@@ -163,17 +170,16 @@ def take_snapshot(
 
     if checkpoint_first:
         try:
-            import duckdb
-            conn = duckdb.connect(db_path)
-            try:
-                conn.execute("CHECKPOINT")
-            finally:
-                conn.close()
+            if shared_conn is not None:
+                shared_conn.execute("CHECKPOINT")
+            else:
+                # Do NOT open a second connection — DuckDB C++ layer crashes
+                # with SIGSEGV when two write connections exist in-process.
+                # The live server already does periodic WAL flushes; worst
+                # case the snapshot misses the last few unflushed writes,
+                # which recover replays from the event log.
+                log.debug("pre-snapshot CHECKPOINT skipped: no shared_conn provided")
         except Exception as exc:
-            # If the live process holds the lock, the in-process CHECKPOINT
-            # already happens periodically. Snapshot proceeds without our
-            # explicit one — worst case we miss the last few unflushed
-            # writes, which the next recover replays from the event log.
             log.debug("pre-snapshot CHECKPOINT skipped: %s", exc)
 
     try:
@@ -296,7 +302,19 @@ class SnapshotScheduler:
             self._last_at = _time.time()
             return None
 
-        info = take_snapshot(self._db_path, current_seq, self._snapshot_dir)
+        # Pass the shared DB connection to avoid opening a second write
+        # connection which causes SIGSEGV in DuckDB's C++ layer.
+        conn = None
+        try:
+            from .shared import _db
+            if _db is not None:
+                conn = _db.conn
+        except Exception:
+            pass
+
+        info = take_snapshot(
+            self._db_path, current_seq, self._snapshot_dir, shared_conn=conn
+        )
         if info is not None:
             self._last_seq = info.seq
             self._last_at = _time.time()

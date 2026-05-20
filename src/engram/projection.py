@@ -261,6 +261,139 @@ class RuntimeStateStore:
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(_SCHEMA_SQL)
+            self._migrate_tasks_schema()
+            self._migrate_checkpoints_schema()
+
+    def _migrate_tasks_schema(self) -> None:
+        """Add missing columns to tasks table from older schema versions."""
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        migrations = [
+            ("latest_checkpoint_version", "INTEGER DEFAULT 0"),
+            ("checkpoint_count", "INTEGER NOT NULL DEFAULT 0"),
+        ]
+        for col_name, col_def in migrations:
+            if col_name not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE tasks ADD COLUMN {col_name} {col_def}"
+                )
+                log.info("Added column tasks.%s", col_name)
+        self._conn.commit()
+
+    def _migrate_checkpoints_schema(self) -> None:
+        """Migrate old checkpoints schema (single 'state' blob) to expanded columns.
+
+        Old schema had: id, checkpoint_id, task_id, version, ..., state, state_diff, ...
+        New schema has: id, task_id, version, ..., goal, completed, in_progress, blocked, ...
+
+        If the table has a 'state' column but no 'goal' column, we need to
+        recreate with the correct schema and migrate data.
+        """
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(checkpoints)").fetchall()
+        }
+        if "goal" in cols:
+            return  # Already on new schema
+
+        if "state" not in cols:
+            return  # Neither old nor new — table is freshly created with new schema
+
+        log.info("Migrating checkpoints table from state-blob to expanded columns...")
+
+        # Read existing rows
+        rows = self._conn.execute("SELECT * FROM checkpoints").fetchall()
+        existing_data = []
+        for row in rows:
+            row_dict = dict(row)
+            state_raw = row_dict.get("state", "{}")
+            try:
+                state = json.loads(state_raw) if isinstance(state_raw, str) else (state_raw or {})
+            except (ValueError, TypeError):
+                state = {}
+            existing_data.append((row_dict, state))
+
+        # Drop and recreate with new schema
+        self._conn.execute("DROP TABLE IF EXISTS checkpoints")
+        checkpoint_ddl = """
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    parent_version INTEGER,
+    kind TEXT NOT NULL DEFAULT 'auto',
+    checkpoint_reason TEXT NOT NULL,
+    triggered_by_event TEXT,
+    goal TEXT DEFAULT '',
+    completed TEXT DEFAULT '[]',
+    in_progress TEXT DEFAULT '[]',
+    blocked TEXT DEFAULT '[]',
+    preferred_next TEXT DEFAULT '[]',
+    must_not_redo TEXT DEFAULT '[]',
+    must_preserve TEXT DEFAULT '[]',
+    working_set TEXT DEFAULT '{}',
+    active_constraints TEXT DEFAULT '[]',
+    blocked_reasons TEXT DEFAULT '[]',
+    state_diff TEXT DEFAULT '{}',
+    source_session_id TEXT,
+    source_memory_id INTEGER,
+    continuation_confidence REAL DEFAULT 0.0,
+    confidence_breakdown TEXT DEFAULT '{}',
+    failure_signature TEXT,
+    user_id TEXT NOT NULL DEFAULT 'default',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON checkpoints(task_id, user_id, version);
+"""
+        self._conn.executescript(checkpoint_ddl)
+
+        # Re-insert data with expanded columns
+        migrated = 0
+        for row_dict, state in existing_data:
+            self._conn.execute(
+                """INSERT INTO checkpoints (
+                    task_id, version, parent_version, kind,
+                    checkpoint_reason, triggered_by_event,
+                    goal, completed, in_progress, blocked,
+                    preferred_next, must_not_redo, must_preserve, working_set,
+                    active_constraints, blocked_reasons,
+                    state_diff, source_session_id, source_memory_id,
+                    continuation_confidence, confidence_breakdown,
+                    failure_signature, user_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    row_dict.get("task_id"),
+                    row_dict.get("version"),
+                    row_dict.get("parent_version"),
+                    row_dict.get("kind", "auto"),
+                    row_dict.get("checkpoint_reason", "AUTO_SAVE"),
+                    row_dict.get("triggered_by_event"),
+                    state.get("goal", ""),
+                    json.dumps(state.get("completed", [])),
+                    json.dumps(state.get("in_progress", [])),
+                    json.dumps(state.get("blocked", [])),
+                    json.dumps(state.get("preferred_next", [])),
+                    json.dumps(state.get("must_not_redo", [])),
+                    json.dumps(state.get("must_preserve", [])),
+                    json.dumps(state.get("working_set", {})),
+                    json.dumps(state.get("active_constraints", [])),
+                    json.dumps(state.get("blocked_reasons", [])),
+                    row_dict.get("state_diff", "{}"),
+                    row_dict.get("source_session_id"),
+                    row_dict.get("source_memory_id"),
+                    row_dict.get("continuation_confidence", 0.0),
+                    row_dict.get("confidence_breakdown", "{}"),
+                    row_dict.get("failure_signature"),
+                    row_dict.get("user_id", "default"),
+                    row_dict.get("created_at", ""),
+                ],
+            )
+            migrated += 1
+
+        self._conn.commit()
+        log.info("Checkpoints schema migration complete: %d rows migrated", migrated)
 
     def close(self) -> None:
         self._conn.close()
