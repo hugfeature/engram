@@ -134,6 +134,9 @@ def detect_drift(
     except Exception as exc:
         log.debug("drift signal persistence failed (non-fatal): %s", exc)
 
+    # Drift Nudge: auto-inject warning memory when drift exceeds threshold
+    _maybe_emit_drift_nudge(db, signal, ckpt_state, task_id, user_id)
+
     return signal
 
 
@@ -271,3 +274,85 @@ def _measure_constraint_drift(
 
     drift = len(violations) / total_constraints
     return round(min(drift, 1.0), 4), violations
+
+
+# ============================================================
+# Drift Nudge — auto-inject warning memory on high drift
+# ============================================================
+
+def _maybe_emit_drift_nudge(
+    db: "MemoryDB",
+    signal: DriftSignal,
+    checkpoint_state: dict,
+    task_id: int,
+    user_id: str,
+) -> None:
+    """Emit a high-priority warning memory when drift exceeds threshold.
+
+    This turns drift detection from passive observation into active correction:
+    the warning memory will surface in the next recall_memory call, nudging
+    the Agent back toward its original trajectory.
+    """
+    from .config import DRIFT_NUDGE_THRESHOLD, DRIFT_NUDGE_ENABLED
+
+    if not DRIFT_NUDGE_ENABLED:
+        return
+    if signal.composite < DRIFT_NUDGE_THRESHOLD:
+        return
+
+    # Build a concise warning message
+    goal = checkpoint_state.get("goal", "unknown")
+    violations_text = ""
+    if signal.violations:
+        violations_text = " Violations: " + "; ".join(signal.violations[:3])
+
+    warning_content = (
+        f"⚠️ DRIFT WARNING (task#{task_id}): Execution has drifted significantly "
+        f"(composite={signal.composite:.2f}).{violations_text} "
+        f"Original goal: '{goal}'. "
+        f"Constraint drift={signal.constraint_drift:.2f}, "
+        f"Goal drift={signal.goal_drift:.2f}. "
+        f"Re-check must_not_redo constraints before continuing."
+    )
+
+    # Store as failure category (fast decay ~11d, won't pollute long-term)
+    try:
+        from .embedding import embed
+        warning_embedding = embed(warning_content)
+        if warning_embedding is None:
+            log.debug("drift nudge: embedding failed, skipping")
+            return
+
+        db.insert(
+            content=warning_content,
+            embedding=warning_embedding,
+            importance=0.9,
+            category="failure",
+            user_id=user_id,
+            metadata={
+                "type": "drift_nudge",
+                "task_id": task_id,
+                "composite_drift": signal.composite,
+                "constraint_drift": signal.constraint_drift,
+                "goal_drift": signal.goal_drift,
+            },
+        )
+
+        # Emit event for stats tracking
+        try:
+            db._emit_event("drift.nudge", {
+                "task_id": task_id,
+                "composite": signal.composite,
+                "constraint_drift": signal.constraint_drift,
+                "goal_drift": signal.goal_drift,
+                "violations": signal.violations[:3] if signal.violations else [],
+            })
+        except Exception:
+            pass  # non-fatal
+
+        log.info(
+            "drift nudge emitted for task#%d (composite=%.2f)",
+            task_id, signal.composite,
+        )
+    except Exception as exc:
+        log.debug("drift nudge emission failed (non-fatal): %s", exc)

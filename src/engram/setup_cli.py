@@ -278,8 +278,18 @@ def _build_prompt_snippet(user_id: str = "default") -> tuple[str, dict]:
             "",
             "## Engram Session Rules",
             "",
-            "- **Session start:** `recall_memory(query)` — interrupt state auto-pinned",
-            f"- **Resume task:** `restore_checkpoint(task_id={task_id})` — get full continuation",
+            f"### ⚠️ MANDATORY: Resume Before Starting",
+            f"",
+            f"**BEFORE doing ANY work**, you MUST run:",
+            f"```",
+            f"restore_checkpoint(task_id={task_id})",
+            f"```",
+            f"This loads: constraints, must_not_redo, completed steps, blocked items.",
+            f"Starting without restore risks **redoing completed work** and **violating constraints**.",
+            f"",
+            "### Session Lifecycle",
+            "",
+            "- **Session start:** `recall_memory(query)` → then `restore_checkpoint(task_id=<id>)`",
             "- **Progress update:** `track_progress(feature, status, task_id=<id>)`",
             "- **On error:** `track_failure(error, component, root_cause, task_id=<id>)`",
             "- **Context filling up:** `report_interruption(reason=\"overflow\")` then `session_handoff(...)`",
@@ -337,6 +347,46 @@ def prompt_main() -> None:
     )
     args = parser.parse_args()
     sys.exit(_cmd_prompt(args))
+
+
+def _cmd_stats(args: argparse.Namespace) -> int:
+    """Show runtime usage statistics."""
+    from engram.stats import compute_stats
+
+    days = getattr(args, "days", 7)
+    as_json = getattr(args, "json", False)
+
+    try:
+        stats = compute_stats(days=days)
+    except Exception as exc:
+        print(f"engram stats error: {exc}", file=sys.stderr)
+        return 1
+
+    if as_json:
+        print(json.dumps(stats.to_dict(), indent=2, ensure_ascii=False))
+    else:
+        print(stats.format_table())
+
+    return 0
+
+
+def _cmd_report(args: argparse.Namespace) -> int:
+    """Generate a markdown runtime report."""
+    from engram.stats import compute_stats
+
+    period = getattr(args, "period", "weekly")
+    days = getattr(args, "days", None)
+    if days is None:
+        days = 30 if period == "monthly" else 7
+
+    try:
+        stats = compute_stats(days=days)
+    except Exception as exc:
+        print(f"engram report error: {exc}", file=sys.stderr)
+        return 1
+
+    print(stats.format_report())
+    return 0
 
 
 def _default_event_dir() -> str:
@@ -406,6 +456,32 @@ def main() -> None:
         help="Also re-compute all embeddings (slow, but fixes model drift).",
     )
 
+    stats_p = sub.add_parser(
+        "stats",
+        help="Show runtime usage statistics (sessions, checkpoints, drift, continuity).",
+    )
+    stats_p.add_argument(
+        "--days", type=int, default=7,
+        help="Number of days to aggregate (default: 7).",
+    )
+    stats_p.add_argument(
+        "--json", action="store_true",
+        help="Output raw JSON instead of formatted table.",
+    )
+
+    report_p = sub.add_parser(
+        "report",
+        help="Generate a markdown runtime report (for docs/issues).",
+    )
+    report_p.add_argument(
+        "--days", type=int, default=7,
+        help="Number of days to aggregate (default: 7).",
+    )
+    report_p.add_argument(
+        "--period", choices=["weekly", "monthly"], default="weekly",
+        help="Report period preset (weekly=7d, monthly=30d).",
+    )
+
     args = parser.parse_args()
     cmd = args.cmd or "setup"
     if cmd == "setup":
@@ -418,6 +494,10 @@ def main() -> None:
         sys.exit(_cmd_prompt(args))
     if cmd == "rebuild-cache":
         sys.exit(_cmd_rebuild_cache(args))
+    if cmd == "stats":
+        sys.exit(_cmd_stats(args))
+    if cmd == "report":
+        sys.exit(_cmd_report(args))
 
 
 if __name__ == "__main__":
