@@ -111,6 +111,18 @@ def score_recovery(
     # Recovery Confidence — weighted composite
     score.recovery_confidence = _compute_confidence(score)
 
+    # Tier 3 persistence: record continuity signal for analytical queries
+    try:
+        db.record_signal(
+            task_id=task_id,
+            signal_type="continuity",
+            dimensions=score.to_dict(),
+            composite_score=score.recovery_confidence,
+            user_id=user_id,
+        )
+    except Exception as exc:
+        log.debug("continuity signal persistence failed (non-fatal): %s", exc)
+
     return score
 
 

@@ -5,7 +5,7 @@
 [![PyPI](https://img.shields.io/pypi/v/mcp-engram)](https://pypi.org/project/mcp-engram/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-456%20passed-brightgreen)](https://github.com/hugfeature/engram)
+[![Tests](https://img.shields.io/badge/tests-545%20passed-brightgreen)](https://github.com/hugfeature/engram)
 
 > Engram 让 Claude Code、Cursor、OpenHands 拥有**可恢复执行**能力 ——
 > 上下文坍塌、中断、会话终止后，恢复 Agent 的工作状态，接着做，不从零开始。
@@ -210,17 +210,22 @@ Agent A（Claude Code）                  Agent B（Cursor）
 ## 架构设计
 
 ```
-Tier 1 — Runtime Continuity（唯一可信源，可 replay 恢复）
-  tasks · checkpoints · session lifecycle · handoff events
-  → append-only 事件日志  ~/.engram/events/*.jsonl  (fsync，自动 gzip 轮转)
+Tier 1 — Event Journal（不可变，仅追加）
+  唯一可信源 · 快照压缩 · 增量重放
+  → ~/.engram/events/*.jsonl  (fsync，自动 gzip 轮转)
+  → 定期快照，加速启动
 
-Tier 2 — Semantic Recall（可降级，只读可恢复）
-  memories · metadata · 语义图
-  → DuckDB 从事件日志投影
+Tier 2 — Runtime State Store（运行时持久）
+  tasks · checkpoints · executions · sessions
+  → SQLite WAL  ~/.engram/*.state.sqlite
+  → 并发读取、快速恢复、恢复链路关键
+  → 通过 ENGRAM_SQLITE_TIER2=1 启用（默认回退到 DuckDB）
 
-Tier 3 — Retrieval Cache（可丢弃，可重建）
-  embeddings · FTS · 向量索引
-  → 按需重建，不参与恢复路径
+Tier 3 — Runtime Intelligence Cache（可重建）
+  memories · embeddings · FTS · 向量索引
+  未来：drift vectors · recovery metrics · tool stats · continuity history
+  → DuckDB（可丢弃并从 Tier 1 + 2 重建，无数据丢失）
+  → 重建命令：engram-setup rebuild-cache
 ```
 
 **两条铁律：**
@@ -288,6 +293,7 @@ Engram 还通过 `evaluate_continuity` 追踪 **运行时连续性指标**：目
 | `ENGRAM_REINFORCE_THRESHOLD`        | `0.85`                  | 强化相似度阈值               |
 | `ENGRAM_W_BM25` / `ENGRAM_W_VECTOR` | `0.30` / `0.70`         | 检索权重                     |
 | `ENGRAM_PRUNE_THRESHOLD`            | `0.05`                  | 剪枝强度阈值                 |
+| `ENGRAM_SQLITE_TIER2`               | _（未启用）_            | 设为 `1` 启用 SQLite WAL 运行时状态存储（Tier 2） |
 
 完整变量列表：`src/engram/config.py`
 

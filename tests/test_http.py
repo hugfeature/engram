@@ -46,8 +46,8 @@ class TestHealthAndTools:
         assert r.status_code == 200
         data = r.json()
         assert data["ok"] is True
-        assert "db" in data
-        assert "event_log" in data
+        assert "db_exists" in data
+        assert "event_dir" in data
 
 
 class TestStore:

@@ -21,6 +21,22 @@ log = logging.getLogger("engram.handlers")
 MAX_CONTENT_LENGTH = 100_000  # 100KB
 
 
+def _safe_isoformat(val) -> str | None:
+    """Safely format a datetime or string timestamp to ISO format string.
+
+    v0.18: SQLite returns ISO strings directly; DuckDB returns datetime objects.
+    This helper handles both transparently.
+    """
+    if val is None:
+        return None
+    if isinstance(val, str):
+        return val
+    try:
+        return val.isoformat()
+    except (AttributeError, TypeError):
+        return str(val)
+
+
 def _error(msg: str) -> dict:
     """Standardized error response — all handlers use this."""
     return {"ok": False, "error": msg}
@@ -857,7 +873,7 @@ def handle_get_task(db: MemoryDB, graph: MemoryGraph, task_id: int,
             "memory_id": m.id,
             "content": m.content,
             "importance": m.importance,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "created_at": _safe_isoformat(m.created_at),
             "metadata": meta,
         }
         if memory_type == "handoff":
@@ -875,8 +891,8 @@ def handle_get_task(db: MemoryDB, graph: MemoryGraph, task_id: int,
             "name": task.name,
             "goal": task.goal,
             "status": task.status,
-            "created_at": task.created_at.isoformat() if task.created_at else None,
-            "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+            "created_at": _safe_isoformat(task.created_at),
+            "updated_at": _safe_isoformat(task.updated_at),
             "metadata": task.metadata,
         },
         "handoffs": handoffs,
@@ -895,7 +911,7 @@ def handle_get_task(db: MemoryDB, graph: MemoryGraph, task_id: int,
                 "version": latest["version"],
                 "kind": latest["kind"],
                 "checkpoint_reason": latest["reason"],
-                "created_at": latest["created_at"].isoformat() if latest.get("created_at") else None,
+                "created_at": _safe_isoformat(latest.get("created_at")),
                 "failure_signature": latest.get("failure_signature"),
                 "continuation": checkpoint.build_continuation(latest, db=db),
             }
@@ -917,8 +933,8 @@ def handle_list_tasks(db: MemoryDB, graph: MemoryGraph,
                 "name": t.name,
                 "goal": t.goal,
                 "status": t.status,
-                "created_at": t.created_at.isoformat() if t.created_at else None,
-                "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+                "created_at": _safe_isoformat(t.created_at),
+                "updated_at": _safe_isoformat(t.updated_at),
                 "metadata": t.metadata,
             }
             for t in tasks
@@ -993,7 +1009,7 @@ def handle_restore_checkpoint(db: MemoryDB, graph: MemoryGraph,
         "version": ckpt_row["version"],
         "kind": ckpt_row["kind"],
         "checkpoint_reason": ckpt_row["reason"],
-        "created_at": ckpt_row["created_at"].isoformat() if ckpt_row.get("created_at") else None,
+        "created_at": _safe_isoformat(ckpt_row.get("created_at")),
         "source_session_id": ckpt_row.get("source_session_id"),
         "failure_signature": ckpt_row.get("failure_signature"),
         "continuation": continuation,
@@ -1447,7 +1463,7 @@ def handle_trace_execution(db: MemoryDB, graph: MemoryGraph,
             "previous_task_id": t.previous_task_id,
             "retry_of_task_id": t.retry_of_task_id,
             "checkpoint_id": t.checkpoint_id,
-            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "created_at": _safe_isoformat(t.created_at),
         }
         task_nodes.append(node)
 
@@ -1463,8 +1479,8 @@ def handle_trace_execution(db: MemoryDB, graph: MemoryGraph,
             "status": execution.get("status"),
             "origin_checkpoint": execution.get("origin_checkpoint"),
             "continuity_score": execution.get("continuity_score"),
-            "created_at": execution["created_at"].isoformat() if execution.get("created_at") else None,
-            "last_active_at": execution["last_active_at"].isoformat() if execution.get("last_active_at") else None,
+            "created_at": _safe_isoformat(execution.get("created_at")),
+            "last_active_at": _safe_isoformat(execution.get("last_active_at")),
         },
         "tasks": task_nodes,
         "total_attempts": len(task_nodes),

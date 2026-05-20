@@ -1,11 +1,23 @@
 """Shared test fixtures for engram test suite."""
 
+import os
+
 import pytest
 
 from engram.db import MemoryDB
 from engram.graph import MemoryGraph
 
 FAKE_EMBED = [0.1] * 768
+
+
+@pytest.fixture(autouse=True)
+def _disable_sqlite_tier2(monkeypatch):
+    """Disable SQLite Tier2 by default in tests.
+
+    Most tests directly query DuckDB tables. test_sqlite_tier2.py explicitly
+    enables it via its own env override.
+    """
+    monkeypatch.setenv("ENGRAM_SQLITE_TIER2", "0")
 
 
 @pytest.fixture

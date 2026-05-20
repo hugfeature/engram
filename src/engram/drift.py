@@ -121,6 +121,19 @@ def detect_drift(
     )
 
     signal.composite = compute_composite(signal)
+
+    # Tier 3 persistence: record drift signal for analytical queries
+    try:
+        db.record_signal(
+            task_id=task_id,
+            signal_type="drift",
+            dimensions=signal.to_dict(),
+            composite_score=signal.composite,
+            user_id=user_id,
+        )
+    except Exception as exc:
+        log.debug("drift signal persistence failed (non-fatal): %s", exc)
+
     return signal
 
 

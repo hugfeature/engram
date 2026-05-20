@@ -5,7 +5,7 @@
 [![PyPI](https://img.shields.io/pypi/v/mcp-engram)](https://pypi.org/project/mcp-engram/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-456%20passed-brightgreen)](https://github.com/hugfeature/engram)
+[![Tests](https://img.shields.io/badge/tests-545%20passed-brightgreen)](https://github.com/hugfeature/engram)
 [![engram MCP server](https://glama.ai/mcp/servers/hugfeature/engram/badges/card.svg)](https://glama.ai/mcp/servers/hugfeature/engram)
 
 > Engram gives Claude Code, Cursor, and OpenHands **resumable execution** — recover agent working state after context collapse, interruption, or session termination. Agents continue from where they stopped, not from zero.
@@ -210,17 +210,22 @@ Run `engram-prompt` to auto-generate this from your current state, or paste manu
 ## Architecture
 
 ```
-Tier 1 — Runtime Continuity (Source of Truth, replay-recoverable)
-  tasks · checkpoints · session lifecycle · handoff events
-  → append-only event log  ~/.engram/events/*.jsonl  (fsync, gzip-rotated)
+Tier 1 — Event Journal (immutable, append-only)
+  source of truth · snapshot compaction · incremental replay
+  → ~/.engram/events/*.jsonl  (fsync, gzip-rotated)
+  → periodic snapshots for fast startup
 
-Tier 2 — Semantic Recall (Degradable, readonly-recoverable)
-  memories · metadata · semantic graph
-  → DuckDB projection from event log
+Tier 2 — Runtime State Store (operationally durable)
+  tasks · checkpoints · executions · sessions
+  → SQLite WAL  ~/.engram/*.state.sqlite
+  → concurrent reads, fast restore, recovery-critical
+  → controlled by ENGRAM_SQLITE_TIER2=1 (fallback: DuckDB)
 
-Tier 3 — Retrieval Cache (Disposable, rebuildable)
-  embeddings · FTS · vector index
-  → rebuilt on demand, never in recovery path
+Tier 3 — Runtime Intelligence Cache (rebuildable)
+  memories · embeddings · FTS · vector index
+  future: drift vectors · recovery metrics · tool stats · continuity history
+  → DuckDB (can be dropped and rebuilt without data loss)
+  → rebuild with: engram-setup rebuild-cache
 ```
 
 **Two Laws:**
@@ -288,6 +293,7 @@ Engram also tracks **runtime continuity metrics** via `evaluate_continuity`: Goa
 | `ENGRAM_REINFORCE_THRESHOLD`        | `0.85`                  | Reinforce similarity threshold                                        |
 | `ENGRAM_W_BM25` / `ENGRAM_W_VECTOR` | `0.30` / `0.70`         | Retrieval weights                                                     |
 | `ENGRAM_PRUNE_THRESHOLD`            | `0.05`                  | Prune strength threshold                                              |
+| `ENGRAM_SQLITE_TIER2`               | _(disabled)_            | Set to `1` to enable SQLite WAL Runtime State Store (Tier 2)          |
 
 Full variable list: `src/engram/config.py`
 

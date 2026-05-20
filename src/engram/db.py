@@ -1,12 +1,21 @@
 """DuckDB storage layer — schema, CRUD, vector search, FTS.
 
-Engram architecture (v0.10+):
-    Tier 1 (Source of Truth): tasks / checkpoints / session_lifecycle / ...
-        backed by ``~/.engram/events/*.jsonl`` (append-only event log).
-    Tier 2 (Degradable):      memories content / metadata / graph
-        materialized in this DuckDB file.
-    Tier 3 (Disposable):      embeddings / FTS / vector index
-        rebuildable from Tier 2.
+Engram Durable Runtime Storage Architecture (v0.18):
+
+    Tier 1 — Event Journal (immutable, append-only):
+        ``~/.engram/events/*.jsonl`` + periodic snapshot compaction.
+        Source of truth. Never modified, only appended.
+
+    Tier 2 — Runtime State Store (operationally durable):
+        SQLite WAL (``~/.engram/*.state.sqlite``).
+        Tasks / checkpoints / executions / sessions.
+        Fast restore, concurrent reads, recovery-critical.
+        Controlled by ENGRAM_SQLITE_TIER2=1 (fallback: DuckDB tables).
+
+    Tier 3 — Runtime Intelligence Cache (rebuildable):
+        DuckDB (this file): memories / embeddings / FTS / vector index.
+        Future: drift vectors, recovery metrics, tool stats, continuity history.
+        Can be dropped and rebuilt from Tier 1 + Tier 2 without data loss.
 
 Two laws this module enforces:
     1. Event log is the only durability primitive.
@@ -14,8 +23,6 @@ Two laws this module enforces:
 
 If DuckDB cannot be opened or schema is unsafe to use, MemoryDB enters
 **readonly degraded mode** instead of silently creating a fresh database.
-The previous "rename to .corrupt and continue" behaviour caused users to
-lose runtime state without warning and is now removed.
 """
 
 from __future__ import annotations
@@ -531,6 +538,27 @@ CREATE TABLE IF NOT EXISTS execution_sessions (
 """
 
 
+# --- Tier 3: Runtime Intelligence Signals (v0.18) ---
+# Stores computed drift/recovery/continuity signals for analytical queries.
+# Rebuildable from checkpoint history — dropping this table loses nothing durable.
+RUNTIME_SIGNALS_SQL = """
+CREATE SEQUENCE IF NOT EXISTS signal_id_seq START 1;
+
+CREATE TABLE IF NOT EXISTS runtime_signals (
+    id INTEGER PRIMARY KEY DEFAULT nextval('signal_id_seq'),
+    task_id INTEGER NOT NULL,
+    execution_id VARCHAR,
+    signal_type VARCHAR NOT NULL,
+    recorded_at TIMESTAMP NOT NULL DEFAULT now(),
+    dimensions JSON NOT NULL DEFAULT '{}'::JSON,
+    composite_score DOUBLE,
+    user_id VARCHAR NOT NULL DEFAULT 'default'
+);
+"""
+# signal_type values: 'drift', 'continuity', 'recovery_recommendation'
+# dimensions: the full DriftSignal.to_dict() or SemanticContinuityScore.to_dict()
+
+
 # Checkpoint v2 — Cognitive Continuation Layer
 #
 # 每个 checkpoint 是一个 task 在某个时刻的认知状态快照。
@@ -676,6 +704,23 @@ class MemoryDB:
             )
         try:
             self.conn = _connect_with_retry(db_path)
+        except DatabaseCorruptionError as corrupt_err:
+            # v0.18: auto-recover from snapshot + incremental replay.
+            # If a snapshot exists, copy it over the corrupt DB and replay
+            # only the incremental events. Agent never sees degraded mode.
+            recovered = self._try_auto_recover_from_snapshot(db_path, corrupt_err)
+            if not recovered:
+                # No snapshot available — fall into readonly degraded mode.
+                log.error(
+                    "DB corrupt and no snapshot available for auto-recovery. "
+                    "Entering readonly degraded mode. Run `engram-setup recover`."
+                )
+                self.conn = duckdb.connect(":memory:")
+                self._readonly = True
+                self._readonly_reason = (
+                    f"DB corrupt ({corrupt_err.original}), no snapshot for auto-recovery. "
+                    "Run `engram-setup recover` to rebuild from event log."
+                )
         except DatabaseLockedError as lock_err:
             # v0.16: graceful fallback — another engram holds the lock.
             # Open read-only instead of crashing. Writes will fail with
@@ -703,9 +748,98 @@ class MemoryDB:
         self.current_duckdb_version: str | None = None
         if not self._readonly:
             self._init_schema()
+
+        # v0.18: Tier 2 Runtime State Store (SQLite WAL).
+        # Tasks/checkpoints/executions/sessions go here for concurrent access.
+        self._state_store = self._init_state_store(db_path)
+
         # Best-effort: kick off async maintenance (backup pruning + duckdb
         # upgrade detection). Never blocks boot, never raises.
         self._schedule_maintenance()
+
+    def _try_auto_recover_from_snapshot(
+        self, db_path: str, corrupt_err: "DatabaseCorruptionError"
+    ) -> bool:
+        """Attempt auto-recovery from the latest snapshot + incremental replay.
+
+        v0.18: When the DB is corrupt but a snapshot exists, we can recover
+        transparently without user intervention. The agent never sees degraded
+        mode — it just boots slightly slower (snapshot copy + incremental replay).
+
+        Returns True if recovery succeeded and self.conn is usable.
+        """
+        try:
+            from .snapshot import latest_snapshot, SNAPSHOT_DIR
+            from .recover import recover as _recover
+        except ImportError:
+            return False
+
+        snap = latest_snapshot(SNAPSHOT_DIR)
+        if snap is None:
+            log.warning("No snapshot available for auto-recovery")
+            return False
+
+        log.info(
+            "Auto-recovering from snapshot seq=%d (DB was corrupt: %s)",
+            snap.seq, corrupt_err.original,
+        )
+
+        try:
+            # Use the recover machinery: it handles snapshot seeding +
+            # incremental replay + proper schema init.
+            report = _recover(
+                promote=True,
+                target_db=db_path,
+                snapshot_dir=SNAPSHOT_DIR,
+            )
+            log.info(
+                "Auto-recovery complete: replayed %s events from snapshot seq=%d",
+                sum(report.counts.values()), report.snapshot_seq,
+            )
+            # Now open the recovered DB normally.
+            self.conn = _connect_with_retry(db_path)
+            return True
+        except Exception as exc:
+            log.error("Auto-recovery from snapshot failed: %s", exc)
+            return False
+
+    def _init_state_store(self, db_path: str):
+        """Initialize Tier 2 SQLite Runtime State Store.
+
+        v0.18: operational state (tasks/checkpoints/executions/sessions) lives
+        in SQLite WAL for concurrent access. DuckDB retains only Tier 3
+        (memories/embeddings/FTS).
+
+        The SQLite file lives alongside the DuckDB file with a .state.sqlite suffix.
+
+        Controlled by ENGRAM_SQLITE_TIER2 environment variable:
+        - default (unset or "1"/"true"): SQLite Tier 2 ENABLED
+        - "0" or "false": disable, fallback to DuckDB (backward compatible)
+
+        Also requires log_writes=True (utility opens skip this).
+        """
+        if not self._log_writes:
+            return None
+        disable = os.environ.get("ENGRAM_SQLITE_TIER2", "").strip().lower()
+        if disable in ("0", "false"):
+            return None
+        try:
+            from .projection import RuntimeStateStore, migrate_from_duckdb
+            sqlite_path = db_path.replace(".duckdb", "") + ".state.sqlite"
+            store = RuntimeStateStore(sqlite_path)
+            # Auto-migrate from DuckDB if SQLite is empty but DuckDB has data
+            if store.is_empty() and not self._readonly:
+                try:
+                    result = migrate_from_duckdb(self.conn, store)
+                    if not result.get("skipped"):
+                        log.info("Auto-migrated Tier 2 data to SQLite: %s", result.get("counts"))
+                except Exception as mig_exc:
+                    log.warning("DuckDB→SQLite migration failed (non-fatal): %s", mig_exc)
+            log.info("Tier 2 Runtime State Store initialized: %s", sqlite_path)
+            return store
+        except Exception as exc:
+            log.warning("Failed to init SQLite state store, falling back to DuckDB: %s", exc)
+            return None
 
     def _schedule_maintenance(self) -> None:
         """Hook P1-3 + P1-5 + P1-1 into the boot path on a daemon thread.
@@ -922,6 +1056,7 @@ class MemoryDB:
         self.conn.execute(CHECKPOINT_SQL)
         self.conn.execute(ENGRAM_META_SQL)
         self.conn.execute(EXECUTION_SESSION_SQL)
+        self.conn.execute(RUNTIME_SIGNALS_SQL)
         # tasks 表加列：缓存最新 checkpoint + execution lineage
         for ddl in (
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS latest_checkpoint_version INTEGER DEFAULT 0",
@@ -1107,6 +1242,109 @@ class MemoryDB:
         except Exception:
             return {}
         return {r[0]: r[1] for r in rows}
+
+    # ------------------------------------------------------------------
+    # Tier 3: Runtime Intelligence Signals
+    # ------------------------------------------------------------------
+
+    def record_signal(
+        self,
+        task_id: int,
+        signal_type: str,
+        dimensions: dict,
+        *,
+        composite_score: float | None = None,
+        execution_id: str | None = None,
+        user_id: str = "default",
+    ) -> int | None:
+        """Persist a runtime signal (drift / continuity / recovery) to Tier 3.
+
+        Returns the signal id, or None if in readonly/degraded mode.
+        """
+        if self._readonly:
+            return None
+        try:
+            row = self.conn.execute(
+                """INSERT INTO runtime_signals
+                   (task_id, execution_id, signal_type, dimensions, composite_score, user_id)
+                   VALUES (?, ?, ?, ?::JSON, ?, ?)
+                   RETURNING id""",
+                [
+                    task_id,
+                    execution_id,
+                    signal_type,
+                    json.dumps(dimensions, ensure_ascii=False),
+                    composite_score,
+                    user_id,
+                ],
+            ).fetchone()
+            return row[0] if row else None
+        except Exception as exc:
+            log.debug("record_signal failed (non-fatal): %s", exc)
+            return None
+
+    def query_signals(
+        self,
+        task_id: int,
+        signal_type: str | None = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        """Query runtime signals for a task. Tier 3 analytical read."""
+        clauses = ["task_id = ?"]
+        params: list = [task_id]
+        if signal_type:
+            clauses.append("signal_type = ?")
+            params.append(signal_type)
+        params.append(limit)
+        try:
+            return self._fetchall_dicts(
+                f"SELECT * FROM runtime_signals WHERE {' AND '.join(clauses)} "
+                f"ORDER BY recorded_at DESC LIMIT ?",
+                params,
+            )
+        except Exception:
+            return []
+
+    def rebuild_tier3_cache(self, *, reembed: bool = False) -> dict:
+        """Rebuild Tier 3 Runtime Intelligence Cache.
+
+        v0.18: Tier 3 is rebuildable — embeddings, FTS, and (future) drift
+        vectors / recovery metrics / tool stats can be safely dropped and
+        rebuilt without losing any durable state.
+
+        Args:
+            reembed: if True, null out all embeddings and re-compute them.
+                     If False, only rebuild FTS index.
+
+        Returns:
+            Summary dict with rebuild results.
+        """
+        results: dict = {}
+
+        # 1. FTS rebuild
+        try:
+            self._rebuild_fts_index()
+            results["fts"] = "rebuilt"
+        except Exception as exc:
+            results["fts"] = f"failed: {exc}"
+
+        # 2. Embedding rebuild (optional, expensive)
+        if reembed:
+            try:
+                self.conn.execute("UPDATE memories SET embedding = NULL")
+                self._embedding_stale = False
+                self._backfill_null_embeddings()
+                results["embeddings"] = "rebuilt"
+            except Exception as exc:
+                results["embeddings"] = f"failed: {exc}"
+        else:
+            results["embeddings"] = "skipped (pass reembed=True to rebuild)"
+
+        # 3. Mark cache fresh
+        self._fts_dirty = False
+        results["status"] = "ok"
+        log.info("Tier 3 cache rebuild complete: %s", results)
+        return results
 
     def _rebuild_fts_index(self):
         """Rebuild the FTS index from scratch to include all current data.
@@ -1684,14 +1922,21 @@ class MemoryDB:
                          origin_checkpoint: str | None = None) -> str:
         """Create a new execution session (a continuous runtime intent)."""
         self._assert_writable()
-        self.conn.execute(
-            """
-            INSERT INTO execution_sessions
-                (execution_id, root_goal, origin_checkpoint, status, user_id)
-            VALUES (?, ?, ?, 'active', ?)
-            """,
-            [execution_id, root_goal, origin_checkpoint, user_id],
-        )
+        # v0.18: primary write to SQLite Tier 2
+        if self._state_store:
+            self._state_store.create_execution(
+                execution_id, root_goal, user_id=user_id,
+                origin_checkpoint=origin_checkpoint,
+            )
+        else:
+            self.conn.execute(
+                """
+                INSERT INTO execution_sessions
+                    (execution_id, root_goal, origin_checkpoint, status, user_id)
+                VALUES (?, ?, ?, 'active', ?)
+                """,
+                [execution_id, root_goal, origin_checkpoint, user_id],
+            )
         self._emit_event("execution.start", {
             "execution_id": execution_id,
             "root_goal": root_goal,
@@ -1704,6 +1949,15 @@ class MemoryDB:
                       continuity_score: float | None = None) -> bool:
         """Mark an execution as completed or abandoned."""
         self._assert_writable()
+        # v0.18: primary write to SQLite Tier 2
+        if self._state_store:
+            self._state_store.end_execution(execution_id, status=status)
+            self._emit_event("execution.end", {
+                "execution_id": execution_id,
+                "status": status,
+                "continuity_score": continuity_score,
+            })
+            return True
         sets = ["status = ?", "last_active_at = now()"]
         params: list = [status]
         if continuity_score is not None:
@@ -1724,6 +1978,9 @@ class MemoryDB:
 
     def get_execution(self, execution_id: str) -> dict | None:
         """Get an execution session by ID."""
+        # v0.18: read from SQLite Tier 2
+        if self._state_store:
+            return self._state_store.get_execution(execution_id)
         row = self._fetchone_dict(
             "SELECT * FROM execution_sessions WHERE execution_id = ?",
             [execution_id],
@@ -1732,6 +1989,9 @@ class MemoryDB:
 
     def get_active_executions(self, user_id: str = "default") -> list[dict]:
         """List all active executions for a user."""
+        # v0.18: read from SQLite Tier 2
+        if self._state_store:
+            return self._state_store.get_active_executions(user_id)
         return self._fetchall_dicts(
             """
             SELECT * FROM execution_sessions
@@ -1752,29 +2012,43 @@ class MemoryDB:
                                  metadata: dict | None = None) -> int:
         """Create a task within an execution lineage."""
         self._assert_writable()
-        meta_json = json.dumps(metadata or {}, ensure_ascii=False)
-        result = self.conn.execute(
-            """
-            INSERT INTO tasks (name, goal, status, user_id, metadata,
-                               execution_id, previous_task_id, parent_task_id,
-                               retry_of_task_id, checkpoint_id, attempt)
-            VALUES (?, ?, 'in_progress', ?, ?::JSON, ?, ?, ?, ?, ?, ?)
-            RETURNING id
-            """,
-            [name, goal, user_id, meta_json,
-             execution_id, previous_task_id, parent_task_id,
-             retry_of_task_id, checkpoint_id, attempt],
-        ).fetchone()
-        task_id = result[0]
-        # Update execution last_active_at
-        self.conn.execute(
-            "UPDATE execution_sessions SET last_active_at = now() WHERE execution_id = ?",
-            [execution_id],
-        )
+        # v0.18: primary write to SQLite Tier 2
+        if self._state_store:
+            task_id = self._state_store.create_task_in_execution(
+                name=name, goal=goal, execution_id=execution_id,
+                user_id=user_id, attempt=attempt,
+                previous_task_id=previous_task_id,
+                retry_of_task_id=retry_of_task_id,
+                parent_task_id=parent_task_id,
+                checkpoint_id=checkpoint_id,
+            )
+        else:
+            meta_json = json.dumps(metadata or {}, ensure_ascii=False)
+            result = self.conn.execute(
+                """
+                INSERT INTO tasks (name, goal, status, user_id, metadata,
+                                   execution_id, previous_task_id, parent_task_id,
+                                   retry_of_task_id, checkpoint_id, attempt)
+                VALUES (?, ?, 'in_progress', ?, ?::JSON, ?, ?, ?, ?, ?, ?)
+                RETURNING id
+                """,
+                [name, goal, user_id, meta_json,
+                 execution_id, previous_task_id, parent_task_id,
+                 retry_of_task_id, checkpoint_id, attempt],
+            ).fetchone()
+            task_id = result[0]
+            # Update execution last_active_at
+            self.conn.execute(
+                "UPDATE execution_sessions SET last_active_at = now() WHERE execution_id = ?",
+                [execution_id],
+            )
         return task_id
 
     def get_execution_tasks(self, execution_id: str) -> list[TaskRow]:
         """Get all tasks in an execution, ordered by creation time."""
+        # v0.18: read from SQLite Tier 2
+        if self._state_store:
+            return self._state_store.get_execution_tasks(execution_id)
         rows = self._fetchall_dicts(
             """
             SELECT id, name, goal, status, user_id, created_at, updated_at,
@@ -1789,6 +2063,7 @@ class MemoryDB:
 
     def get_retry_chain(self, task_id: int) -> list[TaskRow]:
         """Walk the retry chain backwards from a task."""
+        # v0.18: get_task already delegates to SQLite when available
         chain = []
         current_id = task_id
         seen = set()
@@ -1809,16 +2084,23 @@ class MemoryDB:
     def create_task(self, name: str, goal: str = "", status: str = "planning",
                     user_id: str = "default", metadata: dict | None = None) -> int:
         self._assert_writable()
-        meta_json = json.dumps(metadata or {}, ensure_ascii=False)
-        result = self.conn.execute(
-            """
-            INSERT INTO tasks (name, goal, status, user_id, metadata)
-            VALUES (?, ?, ?, ?, ?::JSON)
-            RETURNING id
-            """,
-            [name, goal, status, user_id, meta_json],
-        ).fetchone()
-        task_id = result[0]
+        # v0.18: primary write goes to SQLite Tier 2
+        if self._state_store:
+            task_id = self._state_store.create_task(
+                name=name, goal=goal, status=status,
+                user_id=user_id, metadata=metadata,
+            )
+        else:
+            meta_json = json.dumps(metadata or {}, ensure_ascii=False)
+            result = self.conn.execute(
+                """
+                INSERT INTO tasks (name, goal, status, user_id, metadata)
+                VALUES (?, ?, ?, ?, ?::JSON)
+                RETURNING id
+                """,
+                [name, goal, status, user_id, meta_json],
+            ).fetchone()
+            task_id = result[0]
         # Tier 1 — task lifecycle is critical runtime state, MUST be in event log.
         self._emit_event("task.create", {
             "task_id": task_id,
@@ -1831,6 +2113,9 @@ class MemoryDB:
         return task_id
 
     def get_task(self, task_id: int) -> TaskRow | None:
+        # v0.18: read from SQLite Tier 2
+        if self._state_store:
+            return self._state_store.get_task(task_id)
         row = self._fetchone_dict(
             """
             SELECT id, name, goal, status, user_id, created_at, updated_at,
@@ -1847,23 +2132,34 @@ class MemoryDB:
     def update_task(self, task_id: int, status: str | None = None,
                     goal: str | None = None, metadata: dict | None = None) -> bool:
         self._assert_writable()
-        sets = ["updated_at = now()"]
-        params: list = []
-        if status is not None:
-            sets.append("status = ?")
-            params.append(status)
-        if goal is not None:
-            sets.append("goal = ?")
-            params.append(goal)
-        if metadata is not None:
-            sets.append("metadata = ?::JSON")
-            params.append(json.dumps(metadata, ensure_ascii=False))
-        params.append(task_id)
-        row = self.conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ? RETURNING id",
-            params,
-        ).fetchone()
-        updated = row is not None
+        # v0.18: primary write to SQLite Tier 2
+        if self._state_store:
+            kwargs = {}
+            if status is not None:
+                kwargs["status"] = status
+            if goal is not None:
+                kwargs["goal"] = goal
+            if metadata is not None:
+                kwargs["metadata"] = metadata
+            updated = self._state_store.update_task(task_id, **kwargs)
+        else:
+            sets = ["updated_at = now()"]
+            params: list = []
+            if status is not None:
+                sets.append("status = ?")
+                params.append(status)
+            if goal is not None:
+                sets.append("goal = ?")
+                params.append(goal)
+            if metadata is not None:
+                sets.append("metadata = ?::JSON")
+                params.append(json.dumps(metadata, ensure_ascii=False))
+            params.append(task_id)
+            row = self.conn.execute(
+                f"UPDATE tasks SET {', '.join(sets)} WHERE id = ? RETURNING id",
+                params,
+            ).fetchone()
+            updated = row is not None
         if updated:
             self._emit_event("task.update", {
                 "task_id": task_id,
@@ -1874,6 +2170,9 @@ class MemoryDB:
         return updated
 
     def list_tasks(self, user_id: str = "default", status: str | None = None) -> list[TaskRow]:
+        # v0.18: read from SQLite Tier 2
+        if self._state_store:
+            return self._state_store.list_tasks(user_id=user_id, status=status)
         if status:
             rows = self._fetchall_dicts(
                 """
@@ -1958,6 +2257,18 @@ class MemoryDB:
     def upsert_session(self, session_id: str, user_id: str = "default"):
         """Register a new session or refresh its heartbeat."""
         self._assert_writable()
+        # v0.18: primary write to SQLite Tier 2
+        if self._state_store:
+            # Check if session exists for event log decision
+            existing_sessions = self._state_store.get_recent_sessions(user_id, limit=100)
+            is_new = not any(s.get("session_id") == session_id for s in existing_sessions)
+            self._state_store.start_session(session_id, user_id=user_id)
+            if is_new:
+                self._emit_event("session.start", {
+                    "session_id": session_id,
+                    "user_id": user_id,
+                })
+            return
         # Distinguish creation vs heartbeat for the event log:
         # only the first call per session_id should emit session.start.
         existing = self.conn.execute(
@@ -1990,14 +2301,22 @@ class MemoryDB:
                 token count, failure count).
         """
         self._assert_writable()
-        context_json = json.dumps(interruption_context or {}, ensure_ascii=False)
-        self.conn.execute(
-            """UPDATE session_lifecycle
-            SET ended_at = now(), last_active_at = now(), end_type = ?,
-                interruption_reason = ?, interruption_context = ?::JSON
-            WHERE session_id = ?""",
-            [end_type, interruption_reason, context_json, session_id],
-        )
+        # v0.18: primary write to SQLite Tier 2
+        if self._state_store:
+            self._state_store.end_session(
+                session_id, end_type=end_type,
+                interruption_reason=interruption_reason,
+                interruption_context=interruption_context,
+            )
+        else:
+            context_json = json.dumps(interruption_context or {}, ensure_ascii=False)
+            self.conn.execute(
+                """UPDATE session_lifecycle
+                SET ended_at = now(), last_active_at = now(), end_type = ?,
+                    interruption_reason = ?, interruption_context = ?::JSON
+                WHERE session_id = ?""",
+                [end_type, interruption_reason, context_json, session_id],
+            )
         event_payload: dict = {
             "session_id": session_id,
             "end_type": end_type,
