@@ -11,7 +11,7 @@ license = "MIT"
 authors = [
     {name = "hugfeature"},
 ]
-keywords = ["mcp", "memory", "agent", "continuity", "task", "handoff", "ebbinghaus", "vector-search", "duckdb"]
+keywords = ["mcp", "memory", "agent", "continuity", "runtime", "checkpoint", "recovery", "handoff", "durable-execution", "interruption", "sqlite", "duckdb"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

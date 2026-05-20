@@ -12,3 +12,6 @@ benchmark/data/
 benchmark/results/
 .aone_copilot/
 .drift-state.json
+.drift-events.jsonl
+engram-summary.md
+.DS_Store

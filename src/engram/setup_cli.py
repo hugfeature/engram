@@ -344,6 +344,31 @@ def _default_event_dir() -> str:
     return DEFAULT_EVENT_DIR
 
 
+def _cmd_rebuild_cache(args: argparse.Namespace) -> int:
+    """Rebuild Tier 3 Runtime Intelligence Cache (FTS + embeddings)."""
+    print("Engram Rebuild Cache (Tier 3)")
+    print("=" * 40)
+    reembed = getattr(args, "reembed", False)
+    if reembed:
+        print("Mode: FULL (FTS + re-embed all memories)")
+    else:
+        print("Mode: FTS only (use --reembed for full rebuild)")
+    print()
+
+    try:
+        from engram.db import MemoryDB
+        db = MemoryDB(log_writes=False)
+        result = db.rebuild_tier3_cache(reembed=reembed)
+        db.close()
+    except Exception as exc:
+        print(f"Rebuild failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    print("\nTier 3 cache rebuild complete.")
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="engram-setup", description="Engram CLI")
     sub = parser.add_subparsers(dest="cmd")
@@ -372,6 +397,15 @@ def main() -> None:
     prompt_p.add_argument("--json", action="store_true",
                           help="Output raw JSON instead of Markdown")
 
+    rebuild_p = sub.add_parser(
+        "rebuild-cache",
+        help="Rebuild Tier 3 Runtime Intelligence Cache (FTS + embeddings).",
+    )
+    rebuild_p.add_argument(
+        "--reembed", action="store_true",
+        help="Also re-compute all embeddings (slow, but fixes model drift).",
+    )
+
     args = parser.parse_args()
     cmd = args.cmd or "setup"
     if cmd == "setup":
@@ -382,6 +416,8 @@ def main() -> None:
         sys.exit(_cmd_recover(args))
     if cmd == "prompt":
         sys.exit(_cmd_prompt(args))
+    if cmd == "rebuild-cache":
+        sys.exit(_cmd_rebuild_cache(args))
 
 
 if __name__ == "__main__":

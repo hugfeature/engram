@@ -267,11 +267,16 @@ class TestCreateCheckpoint:
     def test_tasks_cache_updated(self, db, task):
         create_checkpoint(db, task, REASON_MANUAL_HANDOFF, {})
         create_checkpoint(db, task, REASON_AUTO_SAVE, {})
-        row = db.conn.execute(
-            "SELECT latest_checkpoint_version, checkpoint_count FROM tasks WHERE id = ?",
-            [task],
-        ).fetchone()
-        assert row == (2, 2)
+        # v0.18: checkpoint cache now lives in SQLite Tier 2
+        if db._state_store:
+            ver, count = db._state_store.get_task_checkpoint_cache(task)
+            assert (ver, count) == (2, 2)
+        else:
+            row = db.conn.execute(
+                "SELECT latest_checkpoint_version, checkpoint_count FROM tasks WHERE id = ?",
+                [task],
+            ).fetchone()
+            assert row == (2, 2)
 
     def test_unique_per_task(self, db):
         # 不同 task 各自 version 独立
@@ -555,12 +560,16 @@ class TestHandoffCheckpointIntegration:
         assert r1["checkpoint_version"] == 1
         assert r2["checkpoint_version"] == 2
         assert r3["checkpoint_version"] == 3
-        # tasks 缓存字段同步更新
-        row = db.conn.execute(
-            "SELECT latest_checkpoint_version, checkpoint_count FROM tasks WHERE id = ?",
-            [tid],
-        ).fetchone()
-        assert row == (3, 3)
+        # tasks 缓存字段同步更新 (v0.18: data in SQLite Tier 2)
+        if db._state_store:
+            ver, count = db._state_store.get_task_checkpoint_cache(tid)
+            assert (ver, count) == (3, 3)
+        else:
+            row = db.conn.execute(
+                "SELECT latest_checkpoint_version, checkpoint_count FROM tasks WHERE id = ?",
+                [tid],
+            ).fetchone()
+            assert row == (3, 3)
 
 
 # ============================================================

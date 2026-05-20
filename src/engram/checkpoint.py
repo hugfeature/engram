@@ -171,10 +171,20 @@ def _now_utc():
 
 
 def _to_utc(dt):
-    """DuckDB 返回的 timestamp 可能是 naive，统一为 aware UTC。"""
+    """DuckDB/SQLite 返回的 timestamp 可能是 naive datetime 或 ISO string，统一为 aware UTC。"""
     from datetime import timezone
     if dt is None:
         return _now_utc()
+    # v0.18: SQLite returns ISO string, parse it first
+    if isinstance(dt, str):
+        from datetime import datetime as _dt
+        # Handle formats: "2026-05-19T10:04:51.117Z" or "2026-05-19T10:04:51.117000Z"
+        dt_str = dt.rstrip("Z").replace("+00:00", "")
+        try:
+            parsed = _dt.fromisoformat(dt_str)
+        except ValueError:
+            return _now_utc()
+        return parsed.replace(tzinfo=timezone.utc)
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
@@ -209,6 +219,14 @@ def _is_debounced(db, task_id: int, reason: str, user_id: str) -> bool:
     """同 reason 60s 内是否已有 checkpoint（FAILURE 不受 debounce 限制）。"""
     if reason == REASON_FAILURE:
         return False
+    # v0.18: read from SQLite Tier 2 when available
+    state_store = getattr(db, "_state_store", None)
+    if state_store:
+        ts = state_store.get_latest_checkpoint_for_reason(task_id, reason, user_id)
+        if not ts:
+            return False
+        age = (_now_utc() - _to_utc(ts)).total_seconds()
+        return age < DEBOUNCE_SAME_REASON_SECONDS
     row = db.conn.execute(
         """
         SELECT created_at FROM checkpoints
@@ -224,6 +242,10 @@ def _is_debounced(db, task_id: int, reason: str, user_id: str) -> bool:
 
 
 def _get_last_checkpoint_ts(db, task_id: int, user_id: str):
+    # v0.18: read from SQLite Tier 2 when available
+    state_store = getattr(db, "_state_store", None)
+    if state_store:
+        return state_store.get_latest_checkpoint_ts(task_id, user_id)
     row = db.conn.execute(
         """
         SELECT created_at FROM checkpoints
@@ -324,6 +346,32 @@ def compute_confidence(
     # verification_history：暂无 handoff_verifications 表，给中性默认值（下一阶段升级）
     verification_history = 0.7
 
+    # v0.18: read from SQLite Tier 2 when available
+    state_store = getattr(db, "_state_store", None)
+    if state_store:
+        reasons = state_store.get_recent_checkpoint_reasons(task_id, user_id, limit=5)
+        if reasons:
+            drift_count = sum(
+                1 for r in reasons if r in (REASON_PLAN_UPDATE, REASON_WORKING_SET_SHIFT)
+            )
+            drift_signals = max(0.0, 1.0 - (drift_count / len(reasons)) * 0.5)
+        else:
+            drift_signals = 1.0
+
+        confidence = (
+            CONFIDENCE_WEIGHT_STATE_COMPLETENESS * state_completeness
+            + CONFIDENCE_WEIGHT_RECENCY * recency
+            + CONFIDENCE_WEIGHT_VERIFICATION_HISTORY * verification_history
+            + CONFIDENCE_WEIGHT_DRIFT_SIGNALS * drift_signals
+        )
+        breakdown = {
+            "state_completeness": round(state_completeness, 3),
+            "recency": round(recency, 3),
+            "verification_history": round(verification_history, 3),
+            "drift_signals": round(drift_signals, 3),
+        }
+        return round(confidence, 3), breakdown
+
     rows = db.conn.execute(
         """
         SELECT checkpoint_reason FROM checkpoints
@@ -405,72 +453,100 @@ def create_checkpoint(
     parent_version = prev["version"] if prev else None
     state_diff = compute_shallow_diff(prev_state or {}, state)
 
-    db.conn.execute("BEGIN")
-    try:
-        max_row = db.conn.execute(
-            "SELECT COALESCE(MAX(version), 0) FROM checkpoints WHERE task_id = ? AND user_id = ?",
-            [task_id, user_id],
-        ).fetchone()
-        new_version = (max_row[0] or 0) + 1
-
-        ckpt_row = db.conn.execute(
-            """
-            INSERT INTO checkpoints (
-                task_id, version, parent_version, kind,
-                checkpoint_reason, triggered_by_event,
-                goal, completed, in_progress, blocked, preferred_next,
-                must_not_redo, must_preserve, working_set,
-                active_constraints, blocked_reasons,
-                state_diff, source_session_id, source_memory_id,
-                continuation_confidence, confidence_breakdown,
-                failure_signature, user_id
-            ) VALUES (
-                ?, ?, ?, ?,
-                ?, ?,
-                ?, ?::JSON, ?::JSON, ?::JSON, ?::JSON,
-                ?::JSON, ?::JSON, ?::JSON,
-                ?::JSON, ?::JSON,
-                ?::JSON, ?, ?,
-                ?, ?::JSON,
-                ?, ?
-            )
-            RETURNING id
-            """,
-            [
-                task_id, new_version, parent_version, kind,
-                reason, triggered_by_event,
-                state.get("goal", "") or "",
-                _json.dumps(_as_list(state.get("completed")), ensure_ascii=False),
-                _json.dumps(_as_list(state.get("in_progress")), ensure_ascii=False),
-                _json.dumps(_as_list(state.get("blocked")), ensure_ascii=False),
-                _json.dumps(_as_list(state.get("preferred_next")), ensure_ascii=False),
-                _json.dumps(state["must_not_redo"], ensure_ascii=False),
-                _json.dumps(_as_list(state.get("must_preserve")), ensure_ascii=False),
-                _json.dumps(_as_dict(state.get("working_set")), ensure_ascii=False),
-                _json.dumps(_as_list(state.get("active_constraints")), ensure_ascii=False),
-                _json.dumps(_as_list(state.get("blocked_reasons")), ensure_ascii=False),
-                _json.dumps(state_diff, ensure_ascii=False),
-                source_session_id, source_memory_id,
-                confidence,
-                _json.dumps(breakdown, ensure_ascii=False),
-                failure_signature, user_id,
-            ],
-        ).fetchone()
-        checkpoint_id = ckpt_row[0]
-
-        db.conn.execute(
-            """
-            UPDATE tasks
-            SET latest_checkpoint_version = ?,
-                checkpoint_count = checkpoint_count + 1
-            WHERE id = ?
-            """,
-            [new_version, task_id],
+    # v0.18: write to SQLite Tier 2 when available
+    state_store = getattr(db, "_state_store", None)
+    if state_store:
+        new_version = state_store.get_max_version(task_id, user_id) + 1
+        checkpoint_id = state_store.insert_checkpoint(
+            task_id=task_id, version=new_version, parent_version=parent_version,
+            kind=kind, checkpoint_reason=reason, triggered_by_event=triggered_by_event,
+            goal=state.get("goal", "") or "",
+            completed=_as_list(state.get("completed")),
+            in_progress=_as_list(state.get("in_progress")),
+            blocked=_as_list(state.get("blocked")),
+            preferred_next=_as_list(state.get("preferred_next")),
+            must_not_redo=state["must_not_redo"],
+            must_preserve=_as_list(state.get("must_preserve")),
+            working_set=_as_dict(state.get("working_set")),
+            active_constraints=_as_list(state.get("active_constraints")),
+            blocked_reasons=_as_list(state.get("blocked_reasons")),
+            state_diff=state_diff,
+            source_session_id=source_session_id,
+            source_memory_id=source_memory_id,
+            continuation_confidence=confidence,
+            confidence_breakdown=breakdown,
+            failure_signature=failure_signature,
+            user_id=user_id,
         )
-        db.conn.execute("COMMIT")
-    except Exception:
-        db.conn.execute("ROLLBACK")
-        raise
+        state_store.update_task_checkpoint_cache(task_id, new_version)
+    else:
+        import json as _json2
+        db.conn.execute("BEGIN")
+        try:
+            max_row = db.conn.execute(
+                "SELECT COALESCE(MAX(version), 0) FROM checkpoints WHERE task_id = ? AND user_id = ?",
+                [task_id, user_id],
+            ).fetchone()
+            new_version = (max_row[0] or 0) + 1
+
+            ckpt_row = db.conn.execute(
+                """
+                INSERT INTO checkpoints (
+                    task_id, version, parent_version, kind,
+                    checkpoint_reason, triggered_by_event,
+                    goal, completed, in_progress, blocked, preferred_next,
+                    must_not_redo, must_preserve, working_set,
+                    active_constraints, blocked_reasons,
+                    state_diff, source_session_id, source_memory_id,
+                    continuation_confidence, confidence_breakdown,
+                    failure_signature, user_id
+                ) VALUES (
+                    ?, ?, ?, ?,
+                    ?, ?,
+                    ?, ?::JSON, ?::JSON, ?::JSON, ?::JSON,
+                    ?::JSON, ?::JSON, ?::JSON,
+                    ?::JSON, ?::JSON,
+                    ?::JSON, ?, ?,
+                    ?, ?::JSON,
+                    ?, ?
+                )
+                RETURNING id
+                """,
+                [
+                    task_id, new_version, parent_version, kind,
+                    reason, triggered_by_event,
+                    state.get("goal", "") or "",
+                    _json.dumps(_as_list(state.get("completed")), ensure_ascii=False),
+                    _json.dumps(_as_list(state.get("in_progress")), ensure_ascii=False),
+                    _json.dumps(_as_list(state.get("blocked")), ensure_ascii=False),
+                    _json.dumps(_as_list(state.get("preferred_next")), ensure_ascii=False),
+                    _json.dumps(state["must_not_redo"], ensure_ascii=False),
+                    _json.dumps(_as_list(state.get("must_preserve")), ensure_ascii=False),
+                    _json.dumps(_as_dict(state.get("working_set")), ensure_ascii=False),
+                    _json.dumps(_as_list(state.get("active_constraints")), ensure_ascii=False),
+                    _json.dumps(_as_list(state.get("blocked_reasons")), ensure_ascii=False),
+                    _json.dumps(state_diff, ensure_ascii=False),
+                    source_session_id, source_memory_id,
+                    confidence,
+                    _json.dumps(breakdown, ensure_ascii=False),
+                    failure_signature, user_id,
+                ],
+            ).fetchone()
+            checkpoint_id = ckpt_row[0]
+
+            db.conn.execute(
+                """
+                UPDATE tasks
+                SET latest_checkpoint_version = ?,
+                    checkpoint_count = checkpoint_count + 1
+                WHERE id = ?
+                """,
+                [new_version, task_id],
+            )
+            db.conn.execute("COMMIT")
+        except Exception:
+            db.conn.execute("ROLLBACK")
+            raise
 
     # Tier 1 — checkpoints are the cognitive backbone of continuity, MUST
     # be in the event log so a destroyed DuckDB can be replayed back.
@@ -537,6 +613,11 @@ def get_checkpoint(
     user_id: str = "default",
 ) -> Optional[dict]:
     """获取 task 的某个 checkpoint。version=None → 最新。"""
+    # v0.18: read from SQLite Tier 2 when available
+    if getattr(db, "_state_store", None):
+        if version is None:
+            return db._state_store.get_latest_checkpoint(task_id, user_id)
+        return db._state_store.get_checkpoint_by_version(task_id, version, user_id)
     if version is None:
         sql = """
             SELECT * FROM checkpoints
@@ -564,6 +645,26 @@ def list_checkpoints(
     user_id: str = "default",
 ) -> list[dict]:
     """返回 task 的 checkpoint 历史（version DESC），不含完整 state。"""
+    # v0.18: read from SQLite Tier 2 when available
+    state_store = getattr(db, "_state_store", None)
+    if state_store:
+        full_rows = state_store.list_checkpoints(task_id, user_id, limit)
+        return [
+            {
+                "checkpoint_id": r["id"],
+                "version": r["version"],
+                "parent_version": r["parent_version"],
+                "kind": r["kind"],
+                "reason": r.get("reason") or r.get("checkpoint_reason"),
+                "triggered_by_event": r["triggered_by_event"],
+                "source_session_id": r["source_session_id"],
+                "source_memory_id": r["source_memory_id"],
+                "continuation_confidence": r["continuation_confidence"],
+                "failure_signature": r["failure_signature"],
+                "created_at": r["created_at"],
+            }
+            for r in full_rows
+        ]
     rows = db._fetchall_dicts(
         """
         SELECT id, version, parent_version, kind, checkpoint_reason,
