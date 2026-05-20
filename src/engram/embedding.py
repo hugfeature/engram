@@ -42,7 +42,8 @@ def try_recover() -> bool:
         try:
             from sentence_transformers import SentenceTransformer
             cache_dir = os.path.join(os.path.expanduser("~"), ".engram", "model_cache")
-            m = SentenceTransformer(MODEL_NAME, cache_folder=cache_dir, local_files_only=True)
+            device = os.environ.get("ENGRAM_EMBED_DEVICE", "cpu")
+            m = SentenceTransformer(MODEL_NAME, cache_folder=cache_dir, local_files_only=True, device=device)
             m.encode("warmup", normalize_embeddings=True)
             _model = m
             _degraded = False
@@ -87,10 +88,13 @@ def _get_model() -> SentenceTransformer | None:
                 # when loading embedding model and DuckDB VSS simultaneously
                 try:
                     from sentence_transformers import SentenceTransformer
+                    # Force CPU to avoid MPS segfault in async/multi-thread context
+                    # MPS (Metal) is not thread-safe and crashes under uvloop + background threads
+                    device = os.environ.get("ENGRAM_EMBED_DEVICE", "cpu")
                     try:
-                        m = SentenceTransformer(MODEL_NAME, cache_folder=cache_dir, local_files_only=True)
+                        m = SentenceTransformer(MODEL_NAME, cache_folder=cache_dir, local_files_only=True, device=device)
                     except Exception:
-                        m = SentenceTransformer(MODEL_NAME, cache_folder=cache_dir)
+                        m = SentenceTransformer(MODEL_NAME, cache_folder=cache_dir, device=device)
                     m.encode("warmup", normalize_embeddings=True)
                     _model = m
                     log.info("Embedding model loaded successfully (sequential mode)")
