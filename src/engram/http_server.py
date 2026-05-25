@@ -78,6 +78,29 @@ async def lifespan(app: FastAPI):
             start_checkpoint_scheduler()
     except Exception as e:
         log.warning("Scheduler init failed: %s", e)
+
+    # Warmup: load embedding model + prime VSS index before serving traffic.
+    # Without this, the first /v1/recall after daemon (re)start blocks 2-5s
+    # while mpnet weights + HNSW index lazy-load, which busts the SessionStart
+    # hook's client-side timeout. We do this synchronously inside lifespan so
+    # the HTTP port is not exposed until warmup completes. Failures degrade
+    # gracefully (BM25 still works) rather than blocking startup.
+    if shared._db is not None:
+        import time as _time
+        try:
+            from .embedding import embed
+            t0 = _time.perf_counter()
+            warm_vec = embed("engram warmup query")
+            log.info("Warmup: embedding model loaded in %.2fs", _time.perf_counter() - t0)
+            try:
+                t1 = _time.perf_counter()
+                shared._db.search_vector(warm_vec, "default", top_k=1, threshold=0.0)
+                log.info("Warmup: VSS index primed in %.2fs", _time.perf_counter() - t1)
+            except Exception as e:
+                log.warning("Warmup: VSS prime failed (non-fatal): %s", e)
+        except Exception as e:
+            log.warning("Warmup: embedding load failed (non-fatal, degraded mode): %s", e)
+
     log.info("Engram server started (REST + MCP)")
     async with session_mgr.run():
         yield

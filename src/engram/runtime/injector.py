@@ -27,7 +27,7 @@ from typing import Any
 log = logging.getLogger("engram.runtime.injector")
 
 DEFAULT_DAEMON_URL = os.environ.get("ENGRAM_DAEMON_URL", "http://127.0.0.1:8900")
-DEFAULT_TIMEOUT = float(os.environ.get("ENGRAM_HOOK_TIMEOUT", "2.0"))
+DEFAULT_TIMEOUT = float(os.environ.get("ENGRAM_HOOK_TIMEOUT", "4.0"))
 DEFAULT_USER_ID = os.environ.get("ENGRAM_USER_ID", "default")
 RUNTIME_DIR = Path(os.environ.get("ENGRAM_HOME", str(Path.home() / ".engram"))) / "runtime"
 MAX_INJECTION_CHARS = int(os.environ.get("ENGRAM_INJECT_BUDGET", "2000"))
@@ -131,7 +131,14 @@ def fetch_active_context(
     daemon_url: str = DEFAULT_DAEMON_URL,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> DaemonResult:
-    """Issue parallel-ish recalls. Each individual failure is non-fatal."""
+    """Issue 4 sequential recalls. Each individual failure is non-fatal.
+
+    Why sequential, not parallel: the embedding model (sentence-transformers
+    mpnet on ARM CPU) is not safe to invoke concurrently — multiple threads
+    calling encode() at once can SIGBUS the daemon. See embedding.py header
+    notes. With daemon-side warmup, single-call latency is ~80ms hot, so
+    4 calls × 80ms = ~320ms total, well under the 8s hook budget.
+    """
     result = DaemonResult(available=True)
 
     # 1. Latest handoff (memory_type=handoff, query is project name)
