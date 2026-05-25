@@ -356,3 +356,147 @@ def _maybe_emit_drift_nudge(
         )
     except Exception as exc:
         log.debug("drift nudge emission failed (non-fatal): %s", exc)
+
+
+# ============================================================
+# Thrashing Circuit Breaker — detect repetitive tool calls
+# ============================================================
+
+class ThrashingDetector:
+    """Detects when an agent is stuck calling the same tool repeatedly.
+
+    Observation-driven: real sessions show 20-200x consecutive same-tool calls
+    when agents hit UI state mismatch or API capability boundaries.
+
+    The detector maintains a sliding window of recent tool calls per task.
+    When the same tool appears N+ times consecutively, it injects a warning
+    memory suggesting the agent change strategy.
+
+    Unlike drift detection (which needs a checkpoint baseline), thrashing
+    detection is purely local — it only looks at the recent call sequence.
+    """
+
+    def __init__(self) -> None:
+        # Per-task state: {task_id: {"tool_history": [...], "last_nudge_at": int}}
+        self._state: dict[int, dict] = {}
+
+    def record_tool_call(
+        self,
+        db: "MemoryDB",
+        task_id: int,
+        tool_name: str,
+        user_id: str = "default",
+    ) -> bool:
+        """Record a tool call and check for thrashing.
+
+        Returns True if a thrashing nudge was emitted.
+        """
+        from .config import THRASHING_ENABLED, THRASHING_THRESHOLD, THRASHING_COOLDOWN
+
+        if not THRASHING_ENABLED:
+            return False
+
+        state = self._state.setdefault(task_id, {
+            "tool_history": [],
+            "last_nudge_at": -THRASHING_COOLDOWN,  # Allow immediate first nudge
+        })
+
+        history = state["tool_history"]
+        history.append(tool_name)
+
+        # Keep only last 50 entries to bound memory
+        if len(history) > 50:
+            history[:] = history[-50:]
+
+        # Count consecutive same-tool calls from the end
+        consecutive = 0
+        for call in reversed(history):
+            if call == tool_name:
+                consecutive += 1
+            else:
+                break
+
+        if consecutive < THRASHING_THRESHOLD:
+            return False
+
+        # Cooldown check: don't spam nudges
+        calls_since_last = len(history) - state["last_nudge_at"]
+        if calls_since_last < THRASHING_COOLDOWN:
+            return False
+
+        # Fire the circuit breaker
+        state["last_nudge_at"] = len(history)
+        self._emit_thrashing_nudge(db, task_id, tool_name, consecutive, user_id)
+        return True
+
+    def _emit_thrashing_nudge(
+        self,
+        db: "MemoryDB",
+        task_id: int,
+        tool_name: str,
+        consecutive: int,
+        user_id: str,
+    ) -> None:
+        """Inject a high-priority warning memory about tool thrashing."""
+        warning_content = (
+            f"⚠️ THRASHING DETECTED (task#{task_id}): '{tool_name}' called "
+            f"{consecutive}x consecutively without progress. "
+            f"This pattern indicates a feedback loop failure — the tool's output "
+            f"is not providing the expected state change. "
+            f"RECOMMENDED: 1) Verify assumptions about current state, "
+            f"2) Try a fundamentally different approach, "
+            f"3) If UI automation: check whether the action actually took effect."
+        )
+
+        try:
+            from .embedding import embed
+            warning_embedding = embed(warning_content)
+            if warning_embedding is None:
+                log.debug("thrashing nudge: embedding failed, skipping")
+                return
+
+            db.insert(
+                content=warning_content,
+                embedding=warning_embedding,
+                importance=0.85,
+                category="failure",
+                user_id=user_id,
+                metadata={
+                    "type": "thrashing_nudge",
+                    "task_id": task_id,
+                    "tool": tool_name,
+                    "consecutive_calls": consecutive,
+                },
+            )
+
+            try:
+                db._emit_event("drift.thrashing", {
+                    "task_id": task_id,
+                    "tool": tool_name,
+                    "consecutive": consecutive,
+                })
+            except Exception:
+                pass
+
+            log.info(
+                "thrashing nudge emitted: task#%d tool='%s' x%d",
+                task_id, tool_name, consecutive,
+            )
+        except Exception as exc:
+            log.debug("thrashing nudge emission failed (non-fatal): %s", exc)
+
+    def reset(self, task_id: int) -> None:
+        """Reset thrashing state for a task (e.g. on task completion)."""
+        self._state.pop(task_id, None)
+
+
+# Module-level singleton
+_thrashing_detector: ThrashingDetector | None = None
+
+
+def get_thrashing_detector() -> ThrashingDetector:
+    """Get or create the module-level thrashing detector."""
+    global _thrashing_detector
+    if _thrashing_detector is None:
+        _thrashing_detector = ThrashingDetector()
+    return _thrashing_detector

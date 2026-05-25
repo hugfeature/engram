@@ -59,6 +59,13 @@ DEDUP_SEARCH_THRESHOLD = _float("ENGRAM_DEDUP_SEARCH_THRESHOLD", 0.60)
 DRIFT_NUDGE_THRESHOLD = _float("ENGRAM_DRIFT_NUDGE_THRESHOLD", 0.7)
 DRIFT_NUDGE_ENABLED = os.environ.get("ENGRAM_DRIFT_NUDGE", "1") != "0"
 
+# --- Thrashing Circuit Breaker (drift.py) ---
+# Triggers when same tool is called N+ times consecutively without progress
+THRASHING_ENABLED = os.environ.get("ENGRAM_THRASHING_BREAKER", "1") != "0"
+THRASHING_THRESHOLD = _int("ENGRAM_THRASHING_THRESHOLD", 5, lo=3, hi=50)
+# Cooldown: don't fire again for same tool within N calls after last nudge
+THRASHING_COOLDOWN = _int("ENGRAM_THRASHING_COOLDOWN", 10, lo=3, hi=100)
+
 # --- Adaptive Checkpoint (checkpoint.py) ---
 ADAPTIVE_CHECKPOINT_ENABLED = os.environ.get("ENGRAM_ADAPTIVE_CHECKPOINT", "1") != "0"
 # If auto_save restore rate < this threshold over last 7 days, double the interval

@@ -1765,6 +1765,37 @@ def handle_recommend_recovery(db: MemoryDB, graph: MemoryGraph,
     }
 
 
+def handle_report_tool_call(db: MemoryDB, graph: MemoryGraph,
+                            task_id: int, tool_name: str,
+                            user_id: str = "default") -> dict:
+    """Report a tool call for thrashing detection (lightweight, no embedding).
+
+    Called by the runtime hook after each tool invocation. If the same tool
+    has been called N+ times consecutively, injects a thrashing warning memory
+    that surfaces on next recall_memory().
+
+    This is the circuit breaker for feedback loop failures observed in real
+    sessions: 20-200x consecutive same-tool calls when agents hit UI state
+    mismatch or API capability boundaries.
+    """
+    if not tool_name or not tool_name.strip():
+        return _error("tool_name must be non-empty")
+
+    task_id = int(task_id)
+    user_id = _validate_user_id(user_id)
+
+    from .drift import get_thrashing_detector
+    detector = get_thrashing_detector()
+    nudge_emitted = detector.record_tool_call(db, task_id, tool_name.strip(), user_id)
+
+    return {
+        "ok": True,
+        "thrashing_detected": nudge_emitted,
+        "tool": tool_name.strip(),
+        "task_id": task_id,
+    }
+
+
 TOOL_HANDLERS = {
     "recall_memory": handle_recall,
     "store_memory": handle_store,
@@ -1792,6 +1823,7 @@ TOOL_HANDLERS = {
     "detect_drift": handle_detect_drift,
     "score_recovery": handle_score_recovery,
     "recommend_recovery": handle_recommend_recovery,
+    "report_tool_call": handle_report_tool_call,
 }
 
 ARG_MAPPING = {
@@ -1851,4 +1883,6 @@ ARG_MAPPING = {
     "recommend_recovery": {"task_id": "task_id",
                            "interruption_reason": "interruption_reason",
                            "retry_count": "retry_count", "user_id": "user_id"},
+    "report_tool_call": {"task_id": "task_id", "tool_name": "tool_name",
+                         "user_id": "user_id"},
 }

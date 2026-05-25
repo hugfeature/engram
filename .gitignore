@@ -15,3 +15,4 @@ benchmark/results/
 .drift-events.jsonl
 engram-summary.md
 .DS_Store
+data/
