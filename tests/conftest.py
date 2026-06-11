@@ -1,6 +1,15 @@
 """Shared test fixtures for engram test suite."""
 
 import os
+import tempfile
+
+# Redirect the engram state root to a throwaway dir BEFORE any engram module is
+# imported. The path constants (ENGRAM_DIR / DB_PATH / SNAPSHOT_DIR / ...) are
+# resolved at import time from ENGRAM_HOME, so this must run first — otherwise the
+# suite reads/writes the real ~/.engram and fights the live daemon for the DuckDB
+# WAL lock (FTS rebuild / CHECKPOINT "Conflicting lock is held" errors).
+if not os.environ.get("ENGRAM_HOME"):
+    os.environ["ENGRAM_HOME"] = tempfile.mkdtemp(prefix="engram-test-home-")
 
 import pytest
 
