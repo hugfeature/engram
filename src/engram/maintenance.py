@@ -33,7 +33,7 @@ import duckdb
 log = logging.getLogger(__name__)
 
 # Constants live here so callers don't need to reach into db.py internals.
-ENGRAM_DIR = os.path.join(os.path.expanduser("~"), ".engram")
+ENGRAM_DIR = os.environ.get("ENGRAM_HOME") or os.path.join(os.path.expanduser("~"), ".engram")
 BACKUP_DIR = os.path.join(ENGRAM_DIR, "backups")
 ARCHIVE_DIR = os.path.join(BACKUP_DIR, "archive")
 
