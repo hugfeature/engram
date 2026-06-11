@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 import time as _time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -42,7 +43,59 @@ from .config import DEDUP_SEARCH_THRESHOLD, SIMILARITY_LOW
 
 log = logging.getLogger("engram.db")
 
-ENGRAM_DIR = os.path.join(os.path.expanduser("~"), ".engram")
+
+# ---------------------------------------------------------------------------
+# Thread-safe DuckDB Connection proxy
+# ---------------------------------------------------------------------------
+# DuckDB connections are NOT thread-safe: concurrent .execute() calls from
+# different threads (e.g. uvicorn event-loop thread vs APScheduler background
+# thread) corrupt internal state and cause SIGBUS/SIGSEGV (observed 2026-06).
+#
+# This proxy wraps a real duckdb.DuckDBPyConnection and serializes all
+# attribute access behind a reentrant lock. MemoryDB assigns self.conn to an
+# instance of this proxy — all 74+ call-sites (self.conn.execute(...)) are
+# protected without any code changes.
+# ---------------------------------------------------------------------------
+
+class _ThreadSafeConnection:
+    """Transparent proxy that serializes all access to a DuckDB connection."""
+
+    __slots__ = ("_real_conn", "_lock")
+
+    def __init__(self, conn: duckdb.DuckDBPyConnection):
+        object.__setattr__(self, "_real_conn", conn)
+        object.__setattr__(self, "_lock", threading.RLock())
+
+    def execute(self, *args, **kwargs):
+        with self._lock:
+            return self._real_conn.execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        with self._lock:
+            return self._real_conn.executemany(*args, **kwargs)
+
+    def close(self):
+        with self._lock:
+            return self._real_conn.close()
+
+    def __getattr__(self, name):
+        # For any other attribute (description, fetchone, etc.) delegate
+        # through the lock. Most are quick property reads but we protect
+        # them anyway since DuckDB result objects share connection state.
+        with self._lock:
+            return getattr(self._real_conn, name)
+
+    def __bool__(self):
+        return self._real_conn is not None
+
+    def __eq__(self, other):
+        if other is None:
+            return self._real_conn is None
+        return NotImplemented
+
+# Root state dir. Override via ENGRAM_HOME (tests point this at a tmp dir so
+# they never touch the user's real ~/.engram or fight the live daemon for locks).
+ENGRAM_DIR = os.environ.get("ENGRAM_HOME") or os.path.join(os.path.expanduser("~"), ".engram")
 DB_PATH = os.path.join(ENGRAM_DIR, "memories.duckdb")
 _BACKUP_DIR = os.path.join(ENGRAM_DIR, "backups")
 
@@ -684,6 +737,20 @@ class MemoryDB:
     ):
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self._db_path = db_path
+        # Single global lock serializing ALL access to self.conn.
+        #
+        # DuckDBPyConnection is NOT thread-safe. The daemon (uvicorn, single
+        # process) drives this one connection from up to four threads:
+        #   - the uvloop request handler (MCP/REST)
+        #   - pruner.run_maintenance        (APScheduler, every 12h)
+        #   - snapshot CHECKPOINT           (APScheduler, every 2min)
+        #   - SnapshotScheduler poll        (daemon thread, every 1min)
+        # Concurrent execute() on a shared conn corrupts DuckDB's C++ state
+        # and SIGBUSes the process. Reentrant so a locked write path can call
+        # other locked helpers without self-deadlock. Callers that span the
+        # request boundary (shared._dispatch) and the background jobs take
+        # this lock; that is enough to make all conn access mutually exclusive.
+        self.global_lock = threading.RLock()
         self._fts_available = False
         self._fts_dirty = True  # Force rebuild on first search
         self._readonly = False
@@ -703,7 +770,7 @@ class MemoryDB:
                 db_path, self._residue_files,
             )
         try:
-            self.conn = _connect_with_retry(db_path)
+            self.conn = _ThreadSafeConnection(_connect_with_retry(db_path))
         except DatabaseCorruptionError as corrupt_err:
             # v0.18: auto-recover from snapshot + incremental replay.
             # If a snapshot exists, copy it over the corrupt DB and replay
@@ -715,30 +782,32 @@ class MemoryDB:
                     "DB corrupt and no snapshot available for auto-recovery. "
                     "Entering readonly degraded mode. Run `engram-setup recover`."
                 )
-                self.conn = duckdb.connect(":memory:")
+                self.conn = _ThreadSafeConnection(duckdb.connect(":memory:"))
                 self._readonly = True
                 self._readonly_reason = (
                     f"DB corrupt ({corrupt_err.original}), no snapshot for auto-recovery. "
                     "Run `engram-setup recover` to rebuild from event log."
                 )
         except DatabaseLockedError as lock_err:
-            # v0.16: graceful fallback — another engram holds the lock.
-            # Open read-only instead of crashing. Writes will fail with
-            # DegradedModeError, which MCP clients can surface clearly.
+            # v0.16+: graceful fallback — another engram holds the lock.
+            # IMPORTANT: Do NOT open the same file with read_only=True.
+            # DuckDB does not guarantee cross-process safety when one process
+            # holds a write lock and another opens read_only on the same file.
+            # The read_only mmap can see stale page layouts when the writer
+            # modifies WAL, causing SIGBUS on worker threads (observed 2026-06).
+            # Instead, fall back to in-memory — CLI commands that need data
+            # should route through the daemon's HTTP API.
             log.warning(
-                "DuckDB locked by another process — entering readonly mode. "
-                "Reads will work; writes will return degraded_mode errors. "
-                "Stop the other engram process to regain write access."
+                "DuckDB locked by another process — falling back to in-memory mode. "
+                "Reads/writes unavailable locally; use the daemon HTTP API instead. "
+                "Stop the other engram process to regain direct DB access."
             )
-            try:
-                self.conn = duckdb.connect(db_path, read_only=True)
-            except Exception:
-                # If even read-only fails, create an in-memory fallback
-                self.conn = duckdb.connect(":memory:")
+            self.conn = _ThreadSafeConnection(duckdb.connect(":memory:"))
             self._readonly = True
             self._readonly_reason = (
                 f"DuckDB locked by another process ({lock_err.original}). "
-                "Stop the other engram process or run `engram-server stop`."
+                "Cannot open read_only (cross-process SIGBUS risk). "
+                "Route requests through daemon HTTP API, or run `engram-server stop`."
             )
         self._dim = dim or _dim()
         # Populated by _init_meta(): the duckdb_version recorded by the
@@ -797,7 +866,7 @@ class MemoryDB:
                 sum(report.counts.values()), report.snapshot_seq,
             )
             # Now open the recovered DB normally.
-            self.conn = _connect_with_retry(db_path)
+            self.conn = _ThreadSafeConnection(_connect_with_retry(db_path))
             return True
         except Exception as exc:
             log.error("Auto-recovery from snapshot failed: %s", exc)
@@ -2197,28 +2266,69 @@ class MemoryDB:
             )
         return [self._row_to_task(r) for r in rows]
 
+    # Task statuses that mean "this task is finished — its interrupt checkpoint
+    # must NOT resurface as a pending-recovery prompt". See case study:
+    # drift/docs/case-memory-injected-hallucinated-state.md
+    _TERMINAL_TASK_STATUSES = ("cancelled", "done")
+
     def get_latest_interrupt_checkpoint(self, user_id: str = "default") -> dict | None:
-        """Return the most recent auto-interrupt checkpoint across all tasks.
+        """Return the most recent auto-interrupt checkpoint for a STILL-ACTIVE task.
 
         Looks for AUTO_SAVE checkpoints triggered by process_exit — these are
         the ones written by trigger_interrupt_checkpoint() on SIGTERM.
+
+        A checkpoint is only returned if its owning task is still active. Without
+        this status gate, a task that was cancelled/done after being interrupted
+        keeps injecting a phantom "DO NOT start fresh, restore IMMEDIATELY" prompt
+        into every new session — a runtime-induced stale-state drift (see
+        drift/docs/case-runtime-induced/RI-001-zombie-checkpoint.md).
+
+        Two backends post-v0.18:
+        - SQLite Tier 2 (primary): status gate done via single-DB JOIN.
+        - DuckDB (fallback / pre-migration residue): status gate done in Python
+          via get_task(), since tasks may already live in SQLite.
+
         Returns a raw dict (same shape as checkpoint._row_to_checkpoint) or None.
         """
+        # v0.18 primary path: checkpoints + tasks both in SQLite, JOIN is safe.
+        if self._state_store:
+            try:
+                return self._state_store.get_latest_interrupt_checkpoint(
+                    user_id, terminal_statuses=self._TERMINAL_TASK_STATUSES)
+            except Exception as exc:
+                log.debug("state_store interrupt checkpoint lookup failed, "
+                          "falling back to DuckDB: %s", exc)
+
         from .checkpoint import _row_to_checkpoint
-        row = self._fetchone_dict(
+        # DuckDB fallback. Scan a few most-recent candidates; the active one is
+        # almost always first, but a terminal task may sit on top, so we walk past.
+        rows = self._fetchall_dicts(
             """
             SELECT * FROM checkpoints
             WHERE user_id = ?
               AND checkpoint_reason = 'AUTO_SAVE'
               AND triggered_by_event = 'process_exit'
             ORDER BY created_at DESC
-            LIMIT 1
+            LIMIT 20
             """,
             [user_id],
         )
-        if not row:
-            return None
-        return _row_to_checkpoint(row)
+        for row in rows:
+            task_id = row.get("task_id")
+            if task_id is None:
+                continue
+            try:
+                task = self.get_task(task_id)
+            except Exception as exc:
+                log.debug("interrupt checkpoint status gate: get_task(%s) failed: %s",
+                          task_id, exc)
+                # Fail open: if we cannot verify status, surface the checkpoint
+                # rather than silently dropping a possibly-real interruption.
+                return _row_to_checkpoint(row)
+            if task is not None and task.status in self._TERMINAL_TASK_STATUSES:
+                continue  # finished task — skip its stale interrupt checkpoint
+            return _row_to_checkpoint(row)
+        return None
 
     def get_task_memories(self, task_id: int, user_id: str = "default") -> list[MemoryRow]:
         """Get all memories associated with a task via metadata.task_id."""
