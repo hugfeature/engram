@@ -28,6 +28,15 @@ _EMBED_CACHE_MAX_KEY_LEN = 1000  # Limit debug key preview length
 _embed_cache: OrderedDict[str, list[float]] = OrderedDict()
 _cache_lock = threading.Lock()
 
+# Serializes model.encode() calls. sentence-transformers / torch on ARM CPU
+# can SIGBUS when encode() runs concurrently from multiple threads (see
+# runtime/injector.py header note). The daemon's DB global_lock already
+# serializes most embed() calls via _dispatch, but paths outside dispatch
+# (graph flush, warmup, direct callers) can still race — this lock closes
+# that gap. It guards ONLY the encode() call, not the cache hit fast-path.
+_encode_lock = threading.Lock()
+
+
 
 def is_degraded() -> bool:
     return _degraded
@@ -143,7 +152,8 @@ def embed(text: str) -> list[float]:
         log.warning("Embedding in degraded mode — returning zero vector")
         return [0.0] * get_dimensions()
     try:
-        vec = model.encode(text, normalize_embeddings=True)
+        with _encode_lock:
+            vec = model.encode(text, normalize_embeddings=True)
         result = vec.tolist()
         with _cache_lock:
             _embed_cache[cache_key] = result
