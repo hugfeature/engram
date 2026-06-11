@@ -39,7 +39,8 @@ from typing import Any, Iterator
 log = logging.getLogger("engram.event_log")
 
 EVENT_SCHEMA_VERSION = 1
-DEFAULT_EVENT_DIR = os.path.join(os.path.expanduser("~"), ".engram", "events")
+_ENGRAM_DIR = os.environ.get("ENGRAM_HOME") or os.path.join(os.path.expanduser("~"), ".engram")
+DEFAULT_EVENT_DIR = os.path.join(_ENGRAM_DIR, "events")
 SEQ_FILE_NAME = ".seq"
 
 # Tier 1 event kinds — these MUST be replayable to reconstruct runtime state.
