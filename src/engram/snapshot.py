@@ -33,7 +33,7 @@ from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
-ENGRAM_DIR = os.path.join(os.path.expanduser("~"), ".engram")
+ENGRAM_DIR = os.environ.get("ENGRAM_HOME") or os.path.join(os.path.expanduser("~"), ".engram")
 SNAPSHOT_DIR = os.path.join(ENGRAM_DIR, "snapshots")
 
 ENV_INTERVAL_EVENTS = "ENGRAM_SNAPSHOT_INTERVAL_EVENTS"
@@ -305,16 +305,28 @@ class SnapshotScheduler:
         # Pass the shared DB connection to avoid opening a second write
         # connection which causes SIGSEGV in DuckDB's C++ layer.
         conn = None
+        db = None
         try:
             from .shared import _db
             if _db is not None:
+                db = _db
                 conn = _db.conn
         except Exception:
             pass
 
-        info = take_snapshot(
-            self._db_path, current_seq, self._snapshot_dir, shared_conn=conn
-        )
+        # CHECKPOINT on the shared conn races request handlers / maintenance
+        # unless serialized — DuckDBPyConnection is not thread-safe. Hold the
+        # DB global lock across the snapshot (which runs CHECKPOINT then a
+        # file copy). The copy itself is cheap relative to request latency.
+        if db is not None:
+            with db.global_lock:
+                info = take_snapshot(
+                    self._db_path, current_seq, self._snapshot_dir, shared_conn=conn
+                )
+        else:
+            info = take_snapshot(
+                self._db_path, current_seq, self._snapshot_dir, shared_conn=conn
+            )
         if info is not None:
             self._last_seq = info.seq
             self._last_at = _time.time()
