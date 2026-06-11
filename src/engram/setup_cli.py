@@ -21,7 +21,7 @@ def _cmd_setup() -> int:
     print("Engram Setup")
     print("=" * 40)
 
-    data_dir = os.path.join(os.path.expanduser("~"), ".engram")
+    data_dir = os.environ.get("ENGRAM_HOME") or os.path.join(os.path.expanduser("~"), ".engram")
     os.makedirs(data_dir, exist_ok=True)
 
     model_name = os.environ.get("ENGRAM_MODEL", "all-mpnet-base-v2")
