@@ -234,97 +234,101 @@ def trigger_interrupt_checkpoint() -> bool:
                       db.conn, db.readonly)
             return False
 
-        # Find the most recently updated in-progress task.
-        # list_tasks returns ORDER BY updated_at DESC, so active_tasks[0]
-        # is the task the agent was most recently working on.
-        active_tasks = db.list_tasks(status="in_progress")
-        if not active_tasks:
-            active_tasks = db.list_tasks(status="planning")
+        # Serialize against request handlers and other schedulers — this runs
+        # on the APScheduler thread (every 2min) and from atexit. Concurrent
+        # conn access with a request would SIGBUS the daemon.
+        with db.global_lock:
+            # Find the most recently updated in-progress task.
+            # list_tasks returns ORDER BY updated_at DESC, so active_tasks[0]
+            # is the task the agent was most recently working on.
+            active_tasks = db.list_tasks(status="in_progress")
+            if not active_tasks:
+                active_tasks = db.list_tasks(status="planning")
 
-        if not active_tasks:
-            # Fallback: infer a task from recent events so we don't lose
-            # the interrupt checkpoint when no explicit task was created.
-            recent_events = _get_recent_events(limit=30)
-            if not recent_events:
-                log.debug("Interrupt checkpoint skipped: no tasks and no events")
-                return False
+            if not active_tasks:
+                # Fallback: infer a task from recent events so we don't lose
+                # the interrupt checkpoint when no explicit task was created.
+                recent_events = _get_recent_events(limit=30)
+                if not recent_events:
+                    log.debug("Interrupt checkpoint skipped: no tasks and no events")
+                    return False
 
-            inferred_goal = _infer_goal_from_events(recent_events)
-            task_id = db.create_task(
-                name=f"auto-session-{(_current_session_id or 'unknown')[:8]}",
-                goal=inferred_goal,
-                status="in_progress",
+                inferred_goal = _infer_goal_from_events(recent_events)
+                task_id = db.create_task(
+                    name=f"auto-session-{(_current_session_id or 'unknown')[:8]}",
+                    goal=inferred_goal,
+                    status="in_progress",
+                )
+                task = db.get_task(task_id)
+                log.info(
+                    "No active task found; auto-created session task %d for interrupt checkpoint",
+                    task_id,
+                )
+            else:
+                task = active_tasks[0]
+
+            from .checkpoint import (
+                create_checkpoint,
+                get_checkpoint,
+                REASON_AUTO_SAVE,
+                _as_dict,
+                _as_list,
             )
-            task = db.get_task(task_id)
-            log.info(
-                "No active task found; auto-created session task %d for interrupt checkpoint",
-                task_id,
-            )
-        else:
-            task = active_tasks[0]
 
-        from .checkpoint import (
-            create_checkpoint,
-            get_checkpoint,
-            REASON_AUTO_SAVE,
-            _as_dict,
-            _as_list,
-        )
+            # Inherit existing checkpoint state so we don't regress continuity.
+            # If there is no prior checkpoint, base_state is empty and we build
+            # from task metadata alone.
+            existing = get_checkpoint(db, task.id, user_id=task.user_id)
+            base_state: dict = existing["state"] if existing else {}
+            existing_working_set: dict = _as_dict(base_state.get("working_set"))
 
-        # Inherit existing checkpoint state so we don't regress continuity.
-        # If there is no prior checkpoint, base_state is empty and we build
-        # from task metadata alone.
-        existing = get_checkpoint(db, task.id, user_id=task.user_id)
-        base_state: dict = existing["state"] if existing else {}
-        existing_working_set: dict = _as_dict(base_state.get("working_set"))
+            # Deterministic runtime signals — code only, no LLM
+            modified_files = _get_git_modified_files()
+            recent_events = _get_recent_events(limit=50)
+            event_summary = _summarise_recent_events(recent_events)
 
-        # Deterministic runtime signals — code only, no LLM
-        modified_files = _get_git_modified_files()
-        recent_events = _get_recent_events(limit=50)
-        event_summary = _summarise_recent_events(recent_events)
+            # Merge git-diff files with any files already tracked in working_set.
+            # Use dict.fromkeys to deduplicate while preserving order.
+            merged_files = list(dict.fromkeys(
+                existing_working_set.get("files", []) + modified_files
+            ))
 
-        # Merge git-diff files with any files already tracked in working_set.
-        # Use dict.fromkeys to deduplicate while preserving order.
-        merged_files = list(dict.fromkeys(
-            existing_working_set.get("files", []) + modified_files
-        ))
-
-        state = {
-            # Continuity fields: inherit from last checkpoint, fall back to task
-            "goal": task.goal or base_state.get("goal", ""),
-            "completed":      _as_list(base_state.get("completed")),
-            "in_progress":    _as_list(base_state.get("in_progress")),
-            "blocked":        _as_list(base_state.get("blocked")),
-            "preferred_next": _as_list(base_state.get("preferred_next")),
-            "must_not_redo":  _as_list(base_state.get("must_not_redo")),
-            "must_preserve":  _as_list(base_state.get("must_preserve")),
-            # working_set: preserve existing keys, overlay interrupt signals
-            "working_set": {
-                **existing_working_set,
-                "files": merged_files,
-                # _interrupt namespace keeps interrupt metadata separate from
-                # the files/tools/artifacts fields used by Jaccard comparison
-                "_interrupt": {
-                    "last_tool_called":   event_summary["last_tool_called"],
-                    "last_success_action": event_summary["last_success_action"],
-                    "last_failure":        event_summary["last_failure"],
-                    # resume_hint left empty — placeholder for MCP Sampling
-                    # (Phase 2: LLM fills this via sampling/createMessage)
-                    "resume_hint":    "",
-                    "interrupt_reason": _reported_interruption_reason or "process_exit",
+            state = {
+                # Continuity fields: inherit from last checkpoint, fall back to task
+                "goal": task.goal or base_state.get("goal", ""),
+                "completed":      _as_list(base_state.get("completed")),
+                "in_progress":    _as_list(base_state.get("in_progress")),
+                "blocked":        _as_list(base_state.get("blocked")),
+                "preferred_next": _as_list(base_state.get("preferred_next")),
+                "must_not_redo":  _as_list(base_state.get("must_not_redo")),
+                "must_preserve":  _as_list(base_state.get("must_preserve")),
+                # working_set: preserve existing keys, overlay interrupt signals
+                "working_set": {
+                    **existing_working_set,
+                    "files": merged_files,
+                    # _interrupt namespace keeps interrupt metadata separate from
+                    # the files/tools/artifacts fields used by Jaccard comparison
+                    "_interrupt": {
+                        "last_tool_called":   event_summary["last_tool_called"],
+                        "last_success_action": event_summary["last_success_action"],
+                        "last_failure":        event_summary["last_failure"],
+                        # resume_hint left empty — placeholder for MCP Sampling
+                        # (Phase 2: LLM fills this via sampling/createMessage)
+                        "resume_hint":    "",
+                        "interrupt_reason": _reported_interruption_reason or "process_exit",
+                    },
                 },
-            },
-        }
+            }
 
-        create_checkpoint(
-            db=db,
-            task_id=task.id,
-            reason=REASON_AUTO_SAVE,
-            state=state,
-            source_session_id=session_id,
-            user_id=task.user_id,
-            triggered_by_event="process_exit",
-        )
+            create_checkpoint(
+                db=db,
+                task_id=task.id,
+                reason=REASON_AUTO_SAVE,
+                state=state,
+                source_session_id=session_id,
+                user_id=task.user_id,
+                triggered_by_event="process_exit",
+            )
 
         log.info(
             "Interrupt checkpoint saved: task_id=%d session=%s "
@@ -377,12 +381,13 @@ def _on_exit():
         context = _reported_interruption_context or {}
         if reason:
             context.setdefault("exit_source", "atexit_with_report")
-        db.end_session(
-            _current_session_id,
-            end_type="process_exit",
-            interruption_reason=reason,
-            interruption_context=context if context else None,
-        )
+        with db.global_lock:
+            db.end_session(
+                _current_session_id,
+                end_type="process_exit",
+                interruption_reason=reason,
+                interruption_context=context if context else None,
+            )
         log.info(
             "Session closed on exit: %s (reason=%s)",
             _current_session_id,
@@ -439,7 +444,11 @@ def _dispatch(name: str, arguments: dict) -> dict:
             kwargs[handler_key] = arguments[mcp_key]
 
     try:
-        return handler(db, graph, **kwargs)
+        # Serialize all conn access against background jobs (pruner, snapshot,
+        # checkpoint). DuckDBPyConnection is not thread-safe; without this the
+        # daemon SIGBUSes when a request overlaps a scheduler tick.
+        with db.global_lock:
+            return handler(db, graph, **kwargs)
     except DegradedModeError as exc:
         return _degraded_error(exc)
 
