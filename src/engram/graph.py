@@ -22,7 +22,8 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("engram.graph")
 
-GRAPH_PATH = os.path.join(os.path.expanduser("~"), ".engram", "graph.json")
+_ENGRAM_DIR = os.environ.get("ENGRAM_HOME") or os.path.join(os.path.expanduser("~"), ".engram")
+GRAPH_PATH = os.path.join(_ENGRAM_DIR, "graph.json")
 
 
 class MemoryGraph:
