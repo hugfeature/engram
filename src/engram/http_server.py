@@ -282,13 +282,14 @@ def health():
     meta: dict[str, str] = {}
     try:
         if shared._db is not None:
-            shared._db.conn.execute("SELECT 1").fetchone()
-            db_ok = True
-            fts_ok = shared._db.fts_available
-            db_readonly = shared._db.readonly
-            embedding_stale = shared._db.embedding_stale
-            residue = shared._db.residue_files
-            meta = shared._db.all_meta()
+            with shared._db.global_lock:
+                shared._db.conn.execute("SELECT 1").fetchone()
+                db_ok = True
+                fts_ok = shared._db.fts_available
+                db_readonly = shared._db.readonly
+                embedding_stale = shared._db.embedding_stale
+                residue = shared._db.residue_files
+                meta = shared._db.all_meta()
     except Exception:
         pass
     graph_ok = shared._graph is not None
@@ -338,10 +339,12 @@ def main():
     parser.add_argument("--port", type=int, default=8900)
     args = parser.parse_args()
 
-    # Pre-flight: refuse to start if the port is already taken. Without this
-    # check, two engram processes race for the DuckDB lock and the loser
-    # used to mis-classify the lock conflict as DB corruption (v0.10/v0.11
-    # bug, fixed in v0.11.1). Catching it here is cheaper and clearer.
+    # Pre-flight: a fast, friendly check. NOT the safety mechanism — there is
+    # a TOCTOU window between this probe and uvicorn's actual bind, so two
+    # daemons launched simultaneously could both pass it. The authoritative
+    # guard is the OS bind below: whoever binds the port first wins, the loser
+    # gets EADDRINUSE and exits cleanly instead of racing for the DuckDB lock
+    # (the v0.10/v0.11 crash path).
     if _port_in_use(args.host, args.port):
         log.error(
             "Port %s:%d is already in use — another engram server is "
@@ -352,7 +355,20 @@ def main():
         sys.exit(2)
 
     log.info(f"Engram server starting on {args.host}:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port)
+    try:
+        uvicorn.run(app, host=args.host, port=args.port)
+    except OSError as exc:
+        # EADDRINUSE (48 on macOS / 98 on Linux): lost the bind race. Exit
+        # cleanly — do NOT fall through to anything that opens the DB.
+        import errno
+        if exc.errno in (errno.EADDRINUSE, errno.EADDRNOTAVAIL):
+            log.error(
+                "Could not bind %s:%d (%s) — another engram server won the "
+                "bind race. Exiting without touching the DB.",
+                args.host, args.port, exc,
+            )
+            sys.exit(2)
+        raise
 
 
 if __name__ == "__main__":
