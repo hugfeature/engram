@@ -92,90 +92,96 @@ def run_consolidate(
     graph: MemoryGraph,
     user_id: str = "default",
 ) -> list[dict]:
-    memories = db.get_all(user_id)
-    if len(memories) < 2:
-        return []
+    # DuckDBPyConnection is not thread-safe. This runs on the maintenance
+    # scheduler thread, so hold the DB global lock for the whole per-user
+    # consolidation (read → cluster → merge writes). It is bounded by
+    # MAX_CONSOLIDATE_BATCH; the caller (run_maintenance) releases the lock
+    # between users so requests aren't starved.
+    with db.global_lock:
+        memories = db.get_all(user_id)
+        if len(memories) < 2:
+            return []
 
-    # Exclude structured memories from consolidation — they carry metadata
-    # that would be lost or corrupted by merging
-    memories = [
-        m for m in memories
-        if (m.metadata or {}).get("type") not in _PROTECTED_TYPES
-    ]
-    if len(memories) < 2:
-        return []
+        # Exclude structured memories from consolidation — they carry metadata
+        # that would be lost or corrupted by merging
+        memories = [
+            m for m in memories
+            if (m.metadata or {}).get("type") not in _PROTECTED_TYPES
+        ]
+        if len(memories) < 2:
+            return []
 
-    if len(memories) > MAX_CONSOLIDATE_BATCH:
-        memories.sort(key=lambda m: m.last_accessed_at, reverse=True)
-        memories = memories[:MAX_CONSOLIDATE_BATCH]
-        log.info("Consolidation limited to %d most recent memories", MAX_CONSOLIDATE_BATCH)
+        if len(memories) > MAX_CONSOLIDATE_BATCH:
+            memories.sort(key=lambda m: m.last_accessed_at, reverse=True)
+            memories = memories[:MAX_CONSOLIDATE_BATCH]
+            log.info("Consolidation limited to %d most recent memories", MAX_CONSOLIDATE_BATCH)
 
-    embeddings: dict[int, list[float]] = {}
-    content_map: dict[int, str] = {}
-    meta_map: dict[int, dict] = {}
+        embeddings: dict[int, list[float]] = {}
+        content_map: dict[int, str] = {}
+        meta_map: dict[int, dict] = {}
 
-    all_ids = [m.id for m in memories]
-    emb_batch = db.get_embeddings_batch(all_ids)
+        all_ids = [m.id for m in memories]
+        emb_batch = db.get_embeddings_batch(all_ids)
 
-    for m in memories:
-        emb = emb_batch.get(m.id)
-        if emb:
-            embeddings[m.id] = emb
-            content_map[m.id] = m.content
-            meta_map[m.id] = {
-                "importance": m.importance,
-                "category": m.category,
-                "recall_count": m.recall_count,
-            }
-        else:
-            log.debug("Skipping memory %d: no embedding", m.id)
+        for m in memories:
+            emb = emb_batch.get(m.id)
+            if emb:
+                embeddings[m.id] = emb
+                content_map[m.id] = m.content
+                meta_map[m.id] = {
+                    "importance": m.importance,
+                    "category": m.category,
+                    "recall_count": m.recall_count,
+                }
+            else:
+                log.debug("Skipping memory %d: no embedding", m.id)
 
-    ids = list(embeddings.keys())
-    clusters = _find_clusters(ids, embeddings, CONSOLIDATE_THRESHOLD)
+        ids = list(embeddings.keys())
+        clusters = _find_clusters(ids, embeddings, CONSOLIDATE_THRESHOLD)
 
-    results = []
-    with graph.batch_mode():
-        for cluster in clusters:
-            sorted_ids = sorted(
-                cluster,
-                key=lambda mid: (
-                    meta_map[mid]["importance"],
-                    meta_map[mid]["recall_count"],
-                ),
-                reverse=True,
-            )
-            keep_id = sorted_ids[0]
-            remove_ids = sorted_ids[1:]
+        results = []
+        with graph.batch_mode():
+            for cluster in clusters:
+                sorted_ids = sorted(
+                    cluster,
+                    key=lambda mid: (
+                        meta_map[mid]["importance"],
+                        meta_map[mid]["recall_count"],
+                    ),
+                    reverse=True,
+                )
+                keep_id = sorted_ids[0]
+                remove_ids = sorted_ids[1:]
 
-            merged_content = content_map[keep_id]
-            for rid in remove_ids:
-                merged_content = _merge_pair(merged_content, content_map[rid])
+                merged_content = content_map[keep_id]
+                for rid in remove_ids:
+                    merged_content = _merge_pair(merged_content, content_map[rid])
 
-            best_importance = max(meta_map[mid]["importance"] for mid in cluster)
-            try:
-                merged_emb = embed(merged_content)
-            except Exception as e:
-                log.error("Embedding failed during consolidation: %s", e)
-                continue
-            db.update(keep_id, merged_content, merged_emb, best_importance)
+                best_importance = max(meta_map[mid]["importance"] for mid in cluster)
+                try:
+                    merged_emb = embed(merged_content)
+                except Exception as e:
+                    log.error("Embedding failed during consolidation: %s", e)
+                    continue
+                db.update(keep_id, merged_content, merged_emb, best_importance)
 
-            graph.index_memory_incremental(
-                keep_id, merged_emb, db,
-                user_id, best_importance, meta_map[keep_id]["category"],
-            )
+                graph.index_memory_incremental(
+                    keep_id, merged_emb, db,
+                    user_id, best_importance, meta_map[keep_id]["category"],
+                )
 
-            for rid in remove_ids:
-                db.delete(rid)
-                graph.remove_node(rid)
+                for rid in remove_ids:
+                    db.delete(rid)
+                    graph.remove_node(rid)
 
-            results.append({
-                "kept": keep_id,
-                "removed": remove_ids,
-                "content": merged_content,
-            })
-            log.info(
-                "Consolidated cluster: kept=%d, removed=%s, content=%s",
-                keep_id, remove_ids, merged_content[:80],
-            )
+                results.append({
+                    "kept": keep_id,
+                    "removed": remove_ids,
+                    "content": merged_content,
+                })
+                log.info(
+                    "Consolidated cluster: kept=%d, removed=%s, content=%s",
+                    keep_id, remove_ids, merged_content[:80],
+                )
 
     return results
