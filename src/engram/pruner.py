@@ -25,52 +25,72 @@ maintenance = _MaintenanceState()
 
 
 def run_prune(db: MemoryDB, graph: MemoryGraph, user_id: str = "default"):
-    """Prune weak memories. Uses SQL pre-filter to avoid loading all rows."""
+    """Prune weak memories. Uses SQL pre-filter to avoid loading all rows.
+
+    Holds db.global_lock for the conn-touching work (the candidate query plus
+    the delete loop). graph operations are in-memory but kept inside the lock
+    so node strength updates and deletes stay consistent with the snapshot the
+    query produced.
+    """
     now = datetime.now(timezone.utc)
     # Only consider memories not accessed in the last 7 days as pruning candidates
     cutoff = now - timedelta(days=7)
-    try:
-        rows = db.conn.execute(
-            """
-            SELECT id, category, importance, last_accessed_at, recall_count
-            FROM memories WHERE user_id = ? AND last_accessed_at < ?
-            """,
-            [user_id, cutoff],
-        ).fetchall()
-    except Exception as e:
-        log.error("Prune query failed for user '%s': %s", user_id, e)
-        return
+    with db.global_lock:
+        try:
+            rows = db.conn.execute(
+                """
+                SELECT id, category, importance, last_accessed_at, recall_count
+                FROM memories WHERE user_id = ? AND last_accessed_at < ?
+                """,
+                [user_id, cutoff],
+            ).fetchall()
+        except Exception as e:
+            log.error("Prune query failed for user '%s': %s", user_id, e)
+            return
 
-    pruned = 0
-    with graph.batch_mode():
-        for row in rows:
-            mid, category, importance, last_accessed, recall_count = row[:5]
-            days = (now - last_accessed.replace(tzinfo=timezone.utc)).total_seconds() / 86400
-            strength = compute_strength(category, importance, days, recall_count)
-            graph.update_node_strength(mid, strength)
+        pruned = 0
+        with graph.batch_mode():
+            for row in rows:
+                mid, category, importance, last_accessed, recall_count = row[:5]
+                days = (now - last_accessed.replace(tzinfo=timezone.utc)).total_seconds() / 86400
+                strength = compute_strength(category, importance, days, recall_count)
+                graph.update_node_strength(mid, strength)
 
-            if strength < PRUNE_THRESHOLD:
-                if graph.chain_safe_to_prune(mid, PRUNE_THRESHOLD, user_id=user_id):
-                    db.delete(mid)
-                    graph.remove_node(mid)
-                    pruned += 1
-                    log.info("Pruned memory %d (strength=%.4f)", mid, strength)
+                if strength < PRUNE_THRESHOLD:
+                    if graph.chain_safe_to_prune(mid, PRUNE_THRESHOLD, user_id=user_id):
+                        db.delete(mid)
+                        graph.remove_node(mid)
+                        pruned += 1
+                        log.info("Pruned memory %d (strength=%.4f)", mid, strength)
 
     if pruned:
         log.info("Pruning complete for user '%s': %d memories removed", user_id, pruned)
 
 
 def run_maintenance(db: MemoryDB, graph: MemoryGraph, user_id: str | None = None):
-    """Run consolidation + pruning for all users (or a single user if specified)."""
+    """Run consolidation + pruning for all users (or a single user if specified).
+
+    Runs on the APScheduler thread (every 12h). DuckDBPyConnection is not
+    thread-safe, so each DB-touching step takes the global lock — but we take
+    it PER STEP, not for the whole cycle. A full cycle can run for tens of
+    seconds (consolidate + prune across all users + FTS rebuild); holding one
+    lock that long would stall every request and bust the SessionStart hook's
+    4s budget. Per-step locking yields the lock between users so interactive
+    recall/store stays responsive.
+    """
 
     if user_id is not None:
+        # get_all_user_ids touches the conn — lock it.
         user_ids = [user_id]
     else:
-        user_ids = db.get_all_user_ids()
+        with db.global_lock:
+            user_ids = db.get_all_user_ids()
         if not user_ids:
             user_ids = ["default"]
 
     for uid in user_ids:
+        # run_consolidate / run_prune each take db.global_lock internally so
+        # the lock is released between users (and between the two phases).
         try:
             run_consolidate(db, graph, uid)
         except Exception as e:
@@ -82,7 +102,8 @@ def run_maintenance(db: MemoryDB, graph: MemoryGraph, user_id: str | None = None
 
     # Rebuild FTS index after consolidation + pruning may have changed data
     try:
-        db._rebuild_fts_index()
+        with db.global_lock:
+            db._rebuild_fts_index()
     except Exception as e:
         log.error("FTS index rebuild failed during maintenance: %s", e)
 
