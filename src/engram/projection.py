@@ -23,7 +23,12 @@ from typing import Any
 
 log = logging.getLogger("engram.projection")
 
-ENGRAM_DIR = os.path.join(os.path.expanduser("~"), ".engram")
+# Python 3.12 deprecated the implicit datetime->str adapter (removed in a future
+# release). Register an explicit ISO-8601 adapter so writing datetime values to
+# SQLite stays warning-free and forward-compatible. Idempotent at import time.
+sqlite3.register_adapter(datetime, lambda dt: dt.isoformat())
+
+ENGRAM_DIR = os.environ.get("ENGRAM_HOME") or os.path.join(os.path.expanduser("~"), ".engram")
 DEFAULT_SQLITE_PATH = os.path.join(ENGRAM_DIR, "runtime_state.sqlite")
 
 
@@ -679,6 +684,29 @@ CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON checkpoints(task_id, user_id,
             [task_id, user_id, reason],
         ).fetchone()
         return row["created_at"] if row else None
+
+    def get_latest_interrupt_checkpoint(self, user_id: str = "default",
+                                        terminal_statuses: tuple = ("cancelled", "done")) -> dict | None:
+        """Latest process_exit AUTO_SAVE checkpoint whose task is still ACTIVE.
+
+        Status gate (JOIN tasks) prevents a finished task's interrupt checkpoint
+        from resurfacing as a phantom recovery prompt. tasks and checkpoints are
+        both in this SQLite store, so the JOIN is single-DB safe.
+        See drift/docs/case-runtime-induced/RI-001-zombie-checkpoint.md
+        """
+        placeholders = ",".join("?" for _ in terminal_statuses)
+        row = self._conn.execute(
+            f"""SELECT c.* FROM checkpoints c
+                JOIN tasks t ON c.task_id = t.id AND c.user_id = t.user_id
+                WHERE c.user_id = ?
+                  AND c.checkpoint_reason = 'AUTO_SAVE'
+                  AND c.triggered_by_event = 'process_exit'
+                  AND t.status NOT IN ({placeholders})
+                ORDER BY c.created_at DESC, c.version DESC
+                LIMIT 1""",
+            [user_id, *terminal_statuses],
+        ).fetchone()
+        return self._row_to_checkpoint(row) if row else None
 
     # ---- Session Lifecycle ----
 
