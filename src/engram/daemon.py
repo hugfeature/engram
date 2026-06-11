@@ -9,8 +9,9 @@ import subprocess
 import sys
 import time
 
-PID_FILE = os.path.expanduser("~/.engram/engram.pid")
-LOG_FILE = os.path.expanduser("~/.engram/server.log")
+_ENGRAM_DIR = os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram")
+PID_FILE = os.path.join(_ENGRAM_DIR, "engram.pid")
+LOG_FILE = os.path.join(_ENGRAM_DIR, "server.log")
 DEFAULT_PORT = 8900
 
 
