@@ -1011,3 +1011,49 @@ class TestFullContinuityLoop:
         # latest > version_at_handoff
         assert ckpts["checkpoints"][0]["version"] > version_at_handoff
         assert handoff_b["checkpoint_version"] == ckpts["checkpoints"][0]["version"]
+
+
+class TestZombieCheckpointStatusGate:
+    """get_latest_interrupt_checkpoint must NOT resurface a finished task's
+    process_exit checkpoint as a phantom recovery prompt.
+
+    Regression for the 'zombie checkpoint' bug: a cancelled/done task kept
+    injecting an interrupt_recovery into every new recall because the lookup
+    only checked checkpoint existence, never task status.
+    See drift/docs/case-runtime-induced/RI-001-zombie-checkpoint.md
+    """
+
+    def _mk_interrupt(self, db, task_id, goal):
+        return create_checkpoint(
+            db, task_id=task_id, reason=REASON_AUTO_SAVE,
+            state={"goal": goal, "in_progress": ["x"]},
+            triggered_by_event="process_exit",
+        )
+
+    def test_cancelled_task_interrupt_checkpoint_is_suppressed(self, db):
+        tb = db.create_task(name="dead", goal="修复CSRF漏洞", status="cancelled")
+        self._mk_interrupt(db, tb, "修复CSRF漏洞")
+        assert db.get_latest_interrupt_checkpoint() is None
+
+    def test_done_task_interrupt_checkpoint_is_suppressed(self, db):
+        tc = db.create_task(name="finished", goal="done-goal", status="in_progress")
+        self._mk_interrupt(db, tc, "done-goal")
+        db.update_task(tc, status="done")
+        assert db.get_latest_interrupt_checkpoint() is None
+
+    def test_active_task_surfaces_over_terminal_one(self, db):
+        import time
+        tb = db.create_task(name="dead", goal="CSRF", status="cancelled")
+        ta = db.create_task(name="active", goal="real", status="in_progress")
+        self._mk_interrupt(db, tb, "CSRF")
+        time.sleep(0.02)
+        self._mk_interrupt(db, ta, "real")  # newer, but active
+        r = db.get_latest_interrupt_checkpoint()
+        assert r is not None and r["task_id"] == ta
+
+    def test_cancelling_active_task_clears_the_pointer(self, db):
+        ta = db.create_task(name="active", goal="real", status="in_progress")
+        self._mk_interrupt(db, ta, "real")
+        assert db.get_latest_interrupt_checkpoint() is not None
+        db.update_task(ta, status="cancelled")
+        assert db.get_latest_interrupt_checkpoint() is None
