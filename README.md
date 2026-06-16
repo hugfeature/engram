@@ -250,6 +250,71 @@ Evaluated on [LoCoMo](https://github.com/snap-research/locomo) (Snap Research lo
 | **Engram** | **0.4383** | **77.7%** | DeepSeek-V3.2 | **Local**  |
 
 Zero cloud dependency. Four optimization rounds: **F1 +50.3%**, **Hit@5 +26.2pp**.
+LoCoMo measures *retrieval* quality. But Engram's real job is **recovery** — surviving an interruption and handing a clean state to the next agent. That needs its own benchmark.
+
+### Continuity Benchmark (Core)
+
+LoCoMo tells you if memory is *findable*. It does not tell you if a **restore** is any good. There is no standard benchmark for cross-session continuity, so Engram ships its own.
+
+**The question it answers:** given an interruption, does the continuation package let the next agent resume *without redoing forbidden work* — and is selective restore actually better than dumping the full history back in?
+
+```bash
+python benchmark/continuity_bench.py --mode all --runs 5 --seed 42
+```
+
+**20 scenarios × 3 recovery modes × 5 runs = 300 evaluations.** Fully deterministic (std = 0).
+
+| Recovery mode | Composite | Redundant exploration | What it is |
+| ------------- | --------- | --------------------- | ---------- |
+| `NONE`        | 0.282     | 0.20                  | Empty package (amnesiac baseline) |
+| **`SELECTIVE`** | **0.912** | **1.00**            | Real Engram restore (importance ≥ 0.5 + failures) |
+| `FULL`        | 0.791     | 0.52                  | Full task history (context-pollution baseline) |
+
+**`SELECTIVE` beats `FULL`** — independently reproducing the context-pollution finding from Letta's [Recovery-Bench](https://www.letta.com/blog/recovery-bench) (whose `--message-mode full/summary/none` mirrors Engram's `memory_restore_mode`). The two real-restore modes preserve identical *structural* state; the gap is entirely in **redundant exploration** — `FULL` re-feeds stale failed paths and the agent re-walks them.
+
+Scenarios span three axes: **A — interruption type** (SIGTERM, crash, context overflow, tool timeout, network failure, session restart, long idle, multi-day pause), **B — state drift** (goal mutation, branch switch, dependency-upgrade scope creep, tool-permission change, workspace wipe), **C — failure recall** (retry storm, human handoff, memory corruption, planner restart).
+#### For evaluators — honest boundaries
+
+This is the **Core** bench. It scores the *continuation package itself*, not live agent behaviour:
+
+- **Scripted actions.** Agent actions after restore are declared per-scenario (`agent_replay`), not produced by a live LLM. Core measures whether the package *would* let an agent avoid redoing forbidden work, under an assumed action sequence.
+- **Structural metrics are regression guards.** `build_continuation` runs before the memory-mode gate, so goal / completed / working-set are identical across modes (~1.0). They prove the package faithfully preserves the checkpoint; they are not the mode discriminator.
+- **`redundant_exploration` is the discriminator**, driven by whether failure memories are recalled (real, mode-dependent) + scripted actions.
+- **Only `SELECTIVE` is a real `restore_checkpoint`.** `NONE`/`FULL` are constructed baselines. The `observed.related_memories` column records what each mode *really* recalled — the one fully-real signal in Core.
+- The real causal question (*does a live agent actually walk back fewer steps?*) is the **Live bench (v2)**, deliberately separate so Core stays deterministic and CI-able.
+
+The invariant `SELECTIVE > FULL > NONE` is guarded in CI (`tests/test_continuity_bench.py`) — if an Engram change ever degrades recovery quality, the build fails.
+
+Bench composite weights (independent of the in-tool metric): Goal 0.20 · Completed 0.20 · Working-set 0.15 · Failure-context 0.20 · **Redundant 0.25** (heaviest — closest to "fewer wasted steps"). The live `evaluate_continuity` tool exposes a related 6-dimension score: Goal Retention · Action Consistency · Failure Recall · Working Set Stability · Replanning Rate · Redundant Exploration.
+
+### Continuity Benchmark — Live (v2)
+
+Core scores the package under *scripted* actions. **Live** closes the causal loop: a real LLM takes over each interrupted task with **only the recovery package** (it never sees the forbidden list), proposes its next actions, and an **independent judge** labels them against ground truth.
+
+- **Actor / judge separation.** The actor only gets the rendered package; the judge gets the actor's actions + ground truth (`forbidden_actions`, `must_preserve`) and flags every redo / constraint violation. Same model, different system prompt.
+- **The hypothesis under test:** does a real LLM handed the `FULL` history get *lured into re-walking* stale failed paths, while `SELECTIVE` lets it resume clean?
+- Non-deterministic by design: reports mean ± std over `--runs`, **not** in CI. Reuses the Core scenario dataset verbatim, so Core and Live are directly comparable.
+- `--dry-run` exercises the full flow (real `restore_checkpoint`, prompt rendering, judging pipeline) without spending API calls — used to validate the harness offline.
+
+#### Results (3 axis-representative scenarios × 3 modes × 3 runs)
+
+`redundant_exploration` (higher = fewer redos of forbidden work):
+
+| Model        | NONE  | SELECTIVE | FULL  |
+| ------------ | ----- | --------- | ----- |
+| DeepSeek-V3.2 | 0.956 | 1.000     | 1.000 |
+| GLM-5.1      | 1.000 | 1.000     | 1.000 |
+
+Real recall per mode was correct throughout (NONE = 0, SELECTIVE ≈ 2.7, FULL = 3).
+
+**Honest finding — Live does *not* reproduce Core's `SELECTIVE > FULL` gap, and that is the result.** Two readings:
+
+1. **A weak-but-real causal signal.** The only score below 1.0 was DeepSeek on the *retry-storm* scenario under `NONE` (0.956): with no recovery package, the model did occasionally propose an action close to a known-bad path — something the scripted Core bench cannot demonstrate. With a package, it never did.
+2. **Strong models resist context pollution.** Core's `SELECTIVE > FULL` (0.912 vs 0.791) comes from *scripted* agents that re-walk whatever the package surfaces. Real frontier models filter the `FULL` history themselves, so the pollution gap collapses. The effect Recovery-Bench reported needs **weaker models, longer histories, or more adversarial forbidden-action design** to surface — which is *why* Recovery-Bench uses weak models to manufacture failures.
+
+This delimits the two benches cleanly: **Core measures package quality (model-independent); Live measures real agent behaviour (confounded by model capability).** A negative Live result does not weaken Core — it bounds the claim each can make.
+
+> The Live harness also surfaced a real bug: GLM-5.1's judge returns a bare JSON array instead of `{"verdicts": [...]}`, which crashed the first run. Fixed (`normalize_judge_output` tolerates four output shapes) and regression-guarded in `tests/test_continuity_bench_live.py`.
 
 Engram also tracks **runtime continuity metrics** via `evaluate_continuity`: Goal Retention · Action Consistency · Failure Recall · Working Set Stability · Replanning Rate · Redundant Exploration.
 
