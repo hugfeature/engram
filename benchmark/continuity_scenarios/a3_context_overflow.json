@@ -1,0 +1,35 @@
+{
+  "scenario_id": "a3_context_overflow",
+  "axis": "A_interruption",
+  "description": "上下文窗口溢出:会话因 token 超限被迫中断,report_interruption(reason=overflow) 后恢复",
+  "stresses": "overflow 是最常见的'软中断'。结构维应零损失;验证 overflow 分类不影响 continuation 保真,且 SELECTIVE 的筛选恰好缓解了导致 overflow 的上下文膨胀。",
+  "interrupt_reason": "overflow",
+  "pre_interrupt_state": {
+    "goal": "document every public endpoint in the REST API",
+    "completed": ["document /users", "document /orders", "document /payments"],
+    "in_progress": ["document /webhooks"],
+    "blocked": [],
+    "preferred_next": ["document /admin", "generate openapi spec"],
+    "must_not_redo": [
+      {"action": "re-document /users", "reason": "already_completed"},
+      {"action": "re-document /orders", "reason": "already_completed"}
+    ],
+    "must_preserve": ["openapi version pinned to 3.1"],
+    "working_set": {"files": ["docs/api/webhooks.md"], "tools": ["redoc"]}
+  },
+  "task_memories": [
+    {"content": "/users /orders /payments are fully documented, do not redo", "importance": 0.7, "category": "fact"},
+    {"content": "openapi must stay on 3.1, 3.0 breaks the webhook examples", "importance": 0.8, "category": "fact"}
+  ],
+  "restored_state_by_mode": null,
+  "ground_truth": {
+    "expected_goal": "document every public endpoint in the REST API",
+    "must_preserve": ["openapi version pinned to 3.1"],
+    "forbidden_actions": ["re-document /users", "re-document /orders"]
+  },
+  "agent_replay": {
+    "NONE": ["re-document /users", "re-document /orders"],
+    "SELECTIVE": ["document /webhooks", "document /admin"],
+    "FULL": ["re-document /users", "document /webhooks"]
+  }
+}

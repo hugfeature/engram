@@ -1,0 +1,35 @@
+{
+  "scenario_id": "a1_sigterm",
+  "axis": "A_interruption",
+  "description": "SIGTERM 优雅中断:atexit 触发,会话以 process_exit 关闭,checkpoint 完整",
+  "stresses": "中断类型识别 + 状态零损失。结构指标应全部接近 1.0,差异只应出现在 related_failures 召回与 redundant_exploration。",
+  "interrupt_reason": "process_exit",
+  "pre_interrupt_state": {
+    "goal": "implement OAuth2 token refresh flow",
+    "completed": ["design auth schema", "add login endpoint"],
+    "in_progress": ["wire refresh token rotation"],
+    "blocked": [],
+    "preferred_next": ["add token expiry tests", "deploy to staging"],
+    "must_not_redo": [
+      {"action": "regenerate client secret", "reason": "side_effect_emitted"}
+    ],
+    "must_preserve": ["existing session cookies must stay valid"],
+    "working_set": {"files": ["src/auth/oauth.py", "src/auth/tokens.py"], "tools": ["pytest"]}
+  },
+  "task_memories": [
+    {"content": "regenerating client secret invalidated all prod sessions last time — never redo", "importance": 0.9, "category": "failure"},
+    {"content": "refresh token TTL is 30 days per security review", "importance": 0.7, "category": "fact"},
+    {"content": "team prefers black for formatting", "importance": 0.2, "category": "fact"}
+  ],
+  "restored_state_override": null,
+  "ground_truth": {
+    "expected_goal": "implement OAuth2 token refresh flow",
+    "must_preserve": ["existing session cookies must stay valid"],
+    "forbidden_actions": ["regenerate client secret"]
+  },
+  "agent_replay": {
+    "NONE": ["regenerate client secret", "re-read auth schema design"],
+    "SELECTIVE": ["wire refresh token rotation"],
+    "FULL": ["re-read auth schema design", "regenerate client secret", "wire refresh token rotation"]
+  }
+}

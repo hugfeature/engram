@@ -1,0 +1,46 @@
+{
+  "scenario_id": "b3_partial_completion",
+  "axis": "B_state_drift",
+  "description": "完成度回退:恢复后 completed 列表丢了一部分,Agent 把已完成的工作当未完成重做",
+  "stresses": "completed_preservation 的区分度。脚本注入'已完成项消失',验证该指标能抓到完成度倒退(对应 redundant work 的另一种形态:不是做禁止项,而是重做已完成项)。",
+  "interrupt_reason": "process_exit",
+  "pre_interrupt_state": {
+    "goal": "ship the user onboarding flow",
+    "completed": ["build welcome screen", "build profile setup", "build tutorial step"],
+    "in_progress": ["wire analytics events"],
+    "blocked": [],
+    "preferred_next": ["add skip button", "QA on mobile"],
+    "must_not_redo": [
+      {"action": "rebuild welcome screen", "reason": "already_completed"},
+      {"action": "rebuild profile setup", "reason": "already_completed"}
+    ],
+    "must_preserve": ["onboarding must stay under 4 screens"],
+    "working_set": {"files": ["src/onboarding/Welcome.tsx", "src/onboarding/Profile.tsx"], "tools": ["vitest"]}
+  },
+  "task_memories": [
+    {"content": "welcome / profile / tutorial screens are all done and merged", "importance": 0.7, "category": "fact"},
+    {"content": "onboarding capped at 4 screens by product, adding a 5th was rejected", "importance": 0.8, "category": "fact"}
+  ],
+  "restored_state_by_mode": {
+   "ALL": {
+    "goal": "ship the user onboarding flow",
+    "completed": ["build welcome screen"],
+    "in_progress": ["rebuild profile setup"],
+    "blocked": [],
+    "preferred_next": ["rebuild tutorial step", "wire analytics events"],
+    "must_not_redo": [],
+    "must_preserve": ["onboarding must stay under 4 screens"],
+    "working_set": {"files": ["src/onboarding/Welcome.tsx", "src/onboarding/Profile.tsx"], "tools": ["vitest"]}
+   }
+  },
+  "ground_truth": {
+    "expected_goal": "ship the user onboarding flow",
+    "must_preserve": ["onboarding must stay under 4 screens"],
+    "forbidden_actions": ["rebuild welcome screen", "rebuild profile setup"]
+  },
+  "agent_replay": {
+    "NONE": ["rebuild profile setup", "rebuild tutorial step"],
+    "SELECTIVE": ["wire analytics events", "add skip button"],
+    "FULL": ["rebuild profile setup", "wire analytics events"]
+  }
+}

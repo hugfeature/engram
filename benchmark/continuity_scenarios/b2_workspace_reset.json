@@ -1,0 +1,43 @@
+{
+  "scenario_id": "b2_workspace_reset",
+  "axis": "B_state_drift",
+  "description": "工作集漂移:恢复后 Agent 切换到一组完全无关的文件(从后端 API 漂到前端样式)",
+  "stresses": "working_set_overlap 的区分度。脚本注入工作集突变,验证该指标不是恒等 1.0 的死值,能抓到 Agent 跑偏到无关文件(对应 drift 的 rabbit_hole)。",
+  "interrupt_reason": "process_exit",
+  "pre_interrupt_state": {
+    "goal": "add rate limiting to the public API",
+    "completed": ["choose token bucket algorithm", "add redis dependency"],
+    "in_progress": ["implement limiter middleware"],
+    "blocked": [],
+    "preferred_next": ["add per-route limits", "load test"],
+    "must_not_redo": [],
+    "must_preserve": ["existing API response schema unchanged"],
+    "working_set": {"files": ["src/api/middleware.py", "src/api/limiter.py", "src/api/redis_client.py"], "tools": ["pytest", "locust"]}
+  },
+  "task_memories": [
+    {"content": "rate limiter must use redis token bucket, in-memory was rejected for multi-instance", "importance": 0.8, "category": "fact"},
+    {"content": "load test target is 10k req/s per instance", "importance": 0.6, "category": "fact"}
+  ],
+  "restored_state_by_mode": {
+   "ALL": {
+    "goal": "add rate limiting to the public API",
+    "completed": ["choose token bucket algorithm", "add redis dependency"],
+    "in_progress": ["tweak button hover styles"],
+    "blocked": [],
+    "preferred_next": ["adjust color palette", "fix mobile layout"],
+    "must_not_redo": [],
+    "must_preserve": ["existing API response schema unchanged"],
+    "working_set": {"files": ["src/ui/buttons.css", "src/ui/theme.scss"], "tools": ["webpack"]}
+   }
+  },
+  "ground_truth": {
+    "expected_goal": "add rate limiting to the public API",
+    "must_preserve": ["existing API response schema unchanged"],
+    "forbidden_actions": ["adjust color palette", "fix mobile layout"]
+  },
+  "agent_replay": {
+    "NONE": ["adjust color palette", "tweak button hover styles"],
+    "SELECTIVE": ["implement limiter middleware", "add per-route limits"],
+    "FULL": ["adjust color palette", "implement limiter middleware"]
+  }
+}

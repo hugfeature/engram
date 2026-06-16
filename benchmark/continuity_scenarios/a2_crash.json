@@ -1,0 +1,34 @@
+{
+  "scenario_id": "a2_crash",
+  "axis": "A_interruption",
+  "description": "kill -9 硬崩溃:无 atexit,会话从未关闭,被 cleanup 归类为 crash,但 checkpoint 仍可恢复(Tier 1 持久)",
+  "stresses": "崩溃后状态是否仍可零损失恢复。结构指标应接近 1.0;与 SIGTERM 的区别仅在 interruption 分类标签(crash vs process_exit),验证分类不污染恢复质量。",
+  "interrupt_reason": "crash",
+  "pre_interrupt_state": {
+    "goal": "migrate user table from MySQL to Postgres",
+    "completed": ["export MySQL schema", "write column mapping"],
+    "in_progress": ["run batch migration script"],
+    "blocked": [],
+    "preferred_next": ["verify row counts", "cut over reads"],
+    "must_not_redo": [
+      {"action": "drop the source mysql table", "reason": "failed_dont_retry"}
+    ],
+    "must_preserve": ["source MySQL table until cutover verified"],
+    "working_set": {"files": ["migrate/batch.py", "migrate/mapping.sql"], "tools": ["psql", "mysqldump"]}
+  },
+  "task_memories": [
+    {"content": "dropping source table before verifying counts caused data loss in staging — never redo", "importance": 0.95, "category": "failure"},
+    {"content": "batch size 5000 rows is the sweet spot for this migration", "importance": 0.6, "category": "fact"}
+  ],
+  "restored_state_override": null,
+  "ground_truth": {
+    "expected_goal": "migrate user table from MySQL to Postgres",
+    "must_preserve": ["source MySQL table until cutover verified"],
+    "forbidden_actions": ["drop the source mysql table"]
+  },
+  "agent_replay": {
+    "NONE": ["drop the source mysql table", "re-export mysql schema"],
+    "SELECTIVE": ["run batch migration script"],
+    "FULL": ["re-export mysql schema", "run batch migration script", "drop the source mysql table"]
+  }
+}

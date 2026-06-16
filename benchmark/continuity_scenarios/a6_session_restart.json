@@ -1,0 +1,32 @@
+{
+  "scenario_id": "a6_session_restart",
+  "axis": "A_interruption",
+  "description": "会话重启:用户主动关闭再重开会话(process_exit),同一任务跨会话续接",
+  "stresses": "干净重启下的零损失基线。与 SIGTERM 几乎对称,但语义是'用户主动'而非'信号触发';验证 continuation 在最常见的日常重启路径上稳定。",
+  "interrupt_reason": "process_exit",
+  "pre_interrupt_state": {
+    "goal": "add dark mode toggle to settings page",
+    "completed": ["add theme context", "define dark palette"],
+    "in_progress": ["wire toggle to localStorage"],
+    "blocked": [],
+    "preferred_next": ["persist across reloads", "add system-preference detection"],
+    "must_not_redo": [],
+    "must_preserve": ["light mode remains the default for new users"],
+    "working_set": {"files": ["src/ui/ThemeToggle.tsx", "src/ui/theme.ts"], "tools": ["vitest"]}
+  },
+  "task_memories": [
+    {"content": "default theme stays light, a previous PR that flipped the default was reverted", "importance": 0.7, "category": "fact"},
+    {"content": "theme persistence uses localStorage key 'app-theme'", "importance": 0.5, "category": "fact"}
+  ],
+  "restored_state_by_mode": null,
+  "ground_truth": {
+    "expected_goal": "add dark mode toggle to settings page",
+    "must_preserve": ["light mode remains the default for new users"],
+    "forbidden_actions": ["make dark mode the default"]
+  },
+  "agent_replay": {
+    "NONE": ["make dark mode the default", "redefine dark palette"],
+    "SELECTIVE": ["wire toggle to localStorage", "persist across reloads"],
+    "FULL": ["make dark mode the default", "wire toggle to localStorage"]
+  }
+}

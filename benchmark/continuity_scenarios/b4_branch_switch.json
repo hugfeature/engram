@@ -1,0 +1,43 @@
+{
+  "scenario_id": "b4_branch_switch",
+  "axis": "B_state_drift",
+  "description": "分支切换:恢复后工作集漂到另一个 feature 分支的文件,目标未变但上下文跑偏",
+  "stresses": "working_set_overlap 在'目标对、文件错'情况下的灵敏度。goal_preservation 应保持高,working_set_overlap 应明显掉——区分'走错路'和'忘了目标'两种 drift。",
+  "interrupt_reason": "process_exit",
+  "pre_interrupt_state": {
+    "goal": "fix the cart total rounding bug",
+    "completed": ["reproduce off-by-one-cent", "locate float arithmetic"],
+    "in_progress": ["switch cart math to decimal"],
+    "blocked": [],
+    "preferred_next": ["add rounding tests", "backfill affected orders"],
+    "must_not_redo": [],
+    "must_preserve": ["existing cart API response shape unchanged"],
+    "working_set": {"files": ["src/cart/total.py", "src/cart/money.py"], "tools": ["pytest"]}
+  },
+  "task_memories": [
+    {"content": "rounding bug is in cart/total.py float math, fix is to use Decimal", "importance": 0.8, "category": "fact"},
+    {"content": "do not change cart API response shape, mobile client depends on it", "importance": 0.85, "category": "fact"}
+  ],
+  "restored_state_by_mode": {
+   "ALL": {
+    "goal": "fix the cart total rounding bug",
+    "completed": ["reproduce off-by-one-cent", "locate float arithmetic"],
+    "in_progress": ["edit checkout shipping calculator"],
+    "blocked": [],
+    "preferred_next": ["refactor shipping zones", "update tax rules"],
+    "must_not_redo": [],
+    "must_preserve": ["existing cart API response shape unchanged"],
+    "working_set": {"files": ["src/checkout/shipping.py", "src/checkout/tax.py"], "tools": ["pytest"]}
+   }
+  },
+  "ground_truth": {
+    "expected_goal": "fix the cart total rounding bug",
+    "must_preserve": ["existing cart API response shape unchanged"],
+    "forbidden_actions": ["refactor shipping zones", "update tax rules"]
+  },
+  "agent_replay": {
+    "NONE": ["refactor shipping zones", "update tax rules"],
+    "SELECTIVE": ["switch cart math to decimal", "add rounding tests"],
+    "FULL": ["refactor shipping zones", "switch cart math to decimal"]
+  }
+}

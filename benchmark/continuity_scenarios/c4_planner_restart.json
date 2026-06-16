@@ -1,0 +1,38 @@
+{
+  "scenario_id": "c4_planner_restart",
+  "axis": "C_failure_recall",
+  "description": "Planner 重启:规划层重置丢了执行历史,只剩 continuation 的 must_not_redo 守着踩过的坑",
+  "stresses": "多条 must_not_redo 在 planner 失忆后的完整继承。这是 failure_recall 维度的纯压测——planner 没有任何对话记忆,完全靠 continuation 的负记忆集合避免重复探索。",
+  "interrupt_reason": "crash",
+  "pre_interrupt_state": {
+    "goal": "get the mobile app build size under 50MB",
+    "completed": ["measure baseline 78MB", "remove unused locales"],
+    "in_progress": ["enable resource shrinking"],
+    "blocked": [],
+    "preferred_next": ["split native libs by ABI", "compress assets"],
+    "must_not_redo": [
+      {"action": "drop the analytics sdk", "reason": "user_forbidden"},
+      {"action": "downscale all images to 1x", "reason": "failed_dont_retry"},
+      {"action": "remove the offline maps feature", "reason": "user_forbidden"}
+    ],
+    "must_preserve": ["app must keep offline maps and analytics"],
+    "working_set": {"files": ["android/build.gradle", "android/proguard-rules.pro"], "tools": ["gradle"]}
+  },
+  "task_memories": [
+    {"content": "dropping the analytics sdk is forbidden by growth team — never do it", "importance": 0.95, "category": "failure"},
+    {"content": "downscaling all images to 1x made the UI blurry and was rejected in review — failed", "importance": 0.85, "category": "failure"},
+    {"content": "removing offline maps is off the table, it's a core feature", "importance": 0.95, "category": "failure"},
+    {"content": "biggest safe win is ABI splitting + resource shrinking, ~20MB", "importance": 0.8, "category": "fact"}
+  ],
+  "restored_state_by_mode": null,
+  "ground_truth": {
+    "expected_goal": "get the mobile app build size under 50MB",
+    "must_preserve": ["app must keep offline maps and analytics"],
+    "forbidden_actions": ["drop the analytics sdk", "downscale all images to 1x", "remove the offline maps feature"]
+  },
+  "agent_replay": {
+    "NONE": ["drop the analytics sdk", "downscale all images to 1x", "remove the offline maps feature"],
+    "SELECTIVE": ["enable resource shrinking", "split native libs by ABI"],
+    "FULL": ["drop the analytics sdk", "enable resource shrinking"]
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "scenario_id": "c2_human_handoff",
+  "axis": "C_failure_recall",
+  "description": "人类交接:Agent A 干到一半交给 Agent B,B 必须继承 A 踩过的坑而非从零试",
+  "stresses": "failure_context 在交接边界的保真。Agent B 没有 A 的对话历史,完全依赖 continuation package 的 must_not_redo 和 related_failures。NONE 档=失忆重来,SELECTIVE=继承教训。",
+  "interrupt_reason": "process_exit",
+  "pre_interrupt_state": {
+    "goal": "reduce p99 latency of the search endpoint below 200ms",
+    "completed": ["profile the endpoint", "find N+1 query in tag join"],
+    "in_progress": ["add query batching"],
+    "blocked": [],
+    "preferred_next": ["add result cache", "verify p99 under load"],
+    "must_not_redo": [
+      {"action": "add a blanket 60s cache", "reason": "side_effect_emitted"},
+      {"action": "add db read replica", "reason": "superseded"}
+    ],
+    "must_preserve": ["search results must stay strongly consistent"],
+    "working_set": {"files": ["src/search/query.py", "src/search/cache.py"], "tools": ["pytest", "pyflame"]}
+  },
+  "task_memories": [
+    {"content": "blanket 60s cache served stale results and broke consistency — reverted", "importance": 0.9, "category": "failure"},
+    {"content": "read replica added 80ms replication lag, made p99 worse not better — superseded", "importance": 0.85, "category": "failure"},
+    {"content": "the real win is batching the N+1 tag join, confirmed by profiler", "importance": 0.8, "category": "fact"},
+    {"content": "consistency requirement rules out any TTL cache over 1s", "importance": 0.85, "category": "fact"}
+  ],
+  "restored_state_by_mode": null,
+  "ground_truth": {
+    "expected_goal": "reduce p99 latency of the search endpoint below 200ms",
+    "must_preserve": ["search results must stay strongly consistent"],
+    "forbidden_actions": ["add a blanket 60s cache", "add db read replica"]
+  },
+  "agent_replay": {
+    "NONE": ["add a blanket 60s cache", "add db read replica"],
+    "SELECTIVE": ["add query batching", "verify p99 under load"],
+    "FULL": ["add db read replica", "add query batching"]
+  }
+}

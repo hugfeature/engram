@@ -1,0 +1,34 @@
+{
+  "scenario_id": "a8_multiday_pause",
+  "axis": "A_interruption",
+  "description": "跨天暂停:任务搁置数天后重启,期间记忆经历自然衰减,recall 仍需召回关键失败",
+  "stresses": "长跨度下 failure 记忆的存活。failure 类衰减最快(~11天半衰期),验证多天后高 importance 的失败记忆仍被 SELECTIVE 召回,避免重蹈。",
+  "interrupt_reason": "user_away",
+  "pre_interrupt_state": {
+    "goal": "optimize the nightly batch job to finish under 2 hours",
+    "completed": ["profile the job", "parallelize the export step"],
+    "in_progress": ["batch the transform step"],
+    "blocked": [],
+    "preferred_next": ["tune chunk size", "verify under prod data volume"],
+    "must_not_redo": [
+      {"action": "set chunk size to 100k", "reason": "failed_dont_retry"}
+    ],
+    "must_preserve": ["job output schema must stay byte-identical"],
+    "working_set": {"files": ["jobs/nightly_batch.py", "jobs/transform.py"], "tools": ["airflow"]}
+  },
+  "task_memories": [
+    {"content": "chunk size 100k caused OOM on the transform worker — failed, never retry", "importance": 0.9, "category": "failure"},
+    {"content": "output schema is consumed downstream, any change breaks the warehouse load", "importance": 0.9, "category": "fact"}
+  ],
+  "restored_state_by_mode": null,
+  "ground_truth": {
+    "expected_goal": "optimize the nightly batch job to finish under 2 hours",
+    "must_preserve": ["job output schema must stay byte-identical"],
+    "forbidden_actions": ["set chunk size to 100k", "change output schema"]
+  },
+  "agent_replay": {
+    "NONE": ["set chunk size to 100k", "change output schema"],
+    "SELECTIVE": ["batch the transform step", "tune chunk size"],
+    "FULL": ["set chunk size to 100k", "batch the transform step"]
+  }
+}

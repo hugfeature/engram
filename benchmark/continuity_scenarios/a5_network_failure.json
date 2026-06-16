@@ -1,0 +1,34 @@
+{
+  "scenario_id": "a5_network_failure",
+  "axis": "A_interruption",
+  "description": "网络中断:与模型/工具后端的连接断开导致会话异常终止,恢复后继续",
+  "stresses": "外部依赖故障(非 agent 自身问题)下的状态保真。验证恢复包不把网络故障误记为任务级失败,goal/working_set 零损失。",
+  "interrupt_reason": "crash",
+  "pre_interrupt_state": {
+    "goal": "integrate the Stripe payment webhook",
+    "completed": ["register webhook endpoint", "verify signature check"],
+    "in_progress": ["handle charge.succeeded event"],
+    "blocked": [],
+    "preferred_next": ["handle refund event", "add idempotency keys"],
+    "must_not_redo": [
+      {"action": "re-register the webhook endpoint", "reason": "already_completed"}
+    ],
+    "must_preserve": ["webhook signing secret stays in vault, never inline"],
+    "working_set": {"files": ["src/payments/stripe_webhook.py"], "tools": ["stripe-cli"]}
+  },
+  "task_memories": [
+    {"content": "webhook endpoint already registered with Stripe, re-registering creates duplicate deliveries", "importance": 0.85, "category": "failure"},
+    {"content": "signing secret must come from vault, inlining it failed security review", "importance": 0.9, "category": "fact"}
+  ],
+  "restored_state_by_mode": null,
+  "ground_truth": {
+    "expected_goal": "integrate the Stripe payment webhook",
+    "must_preserve": ["webhook signing secret stays in vault, never inline"],
+    "forbidden_actions": ["re-register the webhook endpoint", "inline the signing secret"]
+  },
+  "agent_replay": {
+    "NONE": ["re-register the webhook endpoint", "inline the signing secret"],
+    "SELECTIVE": ["handle charge.succeeded event", "add idempotency keys"],
+    "FULL": ["re-register the webhook endpoint", "handle charge.succeeded event"]
+  }
+}

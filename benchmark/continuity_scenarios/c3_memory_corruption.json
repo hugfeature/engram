@@ -1,0 +1,35 @@
+{
+  "scenario_id": "c3_memory_corruption",
+  "axis": "C_failure_recall",
+  "description": "记忆污染:中断前混入一条错误'结论'(把失败方案误记为成功),恢复后能否靠真实失败记忆纠偏",
+  "stresses": "failure_context 在存在矛盾记忆时的鲁棒性。一条高 importance 的真实 failure 记忆应压过低质误记;验证 SELECTIVE 召回的是真失败而非被污染的乐观结论。",
+  "interrupt_reason": "tool_failure",
+  "pre_interrupt_state": {
+    "goal": "stop the duplicate email sends on signup",
+    "completed": ["confirm duplicates happen", "trace to retry-on-timeout"],
+    "in_progress": ["add idempotency key on send"],
+    "blocked": [],
+    "preferred_next": ["add send-dedup test", "monitor for a week"],
+    "must_not_redo": [
+      {"action": "increase the smtp timeout", "reason": "failed_dont_retry"}
+    ],
+    "must_preserve": ["signup flow latency stays under 800ms"],
+    "working_set": {"files": ["src/email/sender.py", "src/signup/flow.py"], "tools": ["pytest"]}
+  },
+  "task_memories": [
+    {"content": "increasing smtp timeout did NOT fix duplicates, it just delayed the retry and made it worse — failed approach", "importance": 0.9, "category": "failure"},
+    {"content": "the real fix is an idempotency key per signup, confirmed in staging", "importance": 0.85, "category": "fact"},
+    {"content": "raising smtp timeout seemed to help (noisy low-traffic window, misleading)", "importance": 0.25, "category": "assumption"}
+  ],
+  "restored_state_by_mode": null,
+  "ground_truth": {
+    "expected_goal": "stop the duplicate email sends on signup",
+    "must_preserve": ["signup flow latency stays under 800ms"],
+    "forbidden_actions": ["increase the smtp timeout"]
+  },
+  "agent_replay": {
+    "NONE": ["increase the smtp timeout", "retrace the duplicates"],
+    "SELECTIVE": ["add idempotency key on send", "add send-dedup test"],
+    "FULL": ["increase the smtp timeout", "add idempotency key on send"]
+  }
+}

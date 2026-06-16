@@ -1,0 +1,32 @@
+{
+  "scenario_id": "a4_tool_timeout",
+  "axis": "A_interruption",
+  "description": "工具超时:长跑工具(构建/部署)卡死触发 tool_failure 中断,恢复后继续",
+  "stresses": "tool_failure 分类下的状态保真。区别于 retry storm——这里只是单次工具卡死,不是反复失败;验证单次超时不被误判为'坏路径'而错误写入 must_not_redo。",
+  "interrupt_reason": "tool_failure",
+  "pre_interrupt_state": {
+    "goal": "set up CI pipeline for the monorepo",
+    "completed": ["write build stage", "write lint stage"],
+    "in_progress": ["wire the deploy stage"],
+    "blocked": [],
+    "preferred_next": ["add cache layer", "enable parallel jobs"],
+    "must_not_redo": [],
+    "must_preserve": ["build stage config must not change"],
+    "working_set": {"files": [".github/workflows/ci.yml", "scripts/deploy.sh"], "tools": ["act", "docker"]}
+  },
+  "task_memories": [
+    {"content": "build stage took 3 iterations to get right, config is final — don't touch", "importance": 0.8, "category": "fact"},
+    {"content": "deploy stage timed out once on a cold docker cache, it is NOT a real failure, just retry", "importance": 0.6, "category": "fact"}
+  ],
+  "restored_state_by_mode": null,
+  "ground_truth": {
+    "expected_goal": "set up CI pipeline for the monorepo",
+    "must_preserve": ["build stage config must not change"],
+    "forbidden_actions": ["rewrite build stage"]
+  },
+  "agent_replay": {
+    "NONE": ["rewrite build stage", "rewrite lint stage"],
+    "SELECTIVE": ["wire the deploy stage", "add cache layer"],
+    "FULL": ["rewrite build stage", "wire the deploy stage"]
+  }
+}

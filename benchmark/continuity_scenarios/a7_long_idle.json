@@ -1,0 +1,34 @@
+{
+  "scenario_id": "a7_long_idle",
+  "axis": "A_interruption",
+  "description": "长时间空闲:会话挂起数小时(user_away),恢复时 continuation_confidence 因 recency 衰减下降但状态完整",
+  "stresses": "recency 衰减对 continuation_confidence 的影响。结构维仍应零损失(confidence 是软信号);验证长空闲后恢复包不丢内容,只是置信度提示下降。",
+  "interrupt_reason": "user_away",
+  "pre_interrupt_state": {
+    "goal": "write the data retention policy doc",
+    "completed": ["draft GDPR section", "draft logging section"],
+    "in_progress": ["draft backup retention section"],
+    "blocked": [],
+    "preferred_next": ["legal review", "publish to wiki"],
+    "must_not_redo": [
+      {"action": "rewrite the GDPR section", "reason": "already_completed"}
+    ],
+    "must_preserve": ["retention numbers must match the legal-approved table"],
+    "working_set": {"files": ["docs/retention-policy.md"], "tools": []}
+  },
+  "task_memories": [
+    {"content": "GDPR section is legal-approved, do not rewrite it", "importance": 0.85, "category": "fact"},
+    {"content": "backup retention is 90 days per the approved table, not 30", "importance": 0.7, "category": "fact"}
+  ],
+  "restored_state_by_mode": null,
+  "ground_truth": {
+    "expected_goal": "write the data retention policy doc",
+    "must_preserve": ["retention numbers must match the legal-approved table"],
+    "forbidden_actions": ["rewrite the GDPR section", "change retention to 30 days"]
+  },
+  "agent_replay": {
+    "NONE": ["rewrite the GDPR section", "change retention to 30 days"],
+    "SELECTIVE": ["draft backup retention section", "legal review"],
+    "FULL": ["rewrite the GDPR section", "draft backup retention section"]
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "scenario_id": "b1_goal_mutation",
+  "axis": "B_state_drift",
+  "description": "目标漂移:恢复后 Agent 的目标被悄悄改写(从'修复登录bug'变成'重构整个auth模块')",
+  "stresses": "goal_retention 的区分度。这是 B 轴最核心的反例——结构指标应在 goal 维度明显掉分,验证 benchmark 能抓到目标突变(对应 drift 的 goal_forgotten)。",
+  "interrupt_reason": "process_exit",
+  "pre_interrupt_state": {
+    "goal": "fix the login 500 error on empty password",
+    "completed": ["reproduce the 500", "locate null check gap"],
+    "in_progress": ["add input validation"],
+    "blocked": [],
+    "preferred_next": ["add regression test", "deploy hotfix"],
+    "must_not_redo": [],
+    "must_preserve": ["hotfix must not touch the session layer"],
+    "working_set": {"files": ["src/auth/login.py"], "tools": ["pytest"]}
+  },
+  "task_memories": [
+    {"content": "the 500 is a missing null check on password field, not a session issue", "importance": 0.8, "category": "fact"},
+    {"content": "scope is a hotfix only — do NOT refactor auth in this task", "importance": 0.85, "category": "fact"}
+  ],
+  "restored_state_by_mode": {
+   "ALL": {
+    "goal": "refactor the entire auth module for clean architecture",
+    "completed": ["reproduce the 500", "locate null check gap"],
+    "in_progress": ["redesign auth package layout"],
+    "blocked": [],
+    "preferred_next": ["split into services", "rewrite session layer"],
+    "must_not_redo": [],
+    "must_preserve": [],
+    "working_set": {"files": ["src/auth/login.py", "src/auth/session.py", "src/auth/services/"], "tools": ["pytest"]}
+   }
+  },
+  "ground_truth": {
+    "expected_goal": "fix the login 500 error on empty password",
+    "must_preserve": ["hotfix must not touch the session layer"],
+    "forbidden_actions": ["rewrite session layer", "refactor auth module"]
+  },
+  "agent_replay": {
+    "NONE": ["rewrite session layer", "split into services"],
+    "SELECTIVE": ["add input validation", "add regression test"],
+    "FULL": ["rewrite session layer", "add input validation"]
+  }
+}

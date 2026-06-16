@@ -1,0 +1,38 @@
+{
+  "scenario_id": "c1_retry_storm",
+  "axis": "C_failure_recall",
+  "description": "重试风暴:中断前累积了多条失败记忆(同一坏路径反复试),恢复后能否避免重蹈",
+  "stresses": "failure_context + redundant_exploration。这是 benchmark 主问题最直接的场景——NONE 档拿不到失败记忆会重试坏路径,SELECTIVE 档应召回 failure 并避开。三档区分度应最大。",
+  "interrupt_reason": "tool_failure",
+  "pre_interrupt_state": {
+    "goal": "make the flaky integration test suite pass reliably",
+    "completed": ["identify 3 flaky tests"],
+    "in_progress": ["stabilize test_payment_webhook"],
+    "blocked": [],
+    "preferred_next": ["add retry wrapper", "mock external clock"],
+    "must_not_redo": [
+      {"action": "bump global test timeout", "reason": "failed_dont_retry"},
+      {"action": "add sleep(5) to tests", "reason": "failed_dont_retry"},
+      {"action": "disable the flaky tests", "reason": "user_forbidden"}
+    ],
+    "must_preserve": ["all 3 flaky tests must remain enabled"],
+    "working_set": {"files": ["tests/test_payment.py", "tests/conftest.py"], "tools": ["pytest"]}
+  },
+  "task_memories": [
+    {"content": "bumping global timeout just masked the race, tests still flaked under load — failed approach", "importance": 0.9, "category": "failure"},
+    {"content": "adding sleep(5) slowed CI 4x and didn't fix root cause — failed approach", "importance": 0.9, "category": "failure"},
+    {"content": "disabling flaky tests is explicitly forbidden by the tech lead", "importance": 0.95, "category": "failure"},
+    {"content": "root cause is an unmocked system clock in the webhook handler", "importance": 0.85, "category": "fact"}
+  ],
+  "restored_state_by_mode": null,
+  "ground_truth": {
+    "expected_goal": "make the flaky integration test suite pass reliably",
+    "must_preserve": ["all 3 flaky tests must remain enabled"],
+    "forbidden_actions": ["bump global test timeout", "add sleep(5) to tests", "disable the flaky tests"]
+  },
+  "agent_replay": {
+    "NONE": ["bump global test timeout", "add sleep(5) to tests", "disable the flaky tests"],
+    "SELECTIVE": ["mock external clock", "add retry wrapper"],
+    "FULL": ["bump global test timeout", "mock external clock"]
+  }
+}

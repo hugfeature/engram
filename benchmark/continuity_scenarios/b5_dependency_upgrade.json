@@ -1,0 +1,43 @@
+{
+  "scenario_id": "b5_dependency_upgrade",
+  "axis": "B_state_drift",
+  "description": "依赖升级漂移:恢复后 Agent 把'修一个用法'扩成'升级整个依赖大版本',scope 膨胀",
+  "stresses": "scope_expansion 形态的 drift。goal 字面相近但范围爆炸,working_set 从单文件漂到全仓 lockfile;验证 benchmark 能抓到'温水煮青蛙'式扩张(对应 drift 的 depth_escalation)。",
+  "interrupt_reason": "process_exit",
+  "pre_interrupt_state": {
+    "goal": "fix the deprecated requests.get timeout warning",
+    "completed": ["find the 2 call sites"],
+    "in_progress": ["add explicit timeout arg"],
+    "blocked": [],
+    "preferred_next": ["run the affected tests"],
+    "must_not_redo": [],
+    "must_preserve": ["do not bump requests major version in this task"],
+    "working_set": {"files": ["src/client/http.py"], "tools": ["pytest"]}
+  },
+  "task_memories": [
+    {"content": "this task is a 2-line timeout fix, NOT a requests upgrade", "importance": 0.85, "category": "fact"},
+    {"content": "bumping requests to 3.x last quarter broke the retry adapter, separate effort needed", "importance": 0.8, "category": "failure"}
+  ],
+  "restored_state_by_mode": {
+   "ALL": {
+    "goal": "fix the deprecated requests.get timeout warning",
+    "completed": ["find the 2 call sites"],
+    "in_progress": ["upgrade requests to 3.x across the repo"],
+    "blocked": [],
+    "preferred_next": ["migrate all http clients", "rewrite retry adapter"],
+    "must_not_redo": [],
+    "must_preserve": ["do not bump requests major version in this task"],
+    "working_set": {"files": ["pyproject.toml", "poetry.lock", "src/client/http.py", "src/client/retry.py"], "tools": ["pytest", "poetry"]}
+   }
+  },
+  "ground_truth": {
+    "expected_goal": "fix the deprecated requests.get timeout warning",
+    "must_preserve": ["do not bump requests major version in this task"],
+    "forbidden_actions": ["upgrade requests to 3.x across the repo", "rewrite retry adapter"]
+  },
+  "agent_replay": {
+    "NONE": ["upgrade requests to 3.x across the repo", "rewrite retry adapter"],
+    "SELECTIVE": ["add explicit timeout arg", "run the affected tests"],
+    "FULL": ["upgrade requests to 3.x across the repo", "add explicit timeout arg"]
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "scenario_id": "b7_agent_version_upgrade",
+  "axis": "B_state_drift",
+  "description": "Agent 版本升级:中途换了更新版模型/Agent 接手,新 Agent 倾向用自己的'更优'方案推翻原计划",
+  "stresses": "preferred_next 计划的保真 vs 新 Agent 的自作主张。验证恢复包能锚住原定下一步,抑制'新官上任三把火'式的计划推翻(对应 plan_divergence)。",
+  "interrupt_reason": "process_exit",
+  "pre_interrupt_state": {
+    "goal": "add full-text search to the docs site",
+    "completed": ["evaluate options", "decide on lightweight client-side index"],
+    "in_progress": ["build the search index at compile time"],
+    "blocked": [],
+    "preferred_next": ["wire the search box", "add keyboard shortcuts"],
+    "must_not_redo": [
+      {"action": "re-evaluate search backends", "reason": "already_completed"}
+    ],
+    "must_preserve": ["search must work fully offline, no server calls"],
+    "working_set": {"files": ["src/search/index.ts", "src/search/Search.tsx"], "tools": ["vite"]}
+  },
+  "task_memories": [
+    {"content": "decision is LOCKED: client-side index (lunr-style), a hosted search service was explicitly rejected for the offline requirement", "importance": 0.9, "category": "fact"},
+    {"content": "offline-first is a hard product constraint, anything needing a server is out", "importance": 0.9, "category": "fact"}
+  ],
+  "restored_state_by_mode": {
+   "ALL": {
+    "goal": "add full-text search to the docs site",
+    "completed": ["evaluate options", "decide on lightweight client-side index"],
+    "in_progress": ["migrate search to a hosted Algolia service"],
+    "blocked": [],
+    "preferred_next": ["set up Algolia account", "stream docs to the search API"],
+    "must_not_redo": [],
+    "must_preserve": ["search must work fully offline, no server calls"],
+    "working_set": {"files": ["src/search/algolia.ts"], "tools": ["vite", "algolia-cli"]}
+   }
+  },
+  "ground_truth": {
+    "expected_goal": "add full-text search to the docs site",
+    "must_preserve": ["search must work fully offline, no server calls"],
+    "forbidden_actions": ["migrate search to a hosted Algolia service", "re-evaluate search backends"]
+  },
+  "agent_replay": {
+    "NONE": ["migrate search to a hosted Algolia service", "re-evaluate search backends"],
+    "SELECTIVE": ["build the search index at compile time", "wire the search box"],
+    "FULL": ["migrate search to a hosted Algolia service", "build the search index at compile time"]
+  }
+}
